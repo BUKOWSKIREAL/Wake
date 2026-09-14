@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix: an agent's own Wake lookups (the `wake_*` tools, `wake-cli` commands) no longer show up as search hits in its session
 - Update: search now matches session titles too, in ⌘K / Ctrl+K, `wake_search` and `wake-cli search` — title hits come first and open the session at its start
 
 ## [0.6.4] — 2026-09-14

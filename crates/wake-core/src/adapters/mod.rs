@@ -418,7 +418,10 @@ pub fn adapter_for<'a>(
     adapter_ix_for(adapters, agent, file_path).map(|ix| adapters[ix].as_ref())
 }
 
-/// 从解析后的消息派生 FTS 单元(text + tool 名称/输入摘要)
+/// 从解析后的消息派生 FTS 单元(text + tool 名称/输入摘要)。agent 对 Wake 自己的
+/// 查询(MCP 的 wake_* 工具、shell 里的 wake-cli / wake-mcp)不进索引:否则搜任何
+/// 词,第一条命中都是"上次搜这个词的那次调用",越用越吵(自指回声)。只跳过工具
+/// 那一段,消息正文照常——用户真写了 "wake-cli" 是内容,不是回声
 pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
     messages
         .iter()
@@ -426,6 +429,9 @@ pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUn
         .filter_map(|m| {
             let mut parts = vec![m.text.clone()];
             for tc in &m.tool_calls {
+                if is_wake_lookup(&tc.name, &tc.input_preview) {
+                    continue;
+                }
                 parts.push(format!("{} {}", tc.name, tc.input_preview));
             }
             let text = parse_utils::clip(&parts.join("\n"), MAX_MSG_TEXT).0;
@@ -456,5 +462,96 @@ pub fn expand_tilde(p: &str) -> String {
             }
         }
         _ => p.to_string(),
+    }
+}
+
+/// 这次工具调用是不是 agent 在查 Wake。MCP 客户端给工具名加 `mcp__<server>__`
+/// 前缀(Claude Code 实测 `mcp__wake__wake_search`),取最后一段看是否 `wake_*`;
+/// shell 工具(Bash 等)看输入预览里有没有 wake-cli / wake-mcp 命令
+fn is_wake_lookup(tool_name: &str, input_preview: &str) -> bool {
+    let bare = tool_name.rsplit("__").next().unwrap_or(tool_name);
+    bare.starts_with("wake_")
+        || input_preview.contains("wake-cli ")
+        || input_preview.contains("wake-mcp ")
+        || input_preview.ends_with("wake-cli")
+        || input_preview.ends_with("wake-mcp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(seq: i64, text: &str, tools: &[(&str, &str)]) -> TranscriptMessage {
+        TranscriptMessage {
+            seq,
+            role: Role::Assistant,
+            kind: MessageKind::Text,
+            text: text.to_string(),
+            truncated: false,
+            tool_calls: tools
+                .iter()
+                .map(|(name, preview)| ToolCallView {
+                    id: String::new(),
+                    name: name.to_string(),
+                    input_preview: preview.to_string(),
+                    input: None,
+                    output: None,
+                    is_error: false,
+                    sidechain_ref: None,
+                })
+                .collect(),
+            thinking: None,
+            timestamp: None,
+            model: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wake_lookups_stay_out_of_the_index() {
+        let messages = [
+            msg(
+                0,
+                "看看历史",
+                &[
+                    ("mcp__wake__wake_search", "二维码"),
+                    ("Bash", "wake-cli search \"二维码\" --limit 3"),
+                    (
+                        "Bash",
+                        "/Applications/Wake.app/Contents/MacOS/wake-cli sessions --project .",
+                    ),
+                    ("Read", "src/db.rs"),
+                ],
+            ),
+            // 只有 Wake 调用、没有正文:整条不进索引
+            msg(
+                1,
+                "",
+                &[
+                    ("wake_get_session", "claude-code:abc"),
+                    ("Bash", "wake-mcp call wake_search '{}'"),
+                ],
+            ),
+            // 用户正文里提到 wake-cli 是内容,不是回声
+            msg(2, "wake-cli 的 --since 该怎么写", &[]),
+        ];
+        let units = units_from_messages(&messages);
+        assert_eq!(units.iter().map(|u| u.seq).collect::<Vec<_>>(), [0, 2]);
+        assert!(units[0].text.contains("看看历史"));
+        assert!(units[0].text.contains("Read src/db.rs"));
+        assert!(!units[0].text.contains("wake_search"));
+        assert!(!units[0].text.contains("wake-cli"));
+        assert!(!units[0].text.contains("二维码"), "查询词本身也不该进索引");
+        assert!(units[1].text.contains("wake-cli 的 --since"));
+    }
+
+    #[test]
+    fn wake_lookup_detection_is_narrow() {
+        assert!(is_wake_lookup("mcp__wake__wake_list_projects", ""));
+        assert!(is_wake_lookup("wake_search", "x"));
+        assert!(is_wake_lookup("Bash", "cd repo && wake-cli projects"));
+        assert!(!is_wake_lookup("Bash", "cargo test -p wake-core"));
+        assert!(!is_wake_lookup("mcp__other__awake_check", ""));
+        assert!(!is_wake_lookup("Edit", "crates/wake/src/settings.rs"));
     }
 }

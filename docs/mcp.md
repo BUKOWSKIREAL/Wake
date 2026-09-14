@@ -248,7 +248,7 @@ wake-mcp --version
 - Everything runs on this machine. The server makes no network requests.
 - Agents see the same session files Wake indexes — local agents' data directories plus the local mirrors of any remote hosts you configured in Wake. Nothing leaves the machine.
 - Wake's read-only rules apply: other agents' directories and databases are opened read-only and credential files are never read. The server writes nothing to the index; the one thing it can write is Wake's own data directory, which resolving the default index path creates and, on a first run after the old `vibex` builds, migrates the old database into (`--db` skips that).
-- Because an agent's own session is also indexed by Wake, a `wake_search` call it makes today (the tool name and query) will show up in tomorrow's search results for the same term. Tool outputs are not indexed, so the results themselves do not.
+- An agent's own session is indexed by Wake too, but its Wake lookups are not: tool calls to `wake_*` and shell runs of `wake-cli` / `wake-mcp` are left out of the search index, so searching a term tomorrow does not surface today's search for it. Tool outputs are never indexed either.
 
 ## See also
 
