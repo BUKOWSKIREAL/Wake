@@ -736,15 +736,37 @@ fn subagent_label(sc: &SidechainInfo) -> String {
     }
 }
 
-fn subagent_lines(sidechains: &[SidechainInfo]) -> String {
+fn subagent_lines(sidechains: &[SidechainInfo], cap: Option<usize>) -> String {
+    let shown = cap.unwrap_or(sidechains.len());
     let mut out = String::new();
-    for sc in sidechains.iter().take(MAX_SUBAGENTS_LISTED) {
+    for sc in sidechains.iter().take(shown) {
         out.push_str(&format!("- {}\n", subagent_label(sc)));
     }
-    if sidechains.len() > MAX_SUBAGENTS_LISTED {
+    if sidechains.len() > shown {
         out.push_str(&format!(
-            "- … and {} more\n",
-            sidechains.len() - MAX_SUBAGENTS_LISTED
+            "- … and {} more — pass subagent=\"*\" for the full list\n",
+            sidechains.len() - shown
+        ));
+    }
+    out
+}
+
+/// `subagent="*"`:只列清单、不读转录、不设上限——主线页脚的清单封顶 30 条,Task 开
+/// 得多的会话得有地方拿到其余的 id(Codex review 2026-09-14)
+fn subagent_listing(title: &str, meta: &SessionMeta, sidechains: &[SidechainInfo]) -> String {
+    let mut out = format!(
+        "# {title}\nkey: `{}` · agent: {}\n\n",
+        meta.key,
+        meta.agent.display_name()
+    );
+    if sidechains.is_empty() {
+        out.push_str("This session has no subagent transcripts.\n");
+    } else {
+        out.push_str(&format!(
+            "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
+            sidechains.len(),
+            plural(sidechains.len() as i64),
+            subagent_lines(sidechains, None)
         ));
     }
     out
@@ -782,26 +804,24 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
         ))
     })?;
     let live = &transcript.meta;
+    let title = if live.title.is_empty() {
+        UNTITLED
+    } else {
+        &live.title
+    };
     // 子代理转录按 id 现场解析,不进 TranscriptCache:子代理还在跑时它的文件独立于
-    // 主文件增长,拿主文件的戳当键会一直吐旧内容;文件通常远小于主线,一页一解析
+    // 主文件增长,拿主文件的戳当键会一直吐旧内容;文件通常远小于主线,一页一解析。
+    // 先读文件、再查缓存里的清单:清单来自缓存的主转录,主文件没变时看不见刚出现的
+    // 子代理(Codex review 2026-09-14),读得到就算存在,边车信息缺就只报 id
     let sidechain = match subagent {
         None => None,
+        Some("*") => return Ok(subagent_listing(title, &meta, &transcript.sidechains)),
         Some(id) => {
-            let info = transcript
-                .sidechains
-                .iter()
-                .find(|sc| sc.id == id)
-                .ok_or_else(|| {
-                    ToolError::Failed(if transcript.sidechains.is_empty() {
-                        format!("`{}` has no subagent transcripts.", meta.key)
-                    } else {
-                        format!(
-                            "`{}` has no subagent transcript `{id}`. It has:\n{}",
-                            meta.key,
-                            subagent_lines(&transcript.sidechains)
-                        )
-                    })
-                })?;
+            if id.contains(std::path::is_separator) || id == "." || id == ".." {
+                return Err(ToolError::InvalidParams(format!(
+                    "`subagent` must be a bare id as listed by the main transcript, not a path: `{id}`"
+                )));
+            }
             let messages = adapter
                 .load_sidechain(&SessionFileRef::from_meta(&meta), id)
                 .map_err(|e| {
@@ -811,11 +831,27 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
                     ))
                 })?;
             if messages.is_empty() {
-                return Err(ToolError::Failed(format!(
-                    "Subagent transcript `{id}` of `{}` is empty or missing on disk.",
-                    meta.key
-                )));
+                return Err(ToolError::Failed(if transcript.sidechains.is_empty() {
+                    format!("`{}` has no subagent transcripts.", meta.key)
+                } else {
+                    format!(
+                        "`{}` has no subagent transcript `{id}`. It has:\n{}",
+                        meta.key,
+                        subagent_lines(&transcript.sidechains, None)
+                    )
+                }));
             }
+            let info = transcript
+                .sidechains
+                .iter()
+                .find(|sc| sc.id == id)
+                .cloned()
+                .unwrap_or_else(|| SidechainInfo {
+                    id: id.to_string(),
+                    agent_type: None,
+                    description: None,
+                    tool_use_id: None,
+                });
             Some((info, messages))
         }
     };
@@ -832,11 +868,6 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     let page = render_compact(messages, &opts);
 
     let mut out = String::new();
-    let title = if live.title.is_empty() {
-        UNTITLED
-    } else {
-        &live.title
-    };
     out.push_str(&format!("# {title}\n"));
     let mut facts = vec![
         format!("key: `{}`", meta.key),
@@ -922,7 +953,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
             "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
             transcript.sidechains.len(),
             plural(transcript.sidechains.len() as i64),
-            subagent_lines(&transcript.sidechains)
+            subagent_lines(&transcript.sidechains, Some(MAX_SUBAGENTS_LISTED))
         ));
     }
     let with_sub = sub_id

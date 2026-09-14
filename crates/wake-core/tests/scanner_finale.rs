@@ -306,6 +306,55 @@ fn migration_backfill_reparses_unchanged_grok_rows_once() {
     assert!(!store.needs_grok_parent_backfill());
 }
 
+/// FTS 派生规则换代(db::FTS_FORMAT):旧库首开挂 fts_reindex 旗子,下一轮增量扫描
+/// 把 mtime/size 都没变的行也重处理一遍,然后清旗子;新库不挂
+#[test]
+fn fts_reindex_flag_reprocesses_unchanged_rows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reindex.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        assert!(!store.needs_fts_reindex(), "新库不该挂旗子");
+    }
+    // 模拟升级前的库:有 sessions 表,但没记过 fts_format
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DELETE FROM schema_meta WHERE key = 'fts_format'", [])
+        .unwrap();
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(store.needs_fts_reindex(), "旧库首开要挂旗子");
+
+    let path = "/tmp/reindex/p/s.jsonl";
+    let mut before = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    before.meta.title = "before".into();
+    // 库里已有同 mtime/size 的行,增量扫描本会跳过
+    store.write_meta_only(&[(before.meta.clone(), 42)]).unwrap();
+    let mut after = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    after.meta.title = "after".into();
+    run_scan(
+        &[Box::new(after) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    let title = |store: &Store| store.get_session("claude-code:s").unwrap().unwrap().title;
+    assert_eq!(title(&store), "after", "旗子在时未变的文件也要重处理");
+    assert!(!store.needs_fts_reindex(), "跑完一轮就清");
+
+    // 没旗子、文件没变:增量扫描照常跳过
+    let mut third = seed(AgentId::ClaudeCode, "/tmp/reindex", path, "s", 42);
+    third.meta.title = "third".into();
+    run_scan(
+        &[Box::new(third) as Box<dyn AgentAdapter>],
+        &store,
+        &Recorder::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(title(&store), "after");
+}
+
 #[test]
 fn migration_backfill_retries_after_parse_failure() {
     let dir = tempfile::tempdir().unwrap();

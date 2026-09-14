@@ -429,7 +429,7 @@ pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUn
         .filter_map(|m| {
             let mut parts = vec![m.text.clone()];
             for tc in &m.tool_calls {
-                if is_wake_lookup(&tc.name, &tc.input_preview) {
+                if is_wake_lookup(tc) {
                     continue;
                 }
                 parts.push(format!("{} {}", tc.name, tc.input_preview));
@@ -465,18 +465,44 @@ pub fn expand_tilde(p: &str) -> String {
     }
 }
 
+/// Wake 自己的两个命令行二进制;在 shell 工具的 command 里以整词出现即视为在查 Wake
+const WAKE_BINARIES: [&str; 2] = ["wake-cli", "wake-mcp"];
+
 /// 这次工具调用是不是 agent 在查 Wake:MCP 工具按 `mcp::tools::NAMES` 认(加第五家
-/// 自动覆盖),客户端会给名字加
-/// 自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,别家形态不一),所以
-/// 只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);shell 工具(Bash 等)
-/// 看输入预览里是否以整个词的形态出现 wake-cli / wake-mcp
-fn is_wake_lookup(tool_name: &str, input_preview: &str) -> bool {
+/// 自动覆盖),客户端会给名字加自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,
+/// 别家形态不一),所以只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);
+/// 命令行则要求 wake-cli / wake-mcp 以整词出现在 shell 工具的 **command 字段**里——
+/// Grep 的 pattern、Read 的路径提到 wake-cli 是在读代码,不是查询(Codex review 2026-09-14)
+fn is_wake_lookup(tc: &ToolCallView) -> bool {
     crate::mcp::tools::NAMES
         .iter()
-        .any(|t| ends_with_word(tool_name, t))
-        || ["wake-cli", "wake-mcp"]
+        .any(|t| ends_with_word(&tc.name, t))
+        || (WAKE_BINARIES
             .iter()
-            .any(|bin| names_binary(input_preview, bin))
+            .any(|bin| names_binary(&tc.input_preview, bin))
+            && command_names_binary(tc))
+}
+
+/// 预览(对 shell 工具就是命令的前 200 字)提到了二进制名之后再看结构:只有输入对象的
+/// `command`(字符串或 argv 数组,各家 shell 工具都这么叫)里出现才算执行了 Wake。
+/// 输入没有结构可看(None,或被截断到解析不了)时退回预览判断
+fn command_names_binary(tc: &ToolCallView) -> bool {
+    let Some(raw) = tc.input.as_deref() else {
+        return true;
+    };
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return true;
+    };
+    let text = match obj.get("command") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return false,
+    };
+    WAKE_BINARIES.iter().any(|bin| names_binary(&text, bin))
 }
 
 fn ends_with_word(s: &str, word: &str) -> bool {
@@ -500,6 +526,18 @@ fn names_binary(preview: &str, bin: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn tc(name: &str, preview: &str, input: Option<&str>) -> ToolCallView {
+        ToolCallView {
+            id: String::new(),
+            name: name.to_string(),
+            input_preview: preview.to_string(),
+            input: input.map(String::from),
+            output: None,
+            is_error: false,
+            sidechain_ref: None,
+        }
+    }
+
     fn msg(seq: i64, text: &str, tools: &[(&str, &str)]) -> TranscriptMessage {
         TranscriptMessage {
             seq,
@@ -509,15 +547,7 @@ mod tests {
             truncated: false,
             tool_calls: tools
                 .iter()
-                .map(|(name, preview)| ToolCallView {
-                    id: String::new(),
-                    name: name.to_string(),
-                    input_preview: preview.to_string(),
-                    input: None,
-                    output: None,
-                    is_error: false,
-                    sidechain_ref: None,
-                })
+                .map(|(name, preview)| tc(name, preview, None))
                 .collect(),
             thinking: None,
             timestamp: None,
@@ -566,21 +596,58 @@ mod tests {
 
     #[test]
     fn wake_lookup_detection_is_narrow() {
-        assert!(is_wake_lookup("mcp__wake__wake_list_projects", ""));
-        assert!(is_wake_lookup("wake_search", "x"));
+        let lookup = |name: &str, preview: &str, input: Option<&str>| {
+            is_wake_lookup(&tc(name, preview, input))
+        };
+        assert!(lookup("mcp__wake__wake_list_projects", "", None));
+        assert!(lookup("wake_search", "x", None));
         assert!(
-            is_wake_lookup("mcp_wake_wake_get_session", ""),
+            lookup("mcp_wake_wake_get_session", "", None),
             "别家客户端的前缀形态"
         );
-        assert!(is_wake_lookup("Bash", "cd repo && wake-cli projects"));
-        assert!(is_wake_lookup("Bash", "C:\\Wake\\wake-cli.exe sessions"));
-        assert!(is_wake_lookup(
+        // 没有结构化输入可看时按预览判
+        assert!(lookup("Bash", "cd repo && wake-cli projects", None));
+        assert!(lookup("Bash", "C:\\Wake\\wake-cli.exe sessions", None));
+        assert!(lookup(
             "Bash",
-            "WAKE=/Applications/Wake.app/Contents/MacOS/wake-cli"
+            "WAKE=/Applications/Wake.app/Contents/MacOS/wake-cli",
+            None
         ));
-        assert!(!is_wake_lookup("Bash", "cargo test -p wake-core"));
-        assert!(!is_wake_lookup("Bash", "wake-cli-old --help && wake-clip"));
-        assert!(!is_wake_lookup("mcp__other__awake_search", ""));
-        assert!(!is_wake_lookup("Edit", "crates/wake/src/settings.rs"));
+        assert!(!lookup("Bash", "cargo test -p wake-core", None));
+        assert!(!lookup("Bash", "wake-cli-old --help && wake-clip", None));
+        assert!(!lookup("mcp__other__awake_search", "", None));
+        assert!(!lookup("Edit", "crates/wake/src/settings.rs", None));
+        // 有结构化输入时只认 command 字段:读代码、搜代码提到 wake-cli 不是查询
+        assert!(lookup(
+            "Bash",
+            "wake-cli search \"二维码\"",
+            Some(r#"{"command": "wake-cli search \"二维码\"", "description": "search history"}"#)
+        ));
+        assert!(
+            lookup(
+                "shell",
+                "bash -lc wake-cli sessions --limit 5",
+                Some(r#"{"command": ["bash", "-lc", "wake-cli sessions --limit 5"]}"#)
+            ),
+            "Codex 的 argv 数组形态"
+        );
+        assert!(!lookup(
+            "Grep",
+            "wake-cli",
+            Some(r#"{"pattern": "wake-cli", "path": "docs"}"#)
+        ));
+        assert!(!lookup(
+            "Read",
+            "docs/wake-cli notes.md",
+            Some(r#"{"file_path": "docs/wake-cli notes.md"}"#)
+        ));
+        assert!(
+            !lookup(
+                "Bash",
+                "man wake-cli-old",
+                Some(r#"{"command": "man wake-cli-old", "description": "wake-cli docs"}"#)
+            ),
+            "command 里没有整词就不算,哪怕 description 提到"
+        );
     }
 }

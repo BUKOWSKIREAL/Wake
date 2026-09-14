@@ -173,6 +173,10 @@ fn run_scan_inner(
         adapter.begin_scan();
     }
     let force_grok_backfill = store.needs_grok_parent_backfill();
+    // FTS 派生规则换代(db::FTS_FORMAT):这一轮把 mtime/size 没变的也全部重解析。
+    // 跑完就清旗子,不按"全部成功"重试——解析失败的文件下次也不会自己好,它变了
+    // 自然走增量重解析;留着旗子只会让每次启动都全量一遍
+    let force_reindex = store.needs_fts_reindex();
     let known = store.known_files()?;
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     struct WorkItem<'a> {
@@ -273,7 +277,8 @@ fn run_scan_inner(
     }
 
     for (ix, (adapter, refs)) in adapters.iter().zip(per_adapter).enumerate() {
-        let force_adapter = force_grok_backfill && adapter.agent() == AgentId::Grok;
+        let force_adapter =
+            force_reindex || (force_grok_backfill && adapter.agent() == AgentId::Grok);
         for r in &refs {
             seen_paths.insert(r.file_path.clone());
         }
@@ -430,6 +435,9 @@ fn run_scan_inner(
     }
     if force_grok_backfill && grok_backfill_succeeded {
         store.finish_grok_parent_backfill()?;
+    }
+    if force_reindex {
+        store.finish_fts_reindex()?;
     }
 
     Ok(())

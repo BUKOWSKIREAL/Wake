@@ -177,7 +177,7 @@ One transcript as compact Markdown, parsed live from the agent's files.
 | `max_message_chars` | integer 100–50000 | 4000 | budget per message, shared by its text, thinking and tool calls; longer content is truncated and marked |
 | `include_tools` | boolean | false | include tool inputs and outputs (verbose) |
 | `include_thinking` | boolean | false | include the assistant's recorded thinking |
-| `subagent` | string | | read this subagent transcript instead of the main one; the main transcript lists the ids at its end |
+| `subagent` | string | | read this subagent transcript instead of the main one; the main transcript lists the ids at its end (at most 30), and `*` lists them all |
 
 The reply starts with a header (title, key, agent, host, project and branch, model, time range, message count), then one block per message:
 
@@ -191,7 +191,7 @@ inotify queues overflow when …
 - 🔧 Grep: need_rescan
 ```
 
-Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript with their ids; pass one as `subagent` to read it, with the same paging options.
+Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript with their ids; pass one as `subagent` to read it, with the same paging options. The footer lists at most 30; `subagent: "*"` returns the full list without a transcript.
 
 The footer says which seqs were shown and either `End of transcript.` or a `from_seq=<n>` hint for the next page. Seq numbers are the same ones Wake's own search results and transcript view use.
 

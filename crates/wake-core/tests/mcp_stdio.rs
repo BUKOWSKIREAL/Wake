@@ -346,6 +346,24 @@ fn stdio_contract_end_to_end() {
     );
     assert!(is_err);
     assert!(bad.contains("- agent-fixture01"), "{bad}");
+    // `*` 只列清单不读转录(主线页脚封顶 30 条,这里不封顶)
+    let (all, is_err) = c.call(
+        "wake_get_session",
+        json!({ "key": CLAUDE_KEY, "subagent": "*" }),
+    );
+    assert!(!is_err, "{all}");
+    assert!(
+        all.contains("- agent-fixture01 — Explore: find the QR scanner code"),
+        "{all}"
+    );
+    assert!(!all.contains("### [seq"), "listing only:\n{all}");
+    // id 是路径形态:参数形状错,协议级 -32602,不去碰文件系统
+    let reply = c.request(
+        "tools/call",
+        json!({ "name": "wake_get_session",
+                "arguments": { "key": CLAUDE_KEY, "subagent": "../../etc/passwd" } }),
+    );
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
 
     // 5. 项目匹配:cwd 在项目子目录里、没匹配上、项目清单
     let (listed, is_err) = c.call(

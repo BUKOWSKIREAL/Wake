@@ -82,7 +82,7 @@ One session's transcript, parsed live from the agent's own files, as compact Mar
 | `--message-chars` | N | truncate each message, default 4000, range 100–50000 |
 | `--tools` | — | include tool inputs and outputs (verbose) |
 | `--thinking` | — | include the assistant's thinking where the agent recorded it |
-| `--subagent` | ID | read this subagent transcript instead of the main one; the main transcript lists the ids at its end |
+| `--subagent` | ID | read this subagent transcript instead of the main one; the main transcript lists the ids at its end (at most 30), and `'*'` lists them all |
 
 `show` also accepts a bare native id (the one the agent's own `--resume` wants) and falls back to looking it up. When the same id exists on more than one host it lists the candidates instead of guessing.
 
@@ -93,6 +93,7 @@ wake-cli show 'claude-code:1b2c3d4e-…'
 wake-cli show 'wake://session/claude-code:1b2c3d4e-…#42' --tools
 wake-cli show 'codex:0195c2a1-…' --from 120 --messages 40
 wake-cli show 'claude-code:1b2c3d4e-…' --subagent agent-a1b2c3d4
+wake-cli show 'claude-code:1b2c3d4e-…' --subagent '*'
 ```
 
 ### `projects`

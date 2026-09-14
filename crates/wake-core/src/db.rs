@@ -130,6 +130,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
 );
 "#;
 
+/// FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
+/// 规则就换个值:旧库首开时挂 fts_reindex 旗子,下一轮扫描强制重解析全部文件。
+/// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声
+pub const FTS_FORMAT: &str = "2";
+
 fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -168,6 +173,28 @@ fn open_conn(path: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_key)",
         [],
     )?;
+    // FTS 派生规则换代:库里记的版本与 FTS_FORMAT 不一致且已有会话 → 挂 fts_reindex
+    // 旗子,下一轮扫描把全部文件重解析一遍(增量按 mtime/size 跳过的也重来),否则
+    // 旧行会按旧规则一直留着,直到用户手动全量刷新(Codex review 2026-09-14)
+    let stored_format: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'fts_format'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if stored_format.as_deref() != Some(FTS_FORMAT) {
+        if sessions_existed {
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_reindex', '1')",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('fts_format', ?1)",
+            params![FTS_FORMAT],
+        )?;
+    }
     // host 迁移(2026-09-01 远程会话加列;空串 = 本地)。老库首扫时既有行
     // 全部落 '',与远程装饰器生产的非空 host 天然分域,无需回填
     if !table_has_column(&conn, NEWEST_COLUMN.0, NEWEST_COLUMN.1)? {
@@ -380,13 +407,12 @@ impl Store {
         Ok(())
     }
 
-    /// 旧索引第一次升级到父子会话 schema 后，现有 Grok 行需要强制重解析，
-    /// 才能把临时 worktree cwd 统一回主会话项目。
-    pub fn needs_grok_parent_backfill(&self) -> bool {
+    /// schema_meta 里的一次性旗子(升级后要补做的事),做完由 scanner 清掉
+    fn has_meta_flag(&self, key: &str) -> bool {
         let conn = self.read.lock().unwrap();
         conn.query_row(
-            "SELECT 1 FROM schema_meta WHERE key = 'grok_parent_backfill'",
-            [],
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![key],
             |_| Ok(()),
         )
         .optional()
@@ -394,13 +420,30 @@ impl Store {
         .unwrap_or(false)
     }
 
-    pub fn finish_grok_parent_backfill(&self) -> Result<()> {
+    fn clear_meta_flag(&self, key: &str) -> Result<()> {
         let conn = self.write.lock().unwrap();
-        conn.execute(
-            "DELETE FROM schema_meta WHERE key = 'grok_parent_backfill'",
-            [],
-        )?;
+        conn.execute("DELETE FROM schema_meta WHERE key = ?1", params![key])?;
         Ok(())
+    }
+
+    /// 旧索引第一次升级到父子会话 schema 后，现有 Grok 行需要强制重解析，
+    /// 才能把临时 worktree cwd 统一回主会话项目。
+    pub fn needs_grok_parent_backfill(&self) -> bool {
+        self.has_meta_flag("grok_parent_backfill")
+    }
+
+    pub fn finish_grok_parent_backfill(&self) -> Result<()> {
+        self.clear_meta_flag("grok_parent_backfill")
+    }
+
+    /// FTS 派生规则换代后(见 `FTS_FORMAT`)全部文件要重解析一遍;由 scanner 在
+    /// 一轮没有解析失败的扫描后清掉,失败过就留着下次再来
+    pub fn needs_fts_reindex(&self) -> bool {
+        self.has_meta_flag("fts_reindex")
+    }
+
+    pub fn finish_fts_reindex(&self) -> Result<()> {
+        self.clear_meta_flag("fts_reindex")
     }
 
     /// 当前胜出副本的 `(key, file_path)`，scanner 用 file_path 把同一 agent
