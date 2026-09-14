@@ -139,6 +139,91 @@ pub fn default_file_ref(agent: AgentId, path: &std::path::Path) -> Option<Sessio
     })
 }
 
+/// Claude 式 projects 树(Qoder / CodeBuddy / WorkBuddy)的会话枚举:根直属的
+/// `<session>.jsonl` 与下一层 `<slug>/<session>.jsonl` 都收——自定义 location
+/// 允许直接选中某个 slug 目录;**不再往下走**,`<session>/subagents/` 里的子
+/// 代理转录不是顶层会话(递归的 list_jsonl_refs 会把它们吞进来)。按路径排序
+pub fn list_project_tree_refs(root: &std::path::Path, agent: AgentId) -> Vec<SessionFileRef> {
+    let mut refs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return refs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Ok(inner) = std::fs::read_dir(&path) {
+                refs.extend(
+                    inner
+                        .flatten()
+                        .filter_map(|e| default_file_ref(agent, &e.path())),
+                );
+            }
+        } else if let Some(r) = default_file_ref(agent, &path) {
+            refs.push(r);
+        }
+    }
+    refs.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+    refs
+}
+
+/// 上面那棵树里有没有任何会话文件:env 候选根只在探到真实数据时才采信
+/// (存在但空的候选不能遮掉默认根)。见首个就停,不做完整枚举——它跑在
+/// adapter 构造时、也就是应用启动路径上
+pub fn project_tree_has_session(root: &std::path::Path, agent: AgentId) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::read_dir(&path).is_ok_and(|inner| {
+                inner
+                    .flatten()
+                    .any(|e| default_file_ref(agent, &e.path()).is_some())
+            })
+        } else {
+            default_file_ref(agent, &path).is_some()
+        }
+    })
+}
+
+/// JSON 里"有就是非空字符串、否则没有"的字段:标题、模型名、cwd 一类
+pub fn optional_string(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// usage 对象 → 本次调用的 token 数:`total_tokens` 优先;否则 Anthropic 形
+/// input / output / cache 四项之和;再否则 OpenAI completions 形 prompt +
+/// completion(Qoder 与 CodeBuddy 的 rawUsage 共用)
+pub fn usage_tokens(usage: &Value) -> i64 {
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if total > 0 {
+        return total;
+    }
+    let message_tokens: i64 = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .map(|key| usage.get(*key).and_then(Value::as_i64).unwrap_or(0))
+    .sum();
+    if message_tokens > 0 {
+        return message_tokens;
+    }
+    ["prompt_tokens", "completion_tokens"]
+        .iter()
+        .map(|key| usage.get(*key).and_then(Value::as_i64).unwrap_or(0))
+        .sum()
+}
+
 /// 递归枚举目录下非空 .jsonl 为 SessionFileRef;`native_id` 从文件 stem 提取
 /// 会话 id(多数家恒等,codex 需剥 rollout 前缀)
 pub fn list_jsonl_refs(

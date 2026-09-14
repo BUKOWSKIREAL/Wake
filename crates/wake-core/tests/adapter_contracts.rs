@@ -1,4 +1,4 @@
-//! 十六家 adapter 的解析契约测试:全部走公开 API(`AgentAdapter` trait),
+//! 各家 adapter 的解析契约测试:全部走公开 API(`AgentAdapter` trait),
 //! fixture 为全合成数据(tests/fixtures/,SQLite 型在临时 HOME 里现建,
 //! dsh 的 zstd 日志由检入的明文 fixture 在临时 HOME 里压制)。
 //!
@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use wake_core::adapters::antigravity::AntigravityAdapter;
 use wake_core::adapters::claude::ClaudeAdapter;
+use wake_core::adapters::codebuddy::CodebuddyAdapter;
 use wake_core::adapters::codex::CodexAdapter;
 use wake_core::adapters::copilot::CopilotAdapter;
 use wake_core::adapters::cursor::CursorAdapter;
@@ -133,6 +134,23 @@ fn claude_images_ref() -> SessionFileRef {
         "44444444-aaaa-bbbb-cccc-000000000004",
     )
 }
+/// CodeBuddy 与 WorkBuddy 同构,同一份 fixture 两个 agent 复用(仅 root/AgentId 不同)
+fn codebuddy_ref(agent: AgentId) -> SessionFileRef {
+    fs_ref(
+        agent,
+        &fixture("codebuddy/projects/Users-fixture-src-wakefx/cb000001-aaaa-bbbb-cccc-000000000001.jsonl"),
+        "cb000001-aaaa-bbbb-cccc-000000000001",
+    )
+}
+
+fn codebuddy_topic_ref() -> SessionFileRef {
+    fs_ref(
+        AgentId::Codebuddy,
+        &fixture("codebuddy/projects/Users-fixture-src-wakefx/cb000002-aaaa-bbbb-cccc-000000000002.jsonl"),
+        "cb000002-aaaa-bbbb-cccc-000000000002",
+    )
+}
+
 fn codex_images_ref() -> SessionFileRef {
     fs_ref(
         AgentId::Codex,
@@ -1247,13 +1265,17 @@ fn overlapping_watch_roots_dispatch_to_deepest() {
 
 #[test]
 fn data_roots_contract() {
-    // roster 单实例契约:create_adapters 返回全量十六家(不按 detect 过滤,
+    // roster 单实例契约:create_adapters 返回全量各家(不按 detect 过滤,
     // scanner 对缺根家靠各自 list_session_files 降级为空);每家必须给出
     // 绝对路径的数据根——"Session locations" 面板、watch_paths 派生、按
     // (agent, 根) 计数全都建立在它上面
     let _env = setup();
     let adapters = wake_core::adapters::create_adapters();
-    assert_eq!(adapters.len(), 16, "全量 roster 必须十六家,含本机没装的");
+    assert_eq!(
+        adapters.len(),
+        AgentId::ALL.len(),
+        "全量 roster 必须每家一个实例,含本机没装的"
+    );
     for a in &adapters {
         let tag = a.agent().as_str();
         let roots = a.data_roots();
@@ -1436,6 +1458,14 @@ fn seq_contract_holds_for_all_agents() {
             db_ref(AgentId::Openclaw, &env.openclaw_db, "claw-0001"),
         ),
         (Box::new(OpenclawAdapter::new()), openclaw_legacy_ref(env)),
+        (
+            Box::new(CodebuddyAdapter::new()),
+            codebuddy_ref(AgentId::Codebuddy),
+        ),
+        (
+            Box::new(CodebuddyAdapter::workbuddy()),
+            codebuddy_ref(AgentId::Workbuddy),
+        ),
     ];
     for (adapter, r) in &checks {
         assert_seq_contract(adapter.as_ref(), r);
@@ -1933,7 +1963,7 @@ fn agent_id_all_matches_ord_and_roster() {
 fn removed_defaults_suppress_instances() {
     setup();
     let roster = wake_core::adapters::create_adapters_with(&[], &[AgentId::ClaudeCode]);
-    assert_eq!(roster.len(), 15);
+    assert_eq!(roster.len(), AgentId::ALL.len() - 1);
     assert!(roster.iter().all(|a| a.agent() != AgentId::ClaudeCode));
 
     let dir = tempfile::tempdir().unwrap();
@@ -2231,13 +2261,14 @@ fn adapter_ix_for_routes_to_owning_instance() {
     let custom = dir.path().to_path_buf();
     let roster =
         wake_core::adapters::create_adapters_with(&[(AgentId::ClaudeCode, custom.clone())], &[]);
-    assert_eq!(roster.len(), 17, "16 默认 + 1 自定义");
-    assert_eq!(roster[16].agent(), AgentId::ClaudeCode);
+    let defaults = AgentId::ALL.len();
+    assert_eq!(roster.len(), defaults + 1, "全量默认 + 1 自定义");
+    assert_eq!(roster[defaults].agent(), AgentId::ClaudeCode);
 
     let under = format!("{}/projects/p/x.jsonl", custom.display());
     assert_eq!(
         wake_core::adapters::adapter_ix_for(&roster, AgentId::ClaudeCode, &under),
-        Some(16),
+        Some(defaults),
         "自定义根下的文件应路由到自定义实例"
     );
     // 兄弟目录(裸前缀)不得吸入
@@ -2270,7 +2301,7 @@ fn remote_adapters_stay_inside_cache_and_rewrite_keys() {
     let empty = tempfile::tempdir().unwrap();
     let adapters =
         wake_core::adapters::remote::create_remote_adapters(&templates, "devbox", empty.path());
-    assert_eq!(adapters.len(), 16, "每家一个远程实例");
+    assert_eq!(adapters.len(), AgentId::ALL.len(), "每家一个远程实例");
     let cache_prefix = empty.path().to_string_lossy().to_string();
     for adapter in &adapters {
         assert_eq!(adapter.host(), "devbox");
@@ -2446,7 +2477,11 @@ fn roster_appends_remote_instances_for_enabled_hosts() {
 
     store.add_remote_host("devbox").unwrap();
     let roster = wake_core::adapters::create_adapter_roster_for(&store);
-    assert_eq!(roster.active.len(), local_n + 16, "每家一个远程实例");
+    assert_eq!(
+        roster.active.len(),
+        local_n + AgentId::ALL.len(),
+        "每家一个远程实例"
+    );
     assert_eq!(
         roster.locations.len(),
         locations_n,
@@ -2457,7 +2492,7 @@ fn roster_appends_remote_instances_for_enabled_hosts() {
         .iter()
         .filter(|a| a.host() == "devbox")
         .count();
-    assert_eq!(remote_count, 16);
+    assert_eq!(remote_count, AgentId::ALL.len());
     // 顺序契约:默认实例在前,"按 agent 找第一个"的兜底不受远程影响
     assert!(roster.active[..local_n].iter().all(|a| a.host().is_empty()));
 
@@ -2512,4 +2547,181 @@ fn remote_mount_shaping_is_stable_across_sync_states() {
             a.agent()
         );
     }
+}
+
+// ---------------------------------------------------------------- CodeBuddy
+
+/// CodeBuddy 的 Responses 形 JSONL 归桶:custom-title 压过前后的 ai-title、
+/// 占位 ai-title 不采信、模型取 requestModelName 且 last-wins、token 按调用的
+/// rawUsage 累加、reasoning 落 thinking、工具结果按 callId 回填并按 status 判错、
+/// 工具结果之后的 assistant 行另起一条(与 Claude 按 API 响应分条同粒度)、
+/// `<system-reminder>` 用户行归 Meta;summary / turn-metrics /
+/// file-history-snapshot 是已知元数据,只有 wibble-row 计 unknown
+#[test]
+fn codebuddy_parse_contract() {
+    let _env = setup();
+    let adapter = CodebuddyAdapter::new();
+    let r = codebuddy_ref(AgentId::Codebuddy);
+    let s = adapter.parse_session(&r).unwrap();
+    let t = adapter.parse_transcript(&r).unwrap();
+
+    assert_eq!(
+        s.meta.title, "QR effect cleanup",
+        "custom-title 压过 ai-title"
+    );
+    assert_eq!(
+        s.meta.model.as_deref(),
+        Some("Hy3-Pro"),
+        "requestModelName last-wins"
+    );
+    assert_eq!(s.meta.tokens_used, Some(1280 + 1440 + 1560));
+    assert_eq!(s.meta.project_path, "/Users/fixture/src/wakefx");
+    assert_eq!(s.meta.project_name, "wakefx");
+    assert_eq!(s.meta.created_at, 1781000000000);
+    assert_eq!(s.meta.updated_at, 1781000002400);
+    assert_eq!(s.meta.key, "codebuddy:cb000001-aaaa-bbbb-cccc-000000000001");
+    assert_eq!(s.unknown_line_count, 1); // wibble-row;summary/turn-metrics/file-history-snapshot 不计
+
+    let roles: Vec<Role> = t.mainline.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            Role::User,
+            Role::Assistant,
+            Role::Assistant,
+            Role::Assistant,
+            Role::User,
+            Role::Assistant,
+            Role::User,
+        ],
+        "工具结果之后的 assistant 行另起一条"
+    );
+    assert_eq!(s.meta.message_count, 6, "Meta 的 system-reminder 不计");
+    assert_eq!(t.mainline[6].kind, MessageKind::Meta);
+
+    let first = &t.mainline[1];
+    assert!(first
+        .thinking
+        .as_deref()
+        .is_some_and(|x| x.contains("without a cleanup return")));
+    assert_eq!(first.text, "先看一下组件源码。");
+    assert_eq!(first.model.as_deref(), Some("Hy3"));
+    assert_eq!(first.tool_calls.len(), 1);
+    assert_eq!(first.tool_calls[0].name, "Read");
+    assert!(
+        first.tool_calls[0]
+            .input
+            .as_deref()
+            .is_some_and(|i| i.contains("QrCode.tsx")),
+        "arguments JSON 字符串已解开"
+    );
+    assert!(first.tool_calls[0]
+        .output
+        .as_deref()
+        .is_some_and(|o| o.contains("setInterval")));
+    assert!(!first.tool_calls[0].is_error);
+
+    let second = &t.mainline[2];
+    assert_eq!(second.tool_calls.len(), 1);
+    assert_eq!(second.tool_calls[0].name, "Bash");
+    assert!(second.tool_calls[0].is_error, "status=failed 判错");
+    assert!(second.text.is_empty());
+
+    assert_eq!(
+        t.mainline[3].text,
+        "定时器没有在 cleanup 里 clearInterval,我来补上。"
+    );
+    assert_eq!(t.mainline[5].model.as_deref(), Some("Hy3-Pro"));
+
+    let text: String = s
+        .units
+        .iter()
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("二维码组件"), "搜索应索引到用户提问");
+    assert!(text.contains("clearInterval"), "搜索应索引到助手回复");
+}
+
+/// 没有 custom/ai 标题时退到 topic;reasoning 的 content.text 形也收进 thinking;
+/// 只有 model id 时就显示 id;rawUsage 缺 total_tokens 时按 prompt+completion 计
+#[test]
+fn codebuddy_topic_title_and_model_id_fallback() {
+    let _env = setup();
+    let adapter = CodebuddyAdapter::new();
+    let r = codebuddy_topic_ref();
+    let s = adapter.parse_session(&r).unwrap();
+    let t = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(s.meta.title, "Weekly report draft");
+    assert_eq!(s.meta.model.as_deref(), Some("hy3"));
+    assert_eq!(s.meta.tokens_used, Some(900 + 120));
+    assert_eq!(s.unknown_line_count, 0);
+    assert_eq!(t.mainline.len(), 2);
+    assert!(t.mainline[1]
+        .thinking
+        .as_deref()
+        .is_some_and(|x| x.contains("merged PRs")));
+}
+
+/// 枚举只认 slug 目录直属的转录:`<session>/subagents/agent-*.jsonl` 既不进列表、
+/// watcher 事件也被 file_ref 拒掉;自定义 location 选 `~/.codebuddy` 或 projects
+/// 目录都认;删除把 `<id>.meta.json` 与 `<id>/` 边车一并带走
+#[test]
+fn codebuddy_lists_only_top_level_transcripts() {
+    let _env = setup();
+    // 契约测试的假 home 不摆目录型 fixture(那是 cli / mcp / remote_sync 的活),
+    // 直接把检入的 fixture 树当自定义 location
+    let adapter = CodebuddyAdapter::new().with_custom_root(fixture("codebuddy"));
+    let root = adapter.data_roots()[0].clone();
+    let refs = adapter.list_session_files().unwrap();
+    assert_eq!(refs.len(), 2, "两条顶层会话");
+    assert!(refs.iter().all(|r| !r.file_path.contains("subagents")));
+
+    let main = root.join("Users-fixture-src-wakefx/cb000001-aaaa-bbbb-cccc-000000000001.jsonl");
+    let sub = root
+        .join("Users-fixture-src-wakefx/cb000001-aaaa-bbbb-cccc-000000000001/subagents/agent-deadbeef.jsonl");
+    assert!(sub.is_file(), "fixture 应带子代理转录");
+    assert!(adapter.file_ref(&main).is_some());
+    assert!(adapter.file_ref(&sub).is_none(), "子代理转录不是顶层会话");
+
+    let meta = adapter.parse_session(&refs[0]).unwrap().meta;
+    let paths = adapter.session_paths(&meta);
+    assert!(
+        paths.iter().any(|p| p.ends_with(".meta.json")),
+        "meta.json 边车随会话删"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.ends_with("cb000001-aaaa-bbbb-cccc-000000000001")),
+        "边车目录随会话删"
+    );
+
+    for dir in ["codebuddy", "codebuddy/projects"] {
+        let rooted = CodebuddyAdapter::new().with_custom_root(fixture(dir));
+        assert_eq!(rooted.list_session_files().unwrap().len(), 2, "{dir}");
+    }
+}
+
+/// WorkBuddy 是 CodeBuddy 的孪生实例(pi / omp 同款):同一解析核心,只有 agent
+/// 身份、key 前缀与数据根不同;没有 CLI,所以不给任何 resume 目标
+#[test]
+fn workbuddy_is_a_codebuddy_twin() {
+    let _env = setup();
+    let twin = CodebuddyAdapter::workbuddy();
+    assert_eq!(twin.agent(), AgentId::Workbuddy);
+    assert!(twin.data_roots()[0].ends_with(".workbuddy/projects"));
+
+    let rooted = twin.with_custom_root(fixture("codebuddy"));
+    let refs = rooted.list_session_files().unwrap();
+    assert_eq!(refs.len(), 2);
+    assert!(refs.iter().all(|r| r.agent == AgentId::Workbuddy));
+    let meta = rooted.parse_session(&refs[0]).unwrap().meta;
+    assert_eq!(meta.agent, AgentId::Workbuddy);
+    assert_eq!(meta.key, "workbuddy:cb000001-aaaa-bbbb-cccc-000000000001");
+    assert_eq!(meta.title, "QR effect cleanup");
+    assert!(
+        wake_core::services::terminal::resume_targets(&meta).is_empty(),
+        "没有 CLI 的 agent 不画 Open In"
+    );
 }

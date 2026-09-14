@@ -104,6 +104,8 @@ pub fn agent_series_color(agent: wake_core::models::AgentId) -> u32 {
         Qoder => 0x2BB454,
         Hermes => 0xE0B040,
         Openclaw => 0xE04A4A,
+        Codebuddy => 0x6C4DFF,
+        Workbuddy => 0x0EC8A9,
     }
 }
 

@@ -41,6 +41,8 @@ pub fn stage_dir_fixtures(home: &Path) {
         ("pi", ".pi"),
         ("pi", ".omp"),
         ("qoder", ".qoder"),
+        ("codebuddy", ".codebuddy"),
+        ("codebuddy", ".workbuddy"),
     ] {
         copy_tree(&fixture(src), &home.join(dst));
     }
@@ -454,6 +456,8 @@ pub fn clear_agent_env_overrides() {
         "QODER_CONFIG_DIR",
         "HERMES_HOME",
         "OPENCLAW_STATE_DIR",
+        "CODEBUDDY_CONFIG_DIR",
+        "WORKBUDDY_CONFIG_DIR",
     ] {
         std::env::remove_var(var);
     }

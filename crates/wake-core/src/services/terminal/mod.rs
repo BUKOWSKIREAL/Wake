@@ -139,6 +139,9 @@ pub fn agent_bin(agent: AgentId) -> Option<&'static str> {
         AgentId::Dsh => Some("npx"),
         AgentId::Hermes => Some("hermes"),
         AgentId::Openclaw => Some("openclaw"),
+        AgentId::Codebuddy => Some("codebuddy"),
+        // WorkBuddy 是桌面 app,没有 CLI
+        AgentId::Workbuddy => None,
     }
 }
 
@@ -181,6 +184,11 @@ fn resume_args(meta: &SessionMeta) -> Option<(Vec<String>, bool)> {
         // `--session-id` 只有一次性的 `openclaw agent` 认;Wake 存的是 session id,
         // 历史窗口(reset/rollover 之前的)也没有可续的 key——不提供 Open In
         AgentId::Openclaw => None,
+        // CodeBuddy 的历史会话按 cwd 分桶(`--continue` 只看当前目录),
+        // `--resume <id>`(别名 -r)同样在原项目目录启动最稳
+        AgentId::Codebuddy => Some((vec!["--resume".into(), id.into()], true)),
+        // WorkBuddy 只有桌面端、没有 CLI,没有可拼的 resume 命令——不画 Open In
+        AgentId::Workbuddy => None,
         // Kiro / Gemini CLI 没有按会话 id 续会话的形制
         AgentId::Kiro | AgentId::Gemini => None,
     }

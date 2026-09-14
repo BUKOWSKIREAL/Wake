@@ -147,7 +147,7 @@ Numeric options outside their range are clamped, not rejected: `--limit 999` on 
 
 ## Agent ids
 
-`claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`. Display names (`"Claude Code"`) and a few aliases (`claude`, `deepseek`) work too.
+`claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`. Display names (`"Claude Code"`) and a few aliases (`claude`, `deepseek`) work too.
 
 ## Session keys and references
 

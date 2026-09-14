@@ -28,46 +28,10 @@ impl QoderAdapter {
             .map(|dir| dir.join("projects"))
             // 与其他 env override 一致：存在但没有任何会话的候选不能遮掉
             // 默认根（Dock 启动与 shell 启动看到的环境经常不同）。
-            .filter(|dir| contains_session_file(dir))
+            .filter(|dir| project_tree_has_session(dir, AgentId::Qoder))
             .unwrap_or(default);
         Self { root }
     }
-}
-
-fn direct_jsonl_refs(dir: &Path) -> Vec<SessionFileRef> {
-    let mut refs = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return refs;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(mut r) = default_file_ref(AgentId::Qoder, &path) else {
-            continue;
-        };
-        r.agent = AgentId::Qoder;
-        refs.push(r);
-    }
-    refs
-}
-
-/// 默认根下是 `<project-key>/<session>.jsonl`；自定义 location 也允许直接
-/// 选中某个 project-key 目录，因此根直属与下一层两种形态都探。
-fn list_refs(root: &Path) -> Vec<SessionFileRef> {
-    let mut refs = direct_jsonl_refs(root);
-    let Ok(entries) = fs::read_dir(root) else {
-        return refs;
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            refs.extend(direct_jsonl_refs(&entry.path()));
-        }
-    }
-    refs.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-    refs
-}
-
-fn contains_session_file(root: &Path) -> bool {
-    !list_refs(root).is_empty()
 }
 
 #[derive(Clone)]
@@ -122,39 +86,6 @@ const KNOWN_METADATA_TYPES: &[&str] = &[
     "relocated",
     "worktree-state",
 ];
-
-fn optional_string(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn usage_tokens(usage: &Value) -> i64 {
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    if total > 0 {
-        return total;
-    }
-    let message_tokens: i64 = [
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ]
-    .iter()
-    .map(|key| usage.get(*key).and_then(Value::as_i64).unwrap_or(0))
-    .sum();
-    if message_tokens > 0 {
-        return message_tokens;
-    }
-    ["prompt_tokens", "completion_tokens"]
-        .iter()
-        .map(|key| usage.get(*key).and_then(Value::as_i64).unwrap_or(0))
-        .sum()
-}
 
 fn flush_assistant(
     pending: &mut Option<PendingAssistant>,
@@ -707,7 +638,7 @@ impl AgentAdapter for QoderAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        Ok(list_refs(&self.root))
+        Ok(list_project_tree_refs(&self.root, AgentId::Qoder))
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {

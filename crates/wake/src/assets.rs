@@ -59,6 +59,8 @@ brands!(
     "hermes",
     "hermes-light",
     "openclaw",
+    "codebuddy",
+    "workbuddy",
 );
 
 fn lookup_product(path: &str) -> Option<&'static [u8]> {

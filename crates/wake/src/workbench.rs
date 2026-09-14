@@ -2119,7 +2119,7 @@ impl UsageBoard {
         }
     }
 
-    /// Agents 全量列出(总共十六家);项目/模型长尾长,取前 6
+    /// Agents 全量列出(总共十八家);项目/模型长尾长,取前 6
     fn limit(self) -> usize {
         match self {
             Self::Agents => usize::MAX,

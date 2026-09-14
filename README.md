@@ -48,6 +48,8 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 | DeepSeek Harness (`dsh`) | `~/.dsh/sessions/**/session.jsonl[.zstd]` (zstd-compressed logs are decoded transparently) | ✅ | — |
 | Hermes Agent | `~/.hermes/state.db` + `profiles/*/state.db` (`HERMES_HOME` is respected) | ✅ | ✅ |
 | OpenClaw | `~/.openclaw/agents/*/agent/openclaw-agent.sqlite` + legacy `agents/*/sessions/*.jsonl` (`OPENCLAW_STATE_DIR` is respected) | ✅ | ✅ |
+| CodeBuddy | `~/.codebuddy/projects/*/*.jsonl` (`CODEBUDDY_CONFIG_DIR` is respected) | ✅ | — |
+| WorkBuddy | `~/.workbuddy/projects/*/*.jsonl` (`WORKBUDDY_CONFIG_DIR` is respected; desktop app, so no resume) | ✅ | — |
 
 **Model** = whether Wake shows which LLM a session used (the model the session last used). **Via** = whether Wake shows where the session was started from (CLI, IDE extension, desktop app) — Codex records this in its local data; Hermes and OpenClaw record the channel a session came in through (Telegram, Discord, …). A "—" means the agent's local data simply doesn't record that field, not a missing feature.
 
