@@ -225,6 +225,19 @@ pub fn host_cache_dir(db_dir: &Path, host: &str) -> PathBuf {
     db_dir.join("remotes").join(host)
 }
 
+/// 全部镜像(`<db 目录>/remotes/`)的磁盘占用。Settings → Data 的 Storage 行把它
+/// 并进索引库的大小——"Wake 在这台机器上占了多少盘"得含镜像(0.4.0 遗留)。
+/// 逐文件 stat,几千个文件也是毫秒级;调用方别放进每帧的 render,目录不存在即 0
+pub fn cache_bytes(db_dir: &Path) -> u64 {
+    walkdir::WalkDir::new(db_dir.join("remotes"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// ssh 的批处理选项:探测与 rsync 的 `-e` 同一份——认证/超时行为两步一致,
 /// 探测过了 rsync 就不会再卡在认证上
 const SSH_OPTS: [&str; 2] = ["-oBatchMode=yes", "-oConnectTimeout=10"];

@@ -1321,6 +1321,15 @@ impl ListDelegate for SearchDelegate {
                                     .child(h.session.title.clone()),
                             )
                             .child(div().flex_1())
+                            // 远程会话的 @host 徽章,与列表行同款(0.4.0 遗留:
+                            // 两台机器的同名会话在 ⌘K 里分不出来)
+                            .when(!h.session.host.is_empty(), |this| {
+                                this.child(badge(
+                                    format!("@{}", h.session.host),
+                                    theme.primary.opacity(0.14),
+                                    theme.primary,
+                                ))
+                            })
                             .child(
                                 div()
                                     .id(("search-hit-time", ix.row))

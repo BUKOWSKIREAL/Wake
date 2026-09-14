@@ -1033,3 +1033,61 @@ fn title_index_is_backfilled_for_older_databases() {
     );
     assert_eq!(store.search("Legacy", &[], None, 10).unwrap().0.len(), 1);
 }
+
+/// 同一会话在多台 host 上各有镜像(两个远程 host 其实是同一台机器,或本地也有
+/// 一份)时 Insights 只算一次——按 (agent, native id, created_at) 认同一会话,
+/// 取更新最晚的那份;同 id 不同 created_at 是两个会话(Hermes 式小整数 id)
+#[test]
+fn insights_counts_a_session_mirrored_on_several_hosts_once() {
+    let (_dir, store) = temp_store();
+    let prompt = |seq: i64| unit(seq, Role::User, "prompt");
+    let mirror = |key: &str, host: &str, tokens: i64| {
+        let mut m = meta(key, "mirrored");
+        m.id = "m1".into();
+        m.host = host.into();
+        m.tokens_used = Some(tokens);
+        m
+    };
+    let local = mirror("claude-code:m1", "", 100);
+    let a = mirror("claude-code:hosta:m1", "hosta", 100);
+    let mut b = mirror("claude-code:hostb:m1", "hostb", 300);
+    b.updated_at += 5_000; // 最新、最长的一份是统计口径
+    store
+        .write_session(&local, local.updated_at, &[prompt(0), prompt(2)])
+        .unwrap();
+    store
+        .write_session(&a, a.updated_at, &[prompt(0), prompt(2)])
+        .unwrap();
+    store
+        .write_session(&b, b.updated_at, &[prompt(0), prompt(2), prompt(4)])
+        .unwrap();
+    let mut seven = meta("hermes:7", "seven");
+    seven.agent = AgentId::Hermes;
+    let mut seven_remote = meta("hermes:hostb:7", "seven");
+    seven_remote.agent = AgentId::Hermes;
+    seven_remote.id = "7".into();
+    seven_remote.host = "hostb".into();
+    seven_remote.created_at += 1; // 不同起点:另一台机器自己的 7 号会话
+    store
+        .write_session(&seven, seven.updated_at, &[prompt(0)])
+        .unwrap();
+    store
+        .write_session(&seven_remote, seven_remote.updated_at, &[prompt(0)])
+        .unwrap();
+
+    let d = store
+        .insights(chrono::NaiveDate::from_ymd_opt(2026, 1, 13).unwrap())
+        .unwrap();
+    assert_eq!(d.sessions, 3, "三份镜像算一个会话,两个 hermes:7 是两个");
+    assert_eq!(d.prompts, 3 + 1 + 1, "镜像组只计最新那份的三条 prompt");
+    assert_eq!(d.tokens, 300, "tokens 同样只算最新那份");
+    let claude = d
+        .agents
+        .iter()
+        .find(|t| t.name == "claude-code")
+        .expect("claude-code 榜单行");
+    assert_eq!(
+        (claude.sessions, claude.prompts, claude.tokens),
+        (1, 3, 300)
+    );
+}

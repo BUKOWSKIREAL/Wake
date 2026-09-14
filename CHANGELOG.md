@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: "Copy SSH command" for a remote session now starts a login shell on the remote, so agents installed with nvm or another version manager are found
+- Fix: ⌘K / Ctrl+K results show the `@host` badge for sessions mirrored from a remote host
+- Fix: Insights no longer counts a session twice when it is mirrored from more than one host
+- Fix: Settings → Data includes the remote mirrors in the storage size
 - Fix: an agent's own Wake lookups (the `wake_*` tools, `wake-cli` commands) no longer show up as search hits in its session
 - Update: search now matches session titles too, in ⌘K / Ctrl+K, `wake_search` and `wake-cli search` — title hits come first and open the session at its start
 

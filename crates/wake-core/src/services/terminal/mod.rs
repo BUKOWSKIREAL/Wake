@@ -224,7 +224,7 @@ pub(crate) fn sh_command_line(bin: &str, args: &[String], cwd: Option<&str>) -> 
 }
 
 /// 远程会话的 resume 命令(阶段 1 只复制到剪贴板,不代起终端):
-/// `ssh -t <host> 'cd <远程cwd> && <agent CLI> <resume args>'`。
+/// `ssh -t <host> 'exec $SHELL -lic '\''cd <远程cwd> && <agent CLI> <resume args>'\'''`。
 /// CLI 用**裸名**交远端 PATH 解析——本地 resolve_cli 的绝对路径对远端无意义,
 /// 远端没装该 CLI 时由远端 shell 报 command not found(本地无从探测)。
 /// 内层永远是 POSIX 方言;外层整条给用户贴进本地终端(POSIX/PowerShell 的
@@ -238,10 +238,18 @@ pub fn ssh_resume_command(meta: &SessionMeta) -> Option<String> {
     // cwd 是远程路径,本地 is_dir 判据无意义:非空就 cd,空则落 ssh 默认 home
     let cwd = (!meta.project_path.is_empty()).then_some(meta.project_path.as_str());
     let inner = sh_command_line(bin, &args, cwd);
+    // sshd 给远端起的是非交互 shell:zsh 只读 .zshenv,bash 的 .bashrc 开头就对
+    // 非交互 return——nvm/volta/fnm 装的 claude、codex 全靠那些 rc 文件进 PATH,
+    // 直接跑就是 command not found(0.4.0 已知,用远程的人第一条就撞)。所以让
+    // 远端先起一个登录 + 交互 shell 再执行:`$SHELL` 由远端那个初始 shell 展开,
+    // 是该用户的登录 shell;-l 读 profile、-i 读 rc,PATH 与用户自己 ssh 进去
+    // 敲命令时一致;`-t` 给了 tty,交互 shell 不会抱怨。exec 不留一层空壳。
+    // 于是引号有三层(本地 shell → ssh → 远端 $SHELL -c),测试用 sh 逐层剥
+    let remote = format!("exec $SHELL -lic {}", sh_quote(&inner));
     Some(format!(
         "ssh -t {} {}",
         sh_quote(&meta.host),
-        sh_quote(&inner)
+        sh_quote(&remote)
     ))
 }
 
@@ -529,11 +537,32 @@ mod tests {
     fn ssh_resume_command_quotes_nested_layers() {
         let meta = remote_meta(AgentId::Codex, "abc-123", "/home/dev/my project");
         let cmd = super::ssh_resume_command(&meta).unwrap();
-        // 内层 cd 的单引号在外层被 '\'' 转义,整条可直接贴 POSIX shell
+        // 三层:本地 shell 剥一层给 ssh,远端登录 shell 剥一层给 exec 的
+        // $SHELL -lic,再剥一层才是 cd && codex;每层的单引号都以 '\'' 逐级转义
         assert_eq!(
             cmd,
-            r"ssh -t devbox 'cd '\''/home/dev/my project'\'' && codex resume abc-123'"
+            r"ssh -t devbox 'exec $SHELL -lic '\''cd '\''\'\'''\''/home/dev/my project'\''\'\'''\'' && codex resume abc-123'\'''"
         );
+    }
+
+    /// 真拿 sh 逐层剥引号:每一层都是合法 POSIX,最里层就是 cd && resume,
+    /// 且 `$SHELL` 一路以字面量穿到远端才展开
+    #[cfg(unix)]
+    #[test]
+    fn ssh_resume_command_unquotes_layer_by_layer() {
+        fn unquote(shell_words: &str) -> String {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {shell_words}"))
+                .output()
+                .expect("sh");
+            String::from_utf8(out.stdout).unwrap()
+        }
+        let meta = remote_meta(AgentId::Codex, "abc-123", "/home/dev/my project");
+        let cmd = super::ssh_resume_command(&meta).unwrap();
+        let remote = unquote(cmd.strip_prefix("ssh -t devbox ").unwrap());
+        let inner = unquote(remote.strip_prefix("exec $SHELL -lic ").unwrap());
+        assert_eq!(inner, "cd '/home/dev/my project' && codex resume abc-123");
     }
 
     #[test]
@@ -542,14 +571,14 @@ mod tests {
         let meta = remote_meta(AgentId::ClaudeCode, "u-1", "");
         assert_eq!(
             super::ssh_resume_command(&meta).unwrap(),
-            "ssh -t devbox 'claude --resume u-1'"
+            r"ssh -t devbox 'exec $SHELL -lic '\''claude --resume u-1'\'''"
         );
         // opencode2 会话换二进制,与本地 resume 同一分流
         let mut meta = remote_meta(AgentId::Opencode, "s1", "/w");
         meta.source = Some("opencode2".into());
         assert_eq!(
             super::ssh_resume_command(&meta).unwrap(),
-            "ssh -t devbox 'cd /w && opencode2 --session s1'"
+            r"ssh -t devbox 'exec $SHELL -lic '\''cd /w && opencode2 --session s1'\'''"
         );
         // 本地会话不产出 ssh 命令
         let mut meta = remote_meta(AgentId::Codex, "abc", "/w");
