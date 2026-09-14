@@ -1498,6 +1498,14 @@ impl Store {
         }
         let degraded = segs.iter().any(|s| s.chars().count() < 3);
         let limit = if f.limit > 0 { f.limit } else { 60 };
+        // 近因加权:bm25 是负数、越小越相关,乘上 (1 + W / (1 + 距今天数 / H)) 让
+        // 新会话的命中"更负"。W = 1、H = 30 天:今天的会话 ×2、一个月前 ×1.5、
+        // 一年前 ×1.08——同等文本相关性下新会话在前,文本相关性差一倍以上的老命中
+        // 仍然赢得过。按会话的 updated_at 而不是消息自己的 ts:排的是"该翻哪场
+        // 对话",同一会话内各命中的相对顺序不受影响。只用四则运算与 max(),不依赖
+        // SQLite 的数学扩展;`?` 是当前时间(毫秒)。降级的 LIKE 路径本来就按时间排
+        const RECENCY_BOOST: &str = "(1.0 + 1.0 / (1.0 + max(0, ? - s.updated_at) / 2592000000.0))";
+        let now = now_ms();
 
         // 会话侧筛选(agent / 项目并集 / 时间下界):SQL 片段拼一次,参数按需重建
         // ——正文与标题是两条查询,Box<dyn ToSql> 不能 clone
@@ -1548,7 +1556,7 @@ impl Store {
                  JOIN messages m ON m.id = messages_fts.rowid
                  JOIN sessions s ON s.key = m.session_key
                  WHERE messages_fts MATCH ?{filter_sql}
-                 ORDER BY bm25(messages_fts) LIMIT ?"
+                 ORDER BY bm25(messages_fts) * {RECENCY_BOOST} LIMIT ?"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -1557,6 +1565,7 @@ impl Store {
                 Box::new(match_expr.clone()),
             ];
             all_args.extend(filter_args(f));
+            all_args.push(Box::new(now));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
@@ -1628,7 +1637,7 @@ impl Store {
                 "SELECT t.key, highlight(titles_fts, 1, ?, ?)
                  FROM titles_fts t JOIN sessions s ON s.key = t.key
                  WHERE titles_fts MATCH ?{filter_sql}
-                 ORDER BY bm25(titles_fts) LIMIT ?"
+                 ORDER BY bm25(titles_fts) * {RECENCY_BOOST} LIMIT ?"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -1637,6 +1646,7 @@ impl Store {
                 Box::new(match_expr),
             ];
             all_args.extend(filter_args(f));
+            all_args.push(Box::new(now));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),

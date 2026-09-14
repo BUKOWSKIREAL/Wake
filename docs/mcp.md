@@ -141,7 +141,7 @@ Full-text search across every indexed session: titles, user prompts, assistant r
 | `project`, `agents`, `since` | | | see above |
 | `limit` | integer 1–30 | 10 | maximum sessions returned |
 
-Results are grouped by session, best matches first, with up to three snippets per session. Each snippet carries a reference of the form `wake://session/<key>#<seq>` that `wake_get_session` accepts directly. Archived sessions are included.
+Results are grouped by session, best matches first, with up to three snippets per session. Recently active sessions get a mild boost: an equally good match from last week outranks one from last year, but a clearly better match still wins regardless of age. Each snippet carries a reference of the form `wake://session/<key>#<seq>` that `wake_get_session` accepts directly. Archived sessions are included.
 
 ```
 26 sessions match `二维码` (project /Users/me/Github/app) — showing 3, best matches first.

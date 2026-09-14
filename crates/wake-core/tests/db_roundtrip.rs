@@ -1091,3 +1091,40 @@ fn insights_counts_a_session_mirrored_on_several_hosts_once() {
         (1, 3, 300)
     );
 }
+
+/// 近因加权:同等文本相关性下最近活跃的会话排前面(bm25 同分时原本按写入顺序,
+/// 先写的老会话在前),标题命中与正文命中同一规则
+#[test]
+fn search_ranks_recently_active_sessions_higher() {
+    let (_dir, store) = temp_store();
+    let now = wake_core::db::now_ms();
+    let day = 86_400_000;
+    let mut old = meta("claude-code:old", "缓存策略讨论");
+    old.updated_at = now - 400 * day;
+    let mut fresh = meta("claude-code:fresh", "缓存策略讨论");
+    fresh.updated_at = now - day;
+    for m in [&old, &fresh] {
+        store
+            .write_session(
+                m,
+                m.updated_at,
+                &[unit(0, Role::User, "缓存失效要不要加 jitter")],
+            )
+            .unwrap();
+    }
+    let (hits, _) = store.search("缓存失效", &[], None, 10).unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.session.key.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-code:fresh", "claude-code:old"]
+    );
+    let (hits, _) = store.search("缓存策略", &[], None, 10).unwrap();
+    assert!(hits.iter().all(|h| h.role == "title"));
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.session.key.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-code:fresh", "claude-code:old"]
+    );
+}
