@@ -773,7 +773,11 @@ impl ListDelegate for SessionsDelegate {
                                             .flex_shrink_0()
                                             .child(format!("{child_count}"))
                                             .tooltip(move |window, cx| {
-                                                gpui_component::tooltip::Tooltip::new(crate::tp!("{} nested session", "{} nested sessions", child_count))
+                                                gpui_component::tooltip::Tooltip::new(crate::tp!(
+                                                    "{} nested session",
+                                                    "{} nested sessions",
+                                                    child_count
+                                                ))
                                                 .build(window, cx)
                                             }),
                                     )
@@ -1439,7 +1443,9 @@ impl ListDelegate for SearchDelegate {
                 .pb(SPACE_XS)
                 .text_size(FONT_LABEL)
                 .text_color(cx.theme().muted_foreground)
-                .child(t("Short query — using fallback search. Longer keywords are faster.")),
+                .child(t(
+                    "Short query — using fallback search. Longer keywords are faster.",
+                )),
         )
     }
 }
@@ -1463,11 +1469,18 @@ fn load_visible_transcript(
     // adapter_for 按文件路径挑实例：自定义 location 的会话必须由拥有其根的
     // 实例解析；完全找不到对应 agent 时保留可读错误，不再静默变成空详情。
     let adapter = adapter_for(adapters, meta.agent, &meta.file_path).ok_or_else(|| {
-        crate::tf!("No {} adapter is available for this session path.", meta.agent.display_name())
+        crate::tf!(
+            "No {} adapter is available for this session path.",
+            meta.agent.display_name()
+        )
     })?;
     let session_ref = SessionFileRef::from_meta(meta);
     let transcript = adapter.parse_transcript(&session_ref).map_err(|error| {
-        crate::tf!("Failed to parse {} session data: {}", meta.agent.display_name(), format!("{error:#}"))
+        crate::tf!(
+            "Failed to parse {} session data: {}",
+            meta.agent.display_name(),
+            format!("{error:#}")
+        )
     })?;
 
     Ok(transcript
@@ -2204,7 +2217,11 @@ impl Workbench {
         let (store, db_note) = match wake_core::db::open_or_rebuild(&db_path) {
             Ok(v) => v,
             Err(e) => {
-                terminal::show_fatal_alert(&crate::tf!("Wake couldn't open or rebuild its index at {}. {}", db_path.display(), e));
+                terminal::show_fatal_alert(&crate::tf!(
+                    "Wake couldn't open or rebuild its index at {}. {}",
+                    db_path.display(),
+                    e
+                ));
                 std::process::exit(1);
             }
         };
@@ -2836,7 +2853,9 @@ impl Workbench {
                         .child(t("Add remote host")),
                 )
                 .w(px(500.))
-                .button_props(gpui_component::dialog::DialogButtonProps::default().ok_text(t("Add")))
+                .button_props(
+                    gpui_component::dialog::DialogButtonProps::default().ok_text(t("Add")),
+                )
                 .child(
                     v_flex()
                         .gap(SPACE_MD)
@@ -2881,8 +2900,11 @@ impl Workbench {
                         .w_full()
                         .px(field_inset)
                         .child(
-                            gpui_component::dialog::DialogClose::new()
-                                .child(Button::new("remote-host-cancel").label(t("Cancel")).outline()),
+                            gpui_component::dialog::DialogClose::new().child(
+                                Button::new("remote-host-cancel")
+                                    .label(t("Cancel"))
+                                    .outline(),
+                            ),
                         )
                         .child(
                             gpui_component::dialog::DialogAction::new()
@@ -2909,9 +2931,9 @@ impl Workbench {
         }
         if !wake_core::remote::valid_host_name(name) {
             window.push_notification(
-                Notification::error(
-                    t("Host must be an SSH alias or user@host (letters, digits, . _ - @)"),
-                ),
+                Notification::error(t(
+                    "Host must be an SSH alias or user@host (letters, digits, . _ - @)",
+                )),
                 cx,
             );
             return false;
@@ -2965,7 +2987,9 @@ impl Workbench {
             SharedString,
         ) = match &target {
             FormTarget::Add => (t("Add location"), t("Add"), AgentId::ClaudeCode, "".into()),
-            FormTarget::Edit { agent, path, .. } => (t("Edit location"), t("Save"), *agent, path.clone()),
+            FormTarget::Edit { agent, path, .. } => {
+                (t("Edit location"), t("Save"), *agent, path.clone())
+            }
         };
         // 占位符须与校验规则(Path::is_absolute)同形:Windows 上没有盘符
         // 的 `/absolute/...` 并不算绝对路径,照着占位符敲会被拒
@@ -3310,7 +3334,10 @@ impl Workbench {
         // **必须判在剪尾之前**:`//` 剪完是空串,若拿剪后的结果去判就会退回
         // 未剪形态放行,而旧版是拒的(2026-08-25 review)
         if !std::path::Path::new(&expanded).is_absolute() {
-            window.push_notification(Notification::warning(t("Enter an absolute folder path")), cx);
+            window.push_notification(
+                Notification::warning(t("Enter an absolute folder path")),
+                cx,
+            );
             return false;
         }
         // 尾分隔符归一(展示与重叠判定都吃这份);裸根("/"、"C:\")剪完会
@@ -3512,7 +3539,10 @@ impl Workbench {
     ) {
         match res {
             Err(e) => {
-                window.push_notification(Notification::error(crate::tf!("{}: {}", err_prefix, e)), cx);
+                window.push_notification(
+                    Notification::error(crate::tf!("{}: {}", err_prefix, e)),
+                    cx,
+                );
             }
             Ok(()) => {
                 self.rebuild_roster(cx);
@@ -3539,7 +3569,9 @@ impl Workbench {
                 let tally = session_tally(counts.get(&host.name).copied().unwrap_or(0));
                 let (status, failed) = match (&host.last_sync_error, host.last_sync_at) {
                     (Some(err), _) => (crate::tf!("Sync failed: {}", err), true),
-                    (None, Some(ts)) => (crate::tf!("{} · synced {}", tally, smart_time(ts)), false),
+                    (None, Some(ts)) => {
+                        (crate::tf!("{} · synced {}", tally, smart_time(ts)), false)
+                    }
                     (None, None) => (crate::tf!("{} · never synced", tally), false),
                 };
                 RemoteHostRow {
@@ -3560,9 +3592,9 @@ impl Workbench {
     ) {
         if !wake_core::remote::valid_host_name(name) {
             window.push_notification(
-                Notification::error(
-                    t("Host must be an SSH alias or user@host (letters, digits, . _ - @)"),
-                ),
+                Notification::error(t(
+                    "Host must be an SSH alias or user@host (letters, digits, . _ - @)",
+                )),
                 cx,
             );
             return;
@@ -4567,9 +4599,8 @@ impl Workbench {
                     // 立刻把它从列表摘掉,不等 watcher 那 800ms 去抖
                     this.refresh(cx);
                 }
-                Err(e) => {
-                    window.push_notification(Notification::error(crate::tf!("Delete failed: {}", e)), cx)
-                }
+                Err(e) => window
+                    .push_notification(Notification::error(crate::tf!("Delete failed: {}", e)), cx),
             })
             .ok();
         })
@@ -4582,7 +4613,9 @@ impl Workbench {
         // 缓存副本,trash 它下次同步就复活;动远端文件是阶段 3 的产品决定
         if !detail.meta.host.is_empty() {
             window.push_notification(
-                Notification::info(t("Remote sessions are read-only — files stay on the remote host")),
+                Notification::info(t(
+                    "Remote sessions are read-only — files stay on the remote host",
+                )),
                 cx,
             );
             return;
@@ -4717,7 +4750,10 @@ impl Workbench {
             // rsync 与扫描并行;扫描先收工时这里接着展示同步状态
             Some(crate::tf!("Syncing {}…", only))
         } else if !self.syncing_hosts.is_empty() {
-            Some(crate::tf!("Syncing {} remote hosts…", self.syncing_hosts.len()))
+            Some(crate::tf!(
+                "Syncing {} remote hosts…",
+                self.syncing_hosts.len()
+            ))
         } else {
             self.scan
                 .error
@@ -4823,7 +4859,13 @@ impl Workbench {
                             .child(icon("icons/search.svg").with_size(px(13.)).flex_shrink_0())
                             // flex_1 + min_w_0 + truncate:空间不足时压这里,
                             // 绝不把右侧刷新按钮挤出侧栏
-                            .child(div().flex_1().min_w_0().truncate().child(t("Search sessions")))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(t("Search sessions")),
+                            )
                             .child(
                                 div()
                                     .flex_shrink_0()
@@ -5041,11 +5083,15 @@ impl Workbench {
             SortKey::Created => t("Date created"),
             SortKey::Messages => t("Message count"),
         };
-        let sort_tooltip = crate::tf!("Sort by {} · {}", sort_label, if sort_ascending {
+        let sort_tooltip = crate::tf!(
+            "Sort by {} · {}",
+            sort_label,
+            if sort_ascending {
                 t("Ascending")
             } else {
                 t("Descending")
-            });
+            }
+        );
         // 与详情工具栏统一：icon-only ghost，常态透明、hover 才出现背景。
         let sort_menu = Button::new("sort-sessions")
             .ghost()
@@ -6030,7 +6076,10 @@ impl Workbench {
                     px(58.),
                     px(26.),
                     t("No session selected"),
-                    crate::tf!("Pick one from the list, or press {} to search.", search_key_hint()),
+                    crate::tf!(
+                        "Pick one from the list, or press {} to search.",
+                        search_key_hint()
+                    ),
                     cx,
                 ))
                 .into_any_element();
@@ -6867,7 +6916,13 @@ fn hour_label(h: usize) -> String {
 // 数组(7/12 个 &'static str 的拷贝,栈上,比查一次表还便宜)
 fn dow_short() -> [&'static str; 7] {
     [
-        t("Mon"), t("Tue"), t("Wed"), t("Thu"), t("Fri"), t("Sat"), t("Sun"),
+        t("Mon"),
+        t("Tue"),
+        t("Wed"),
+        t("Thu"),
+        t("Fri"),
+        t("Sat"),
+        t("Sun"),
     ]
 }
 fn dow_plural() -> [&'static str; 7] {
@@ -7155,7 +7210,11 @@ fn render_week_section(d: &InsightsData, cx: &App) -> AnyElement {
                     0 => (t("Same as last week").into(), theme.muted_foreground),
                     p => (
                         crate::tf!("{}% vs last week", format!("{p:+}")).into(),
-                        if p > 0 { theme.primary } else { theme.muted_foreground },
+                        if p > 0 {
+                            theme.primary
+                        } else {
+                            theme.muted_foreground
+                        },
                     ),
                 }
             }
@@ -7232,7 +7291,11 @@ fn render_trend(start: chrono::NaiveDate, layers: Rc<Vec<TrendLayer>>, cx: &App)
         columns = columns.child(column.id(("trend", w)).flex_shrink_0().tooltip(
             move |window, cx| {
                 let monday = start + chrono::Days::new(w as u64 * 7);
-                let mut label = crate::tf!("Week of {} · {}", monday.format(t("%b %-d")), prompts_label(total));
+                let mut label = crate::tf!(
+                    "Week of {} · {}",
+                    monday.format(t("%b %-d")),
+                    prompts_label(total)
+                );
                 let breakdown: Vec<String> = layers
                     .iter()
                     .filter(|l| l.weekly[w] > 0)
@@ -7350,7 +7413,8 @@ fn render_heatmap(d: &InsightsData, cx: &App) -> AnyElement {
                     // 只捕获 Copy 的 (start, ix, n),hover 到的那格才格式化
                     .tooltip(move |window, cx| {
                         let day = start + chrono::Days::new(ix as u64);
-                        let label = format!("{} · {}", prompts_label(n), day.format(t("%b %-d, %Y")));
+                        let label =
+                            format!("{} · {}", prompts_label(n), day.format(t("%b %-d, %Y")));
                         gpui_component::tooltip::Tooltip::new(SharedString::from(label))
                             .build(window, cx)
                     }),
@@ -7368,7 +7432,11 @@ fn render_heatmap(d: &InsightsData, cx: &App) -> AnyElement {
         notes.push(crate::tf!("Longest {} days", d.longest_streak));
     }
     if let Some((day, n)) = d.busiest_day() {
-        notes.push(crate::tf!("Busiest {} ({})", day.format(t("%b %-d")), prompts_label(n)));
+        notes.push(crate::tf!(
+            "Busiest {} ({})",
+            day.format(t("%b %-d")),
+            prompts_label(n)
+        ));
     }
     let legend = h_flex()
         .justify_between()

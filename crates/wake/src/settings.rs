@@ -13,8 +13,8 @@ use wake_core::models::AgentId;
 
 use crate::format::tilde_path;
 use crate::ui::{
-    overlay_layers, BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_HEADING, FONT_LABEL,
-    FONT_TITLE, RADIUS_BUTTON, show_in_fm, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS,
+    overlay_layers, show_in_fm, BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_HEADING,
+    FONT_LABEL, FONT_TITLE, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS,
     SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
@@ -429,20 +429,19 @@ impl SettingsView {
                         .map(|locale| (Some(locale.tag), locale.name)),
                 );
                 for (tag, name) in options {
-                    menu = menu.item(
-                        PopupMenuItem::new(name)
-                            .checked(tag == current)
-                            .on_click(move |_, window, cx| {
-                                if let Err(error) = crate::i18n::set_language(tag, cx) {
-                                    window.push_notification(
-                                        gpui_component::notification::Notification::error(
-                                            crate::tf!("Couldn't save language: {}", error),
-                                        ),
-                                        cx,
-                                    );
-                                }
-                            }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(name).checked(tag == current).on_click(
+                        move |_, window, cx| {
+                            if let Err(error) = crate::i18n::set_language(tag, cx) {
+                                window.push_notification(
+                                    gpui_component::notification::Notification::error(crate::tf!(
+                                        "Couldn't save language: {}",
+                                        error
+                                    )),
+                                    cx,
+                                );
+                            }
+                        },
+                    ));
                 }
                 menu
             })
@@ -483,7 +482,10 @@ impl SettingsView {
                         cx.notify();
                     }
                     Err(error) => window.push_notification(
-                        gpui_component::notification::Notification::error(crate::tf!("Couldn't save appearance: {}", error)),
+                        gpui_component::notification::Notification::error(crate::tf!(
+                            "Couldn't save appearance: {}",
+                            error
+                        )),
                         cx,
                     ),
                 }
@@ -1057,9 +1059,11 @@ impl SettingsView {
             UpdateStatus::UpToDate { latest } => {
                 crate::tf!("No newer release is available (latest: {}).", latest).into()
             }
-            UpdateStatus::Available { latest } => {
-                crate::tf!("Wake {} is available. Open the release page to download it.", latest).into()
-            }
+            UpdateStatus::Available { latest } => crate::tf!(
+                "Wake {} is available. Open the release page to download it.",
+                latest
+            )
+            .into(),
             UpdateStatus::Failed => {
                 t("Couldn't check for updates. Check your connection and try again.").into()
             }
@@ -1175,11 +1179,14 @@ impl SettingsView {
                 let edit_row = edit_row.clone();
                 let mut menu = menu
                     .min_w(px(180.))
-                    .item(PopupMenuItem::new(t("Edit…")).on_click(move |_, window, cx| {
-                        let row = edit_row.clone();
-                        workbench
-                            .update(cx, |this, cx| this.open_edit_location_form(row, window, cx));
-                    }));
+                    .item(
+                        PopupMenuItem::new(t("Edit…")).on_click(move |_, window, cx| {
+                            let row = edit_row.clone();
+                            workbench.update(cx, |this, cx| {
+                                this.open_edit_location_form(row, window, cx)
+                            });
+                        }),
+                    );
                 if exists {
                     let path = reveal_path.clone();
                     menu = menu.item(PopupMenuItem::new(show_in_fm()).on_click(move |_, _, _| {
@@ -1188,14 +1195,16 @@ impl SettingsView {
                 }
                 if let Some(stored) = remove_target.clone() {
                     let workbench = edit_workbench.clone();
-                    menu = menu.separator().item(PopupMenuItem::new(t("Remove")).on_click(
-                        move |_, window, cx| {
-                            let stored = stored.clone();
-                            workbench.update(cx, |this, cx| {
-                                this.delete_location(remove_agent, stored, window, cx)
-                            });
-                        },
-                    ));
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(t("Remove")).on_click(move |_, window, cx| {
+                                let stored = stored.clone();
+                                workbench.update(cx, |this, cx| {
+                                    this.delete_location(remove_agent, stored, window, cx)
+                                });
+                            }),
+                        );
                 }
                 menu
             });
@@ -1514,12 +1523,14 @@ impl SettingsView {
                                     }),
                             )
                             .separator()
-                            .item(PopupMenuItem::new(t("Remove")).on_click(move |_, window, cx| {
-                                let name = remove_name.clone();
-                                remove_workbench.update(cx, |this, cx| {
-                                    this.confirm_remove_remote_host(name, window, cx)
-                                });
-                            }))
+                            .item(
+                                PopupMenuItem::new(t("Remove")).on_click(move |_, window, cx| {
+                                    let name = remove_name.clone();
+                                    remove_workbench.update(cx, |this, cx| {
+                                        this.confirm_remove_remote_host(name, window, cx)
+                                    });
+                                }),
+                            )
                     });
                 div()
                     .w_full()

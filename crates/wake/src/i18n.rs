@@ -36,7 +36,11 @@ use gpui::App;
 /// `$name` 仍然保留且必须一致(测试卡住),外部包就靠它。
 const BUNDLED: &[(&str, &str, &str)] = &[
     ("en", "English", include_str!("../locales/en.json")),
-    ("zh-Hans", "简体中文", include_str!("../locales/zh-Hans.json")),
+    (
+        "zh-Hans",
+        "简体中文",
+        include_str!("../locales/zh-Hans.json"),
+    ),
 ];
 
 /// 语言包里 native name 的保留 key(`$` 前缀不会与任何 UI 文案撞)
@@ -123,7 +127,12 @@ pub fn tf(key: &'static str, args: &[&dyn std::fmt::Display]) -> String {
 
 /// 英语的单复数:`n == 1` 取 one 支,否则取 other 支。两支都是完整句子
 /// (`"{} session"` / `"{} sessions"`),中文两条译成同一句即可
-pub fn tp(one: &'static str, other: &'static str, n: i64, args: &[&dyn std::fmt::Display]) -> String {
+pub fn tp(
+    one: &'static str,
+    other: &'static str,
+    n: i64,
+    args: &[&dyn std::fmt::Display],
+) -> String {
     tf(if n == 1 { one } else { other }, args)
 }
 
@@ -395,9 +404,18 @@ mod tests {
 
     fn locales() -> Vec<Locale> {
         vec![
-            Locale { tag: "zh-Hans", name: "简体中文" },
-            Locale { tag: "zh-Hant", name: "繁體中文" },
-            Locale { tag: "ja", name: "日本語" },
+            Locale {
+                tag: "zh-Hans",
+                name: "简体中文",
+            },
+            Locale {
+                tag: "zh-Hant",
+                name: "繁體中文",
+            },
+            Locale {
+                tag: "ja",
+                name: "日本語",
+            },
         ]
     }
 
@@ -431,10 +449,22 @@ mod tests {
     #[test]
     fn exact_tag_wins_over_a_shorter_prefix() {
         let all = vec![
-            Locale { tag: "en", name: "English" },
-            Locale { tag: "en-GB", name: "English (UK)" },
-            Locale { tag: "pt", name: "Português" },
-            Locale { tag: "pt-BR", name: "Português (Brasil)" },
+            Locale {
+                tag: "en",
+                name: "English",
+            },
+            Locale {
+                tag: "en-GB",
+                name: "English (UK)",
+            },
+            Locale {
+                tag: "pt",
+                name: "Português",
+            },
+            Locale {
+                tag: "pt-BR",
+                name: "Português (Brasil)",
+            },
         ];
         assert_eq!(match_system("en-GB", &all), Some("en-GB"));
         assert_eq!(match_system("en-US", &all), Some("en"));
@@ -552,7 +582,9 @@ mod tests {
 
     /// 拿 `provided` 个哑参数把模板填满,用于检查有没有填不掉的花括号
     fn tf_with(template: &str, provided: usize) -> String {
-        let args: Vec<&dyn std::fmt::Display> = (0..provided).map(|_| &"x" as &dyn std::fmt::Display).collect();
+        let args: Vec<&dyn std::fmt::Display> = (0..provided)
+            .map(|_| &"x" as &dyn std::fmt::Display)
+            .collect();
         // tf 走 t() 查表,这里要的是模板本身,故复制那几行的效果:
         // 未装表时 t(key) == key,测试进程从不 load,恒等成立
         tf(Box::leak(template.to_string().into_boxed_str()), &args)
