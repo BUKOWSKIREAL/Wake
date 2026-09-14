@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.6.4] — 2026-09-14
 
 - New: CodeBuddy and WorkBuddy support — sessions from Tencent's CodeBuddy Code CLI and the WorkBuddy desktop agent now show up alongside every other agent, with search and the transcript view, plus one-click resume for CodeBuddy
 - Update: `wake-cli index` shows its progress in the terminal while it scans; when piped or run by an agent it stays quiet until the summary
