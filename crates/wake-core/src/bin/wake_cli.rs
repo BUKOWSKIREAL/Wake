@@ -99,9 +99,8 @@ fn run(db: &Option<PathBuf>, tool: &str, args: &serde_json::Value) -> ExitCode {
 fn index(path: &Path) -> Result<String, tools::ToolError> {
     // 进度只给终端看:全量扫描要几秒到几十秒,没有反馈像卡死;管道与 agent
     // 调用时 stderr 保持安静(它是诊断通道,tests/cli.rs 也这么断言)
-    let tty = TtyProgress;
     let events: &dyn ScanEvents = if io::stderr().is_terminal() {
-        &tty
+        &TtyProgress
     } else {
         &NullEvents
     };
@@ -127,19 +126,13 @@ fn index(path: &Path) -> Result<String, tools::ToolError> {
     ))
 }
 
-/// `index` 在终端上的进度:同一行原地刷新 `Indexing done/total`,终态换行收尾,
-/// 结果本身仍由 stdout 给。写失败一律忽略——进度条不是结果
+/// `index` 在终端上的进度:格式在 `cli::progress_line`(有单测),这里只负责
+/// "写到 stderr"。写失败一律忽略——进度条不是结果;stderr 无缓冲,不需要 flush
 struct TtyProgress;
 
 impl ScanEvents for TtyProgress {
     fn on_progress(&self, p: &ScanProgress) {
-        let mut err = io::stderr().lock();
-        let _ = match (p.scanning, p.total) {
-            (true, 0) => write!(err, "\rIndexing…"),
-            (true, total) => write!(err, "\rIndexing {}/{total}…", p.done),
-            (false, _) => writeln!(err, "\rIndexed {}/{} files.", p.done, p.total),
-        };
-        let _ = err.flush();
+        let _ = cli::progress_line(p, &mut io::stderr().lock());
     }
     fn on_sessions_changed(&self) {}
 }

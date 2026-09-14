@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 
 use crate::mcp::tools;
 use crate::models::AgentId;
+use crate::scanner::ScanProgress;
 use crate::services::terminal::sh_quote;
 
 // ---------------------------------------------------------------- 命令表
@@ -332,6 +333,20 @@ pub fn emit(text: &str, out: &mut impl Write) -> std::io::Result<()> {
         out.write_all(b"\n")?;
     }
     out.flush()
+}
+
+/// `wake-cli index` 在终端上的进度行:同一行 `\r` 原地刷新,终态**只补一个换行**。
+/// 不在这里宣布 "Indexed …"——那句由 bin 用库里查出来的会话数在 stdout 说,进度
+/// 只知道文件数(墓碑/解析失败的文件也计 done),两个数字并排只会互相打架;而且
+/// 扫描收尾(parent_links / backfill)出错时 done 已经等于 total,先打一行成功再
+/// 跟一行错误是撒谎。总数未知的首帧只写 "Indexing…"。写到哪条流、写不写由调用方
+/// 定(bin 只在 stderr 是 TTY 时调);行只会变长(总数定了、done 单调增),不必补空格
+pub fn progress_line(p: &ScanProgress, out: &mut impl Write) -> std::io::Result<()> {
+    match (p.scanning, p.total) {
+        (true, 0) => write!(out, "\rIndexing…"),
+        (true, total) => write!(out, "\rIndexing {}/{total}…", p.done),
+        (false, _) => writeln!(out),
+    }
 }
 
 // ---------------------------------------------------------------- 解析
@@ -1176,6 +1191,28 @@ mod tests {
 
     /// 下游关掉管道要浮成 Err 让 bin 去分类,不能 panic。真管道不好测(fixture
     /// 转录塞得进 64K 管道缓冲,子进程往往先写完),这里用假 writer 卡行为
+    #[test]
+    fn progress_line_updates_in_place_and_only_ends_the_line() {
+        let step = |scanning, done, total, error: Option<&str>| ScanProgress {
+            scanning,
+            done,
+            total,
+            error: error.map(str::to_string),
+        };
+        let mut out = Vec::new();
+        progress_line(&step(true, 0, 0, None), &mut out).unwrap();
+        progress_line(&step(true, 3, 10, None), &mut out).unwrap();
+        progress_line(&step(false, 10, 10, None), &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\rIndexing…\rIndexing 3/10…\n"
+        );
+        // 出错收场同样只是换行:错误由 cli::report 打,这里不抢着宣布任何结果
+        let mut out = Vec::new();
+        progress_line(&step(false, 4, 10, Some("boom")), &mut out).unwrap();
+        assert_eq!(out, b"\n");
+    }
+
     #[test]
     fn a_closed_pipe_surfaces_as_an_error_not_a_panic() {
         struct FailWrite;
