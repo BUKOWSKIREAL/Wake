@@ -133,8 +133,21 @@ fn spawn_remote_sync_thread(
         // 同步期间被 Remove 的 host:rsync 取消不了,收工后按配置表把孤儿
         // 缓存目录清掉(含它刚写回的),Remove 的"缓存已删"承诺自此闭合
         wake_core::remote::purge_orphan_caches(&store);
+        report_remote_cache_size(&store, &bg_tx);
         let _ = bg_tx.unbounded_send(BgEvent::RemoteSyncDone);
     });
+}
+
+/// 算 remotes/ 镜像的占用并经 bg_tx 报回(走目录树 stat,只在后台线程调)。
+/// 镜像只在启动、同步收工、删 host 后会变,所以只在那三处算,不放 render
+fn report_remote_cache_size(
+    store: &Store,
+    bg_tx: &futures::channel::mpsc::UnboundedSender<BgEvent>,
+) {
+    if let Some(db_dir) = store.db_dir() {
+        let bytes = wake_core::remote::cache_bytes(&db_dir);
+        let _ = bg_tx.unbounded_send(BgEvent::RemoteCacheBytes(bytes));
+    }
 }
 
 // ---------------- 后台事件桥 ----------------
@@ -146,6 +159,8 @@ enum BgEvent {
     RescanNeeded,
     /// 远程 rsync 线程收工(成败都发;状态在 remote_hosts 表里)
     RemoteSyncDone,
+    /// remotes/ 镜像的磁盘占用算好了(启动、同步收工、删 host 后各算一次)
+    RemoteCacheBytes(u64),
 }
 
 struct ChannelEvents(futures::channel::mpsc::UnboundedSender<BgEvent>);
@@ -757,14 +772,7 @@ impl ListDelegate for SessionsDelegate {
                                     theme.muted_foreground,
                                 ))
                                 .when(!s.host.is_empty(), |this| {
-                                    // 远程会话的 host 徽章:填充胶囊但用 primary 淡底 +
-                                    // primary 字,与紧邻的 muted 项目胶囊拉开(描边版、
-                                    // muted 填充版都试过,用户否决 2026-09-03)
-                                    this.child(badge(
-                                        format!("@{}", s.host),
-                                        theme.primary.opacity(0.14),
-                                        theme.primary,
-                                    ))
+                                    this.child(host_badge(&s.host, &theme))
                                 })
                                 .when(show_chevron, |this| {
                                     this.child(
@@ -1321,14 +1329,8 @@ impl ListDelegate for SearchDelegate {
                                     .child(h.session.title.clone()),
                             )
                             .child(div().flex_1())
-                            // 远程会话的 @host 徽章,与列表行同款(0.4.0 遗留:
-                            // 两台机器的同名会话在 ⌘K 里分不出来)
                             .when(!h.session.host.is_empty(), |this| {
-                                this.child(badge(
-                                    format!("@{}", h.session.host),
-                                    theme.primary.opacity(0.14),
-                                    theme.primary,
-                                ))
+                                this.child(host_badge(&h.session.host, &theme))
                             })
                             .child(
                                 div()
@@ -1964,6 +1966,9 @@ pub struct Workbench {
     sort_ascending: bool,
 
     agent_counts: Vec<(AgentId, i64)>,
+    /// remotes/ 镜像的磁盘占用(Settings → Data 的 Storage 行并进索引库大小);
+    /// 后台算、经 RemoteCacheBytes 送达,None = 还没算完
+    remote_cache_bytes: Option<u64>,
     projects: Vec<ProjectInfo>,
     agents_collapsed: bool,
     projects_collapsed: bool,
@@ -2187,7 +2192,10 @@ pub(crate) struct LocationSettingsSnapshot {
 pub(crate) struct DataSettingsSnapshot {
     pub(crate) display_path: SharedString,
     pub(crate) raw_path: SharedString,
+    /// 索引库三件套 + remotes/ 镜像
     pub(crate) size_bytes: u64,
+    /// 其中镜像的部分(算完前为 0)
+    pub(crate) remote_bytes: u64,
     pub(crate) session_count: i64,
 }
 
@@ -2269,6 +2277,10 @@ impl Workbench {
         spawn_scan(adapters.clone(), store.clone(), events.clone(), false);
         let syncing_hosts = store.enabled_remote_host_names();
         spawn_remote_sync_thread(&store, bg_tx.clone(), syncing_hosts.clone());
+        {
+            let (store, bg_tx) = (store.clone(), bg_tx.clone());
+            std::thread::spawn(move || report_remote_cache_size(&store, &bg_tx));
+        }
         let watcher = start_watcher(adapters.clone(), store.clone(), events.clone());
         let scan_events = events.clone();
 
@@ -2310,6 +2322,7 @@ impl Workbench {
             sort_ascending: false,
             favorite_only: false,
             agent_counts: Vec::new(),
+            remote_cache_bytes: None,
             projects: Vec::new(),
             agents_collapsed: false,
             projects_collapsed: false,
@@ -2635,15 +2648,17 @@ impl Workbench {
     pub(crate) fn data_settings_snapshot(&self) -> DataSettingsSnapshot {
         let path = wake_core::db::default_db_path();
         let raw = path.to_string_lossy().to_string();
-        let size_bytes = ["", "-wal", "-shm"]
+        let index_bytes: u64 = ["", "-wal", "-shm"]
             .iter()
             .filter_map(|suffix| std::fs::metadata(format!("{raw}{suffix}")).ok())
             .map(|metadata| metadata.len())
             .sum();
+        let remote_bytes = self.remote_cache_bytes.unwrap_or(0);
         DataSettingsSnapshot {
             display_path: tilde_path(&raw).into(),
             raw_path: raw.into(),
-            size_bytes,
+            size_bytes: index_bytes + remote_bytes,
+            remote_bytes,
             session_count: self.session_total(),
         }
     }
@@ -3706,8 +3721,10 @@ impl Workbench {
         self.rebuild_roster(cx);
         if let Some(db_dir) = self.store.db_dir() {
             let cache = wake_core::remote::host_cache_dir(&db_dir, name);
+            let (store, bg_tx) = (self.store.clone(), self.bg_tx.clone());
             std::thread::spawn(move || {
                 let _ = std::fs::remove_dir_all(cache);
+                report_remote_cache_size(&store, &bg_tx);
             });
         }
         self.kick_incremental_scan(cx);
@@ -3793,6 +3810,11 @@ impl Workbench {
                 // 撞上进行中的扫描就排队,由终态事件补扫(kick_incremental_scan
                 // 自带这条状态机);连续多条 rescan 也只会排一次
                 self.kick_incremental_scan(cx);
+                None
+            }
+            BgEvent::RemoteCacheBytes(bytes) => {
+                self.remote_cache_bytes = Some(bytes);
+                cx.notify();
                 None
             }
             BgEvent::RemoteSyncDone => {
@@ -8412,6 +8434,17 @@ fn custom_owner<'a>(
 /// 设置页共用,别让几处各自漂移)
 pub(crate) fn session_tally(n: i64) -> String {
     crate::tp!("{} session", "{} sessions", n)
+}
+
+/// 远程会话的 @host 徽章:填充胶囊但用 primary 淡底 + primary 字,与紧邻的 muted
+/// 项目胶囊拉开(描边版、muted 填充版都试过,用户否决 2026-09-03)。列表行与 ⌘K
+/// 结果行共用;详情页的描边版是有意的第三种
+fn host_badge(host: &str, theme: &gpui_component::Theme) -> impl IntoElement {
+    badge(
+        format!("@{host}"),
+        theme.primary.opacity(0.14),
+        theme.primary,
+    )
 }
 
 fn badge(name: impl Into<SharedString>, bg: Hsla, fg: Hsla) -> impl IntoElement {

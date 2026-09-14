@@ -76,6 +76,9 @@ pub const SEARCH: &str = "wake_search";
 pub const LIST_SESSIONS: &str = "wake_list_sessions";
 pub const GET_SESSION: &str = "wake_get_session";
 pub const LIST_PROJECTS: &str = "wake_list_projects";
+/// 四个工具名的清单:自指回声过滤(`adapters::is_wake_lookup`)与 definitions 的
+/// 稳定性测试都读它,加第五家改这里与 `definitions()` 两处即可
+pub const NAMES: [&str; 4] = [SEARCH, LIST_SESSIONS, GET_SESSION, LIST_PROJECTS];
 
 const MAX_SEARCH_SESSIONS: i64 = 30;
 const MAX_LIST_SESSIONS: i64 = 100;
@@ -226,6 +229,13 @@ fn str_arg<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>, ToolError
     }
 }
 
+/// 去掉首尾空白、空串当没传的字符串参数(key / query / project / subagent 共用)
+fn text_arg<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>, ToolError> {
+    Ok(str_arg(args, name)?
+        .map(str::trim)
+        .filter(|s| !s.is_empty()))
+}
+
 fn int_arg(args: &Value, name: &str, default: i64, min: i64, max: i64) -> Result<i64, ToolError> {
     let v = match args.get(name) {
         None | Some(Value::Null) => return Ok(default),
@@ -352,10 +362,7 @@ enum ProjectScope {
 }
 
 fn project_arg(ctx: &ToolContext, args: &Value) -> Result<ProjectScope, ToolError> {
-    let Some(arg) = str_arg(args, "project")?
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(arg) = text_arg(args, "project")? else {
         return Ok(ProjectScope::All);
     };
     // 含归档:搜索覆盖归档会话,只剩归档会话的项目不能在这一步被挡掉
@@ -502,9 +509,7 @@ fn session_ref(key: &str, seq: i64) -> String {
 // ---------------------------------------------------------------- 工具实现
 
 fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let query = str_arg(args, "query")?
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
+    let query = text_arg(args, "query")?
         .ok_or_else(|| ToolError::InvalidParams("`query` is required".into()))?;
     let agents = agents_arg(args)?;
     let since = since_arg(ctx, args)?;
@@ -723,13 +728,7 @@ const MAX_SUBAGENTS_LISTED: usize = 30;
 
 /// `agent-a1b2 — Explore: find the watcher code`;没有边车信息时只有 id
 fn subagent_label(sc: &SidechainInfo) -> String {
-    let desc = [sc.agent_type.as_deref(), sc.description.as_deref()]
-        .into_iter()
-        .flatten()
-        .map(|s| one_line(s, 80))
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(": ");
+    let desc = one_line(&sc.label(), 80);
     if desc.is_empty() {
         sc.id.clone()
     } else {
@@ -752,9 +751,7 @@ fn subagent_lines(sidechains: &[SidechainInfo]) -> String {
 }
 
 fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let raw_key = str_arg(args, "key")?
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
+    let raw_key = text_arg(args, "key")?
         .ok_or_else(|| ToolError::InvalidParams("`key` is required".into()))?;
     let (key, ref_seq) = parse_key_arg(raw_key);
     let from_seq = int_arg(args, "from_seq", ref_seq.unwrap_or(0), 0, i64::MAX)?;
@@ -766,9 +763,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
         include_tools: bool_arg(args, "include_tools", false)?,
         include_thinking: bool_arg(args, "include_thinking", false)?,
     };
-    let subagent = str_arg(args, "subagent")?
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let subagent = text_arg(args, "subagent")?;
     let meta = match find_session(ctx.store, &key)? {
         Ok(m) => m,
         Err(text) => return Err(ToolError::Failed(text)),
@@ -796,7 +791,6 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
                 .sidechains
                 .iter()
                 .find(|sc| sc.id == id)
-                .cloned()
                 .ok_or_else(|| {
                     ToolError::Failed(if transcript.sidechains.is_empty() {
                         format!("`{}` has no subagent transcripts.", meta.key)
@@ -825,6 +819,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
             Some((info, messages))
         }
     };
+    let sub_id = sidechain.as_ref().map(|(info, _)| info.id.as_str());
     let messages: &[TranscriptMessage] = match &sidechain {
         Some((_, messages)) => messages,
         None => &transcript.mainline,
@@ -871,19 +866,14 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
         facts.push(format!("via {src}"));
     }
     // 时间范围:主线用会话的起止,子代理用它自己消息的首末时间(没有就不写)
-    let (start, end) = match &sidechain {
-        Some((_, messages)) => messages.iter().filter_map(|m| m.timestamp).fold(
-            (None, None),
-            |(lo, hi): (Option<i64>, Option<i64>), t| {
-                (
-                    Some(lo.map_or(t, |lo| lo.min(t))),
-                    Some(hi.map_or(t, |hi| hi.max(t))),
-                )
-            },
-        ),
-        None => (Some(live.created_at), Some(live.updated_at)),
+    let range = match &sidechain {
+        Some((_, messages)) => {
+            let ts = messages.iter().filter_map(|m| m.timestamp);
+            ts.clone().min().zip(ts.max())
+        }
+        None => Some((live.created_at, live.updated_at)),
     };
-    if let (Some(start), Some(end)) = (start, end) {
+    if let Some((start, end)) = range {
         facts.push(format!(
             "{} – {}",
             fmt_time(Some(start)),
@@ -911,9 +901,8 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     let (first, last) = page.seq_range.unwrap_or((from_seq, from_seq));
     let mut summary = format!(
         "Showing seq {first}–{last}{}: {} message{}",
-        sidechain
-            .as_ref()
-            .map(|(info, _)| format!(" of subagent `{}`", info.id))
+        sub_id
+            .map(|id| format!(" of subagent `{id}`"))
             .unwrap_or_default(),
         page.rendered,
         plural(page.rendered as i64)
@@ -928,7 +917,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str(&summary);
     out.push_str(".\n");
     // 主线页脚列出子代理转录:它们不并进主线(各有自己的 seq),按 id 单独读
-    if sidechain.is_none() && !transcript.sidechains.is_empty() {
+    if sub_id.is_none() && !transcript.sidechains.is_empty() {
         out.push_str(&format!(
             "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
             transcript.sidechains.len(),
@@ -936,16 +925,19 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
             subagent_lines(&transcript.sidechains)
         ));
     }
-    match (page.next_seq, &sidechain) {
-        (Some(next), Some((info, _))) => out.push_str(&format!(
-            "More follows — call {GET_SESSION} again with subagent=\"{}\" and from_seq={next}.\n",
-            info.id
+    let with_sub = sub_id
+        .map(|id| format!("subagent=\"{id}\" and "))
+        .unwrap_or_default();
+    let noun = if sub_id.is_some() {
+        "subagent transcript"
+    } else {
+        "transcript"
+    };
+    match page.next_seq {
+        Some(next) => out.push_str(&format!(
+            "More follows — call {GET_SESSION} again with {with_sub}from_seq={next}.\n"
         )),
-        (Some(next), None) => out.push_str(&format!(
-            "More follows — call {GET_SESSION} again with from_seq={next}.\n"
-        )),
-        (None, Some(_)) => out.push_str("End of subagent transcript.\n"),
-        (None, None) => out.push_str("End of transcript.\n"),
+        None => out.push_str(&format!("End of {noun}.\n")),
     }
     Ok(out)
 }
@@ -1005,7 +997,7 @@ mod tests {
     fn definitions_are_stable() {
         let defs = definitions();
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
-        assert_eq!(names, [SEARCH, LIST_SESSIONS, GET_SESSION, LIST_PROJECTS]);
+        assert_eq!(names, NAMES);
         for d in &defs {
             assert_eq!(d["inputSchema"]["type"], "object");
             assert_eq!(d["annotations"]["readOnlyHint"], true);

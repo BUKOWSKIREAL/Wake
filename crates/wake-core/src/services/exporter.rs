@@ -115,12 +115,7 @@ pub fn to_markdown(
         if msgs.is_empty() {
             continue;
         }
-        let label = [sc.agent_type.as_deref(), sc.description.as_deref()]
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(":");
+        let label = sc.label();
         out.push_str(&format!(
             "---\n\n## ⑂ Subagent: {}\n\n",
             if label.is_empty() { &sc.id } else { &label }

@@ -1260,26 +1260,11 @@ impl Store {
                 .ok()
                 .filter(|d| *d <= today)
         };
-        // 同一会话在多台 host 上各有一份镜像时(两个远程 host 指向同一台机器,
-        // 或本地与远程都有)只算一次:按 (agent, native_id, created_at) 认同一会话
-        // ——native_id 单独不够(Hermes 的 id 是小整数,两台机器的 1 号会话不是
-        // 同一个),created_at 出自文件内容,同 id 同起点即同一会话;没有 created_at
-        // 的不合并。取更新时间最新的那份(最完整),平局按 host 名(本地 '' 最小)。
-        // scanner 层有意保留全部副本(不变量 8⑦:各机续跑会分叉),只是统计口径
-        // 不能把一份对话数两遍(2026-09-14,0.4.0 遗留)
-        const CANONICAL_SESSIONS: &str = "(SELECT key FROM (
-                 SELECT key, ROW_NUMBER() OVER (
-                     PARTITION BY agent_id, native_id, created_at,
-                                  CASE WHEN created_at > 0 THEN '' ELSE key END
-                     ORDER BY updated_at DESC, host) AS rn
-                 FROM sessions WHERE archived = 0) WHERE rn = 1)";
         // "一条 prompt" 的行集(主线用户消息)——整页口径共用这一个片段,
         // 内联多份的话谓词一漂移,总数就会与分桶/榜单悄悄不一致
-        let prompt_rows = format!(
-            "FROM messages m JOIN sessions s ON s.key = m.session_key
+        const PROMPT_ROWS: &str = "FROM messages m JOIN sessions s ON s.key = m.session_key
              WHERE s.archived = 0 AND m.role = 'user' AND m.sidechain_id IS NULL
-               AND s.key IN {CANONICAL_SESSIONS}"
-        );
+               AND s.key IN canonical_sessions";
 
         // 临时连接,不与 UI 的 read 连接抢锁:WAL 多读并发,几十毫秒的
         // 统计扫描不该让导航点击的列表查询排队(2026-08-27 Codex review)
@@ -1288,6 +1273,24 @@ impl Store {
         } else {
             open_conn(&self.path)?
         };
+        // 同一会话在多台 host 上各有一份镜像时(两个远程 host 指向同一台机器,
+        // 或本地与远程都有)只算一次:按 (agent, native_id, created_at) 认同一会话
+        // ——native_id 单独不够(Hermes 的 id 是小整数,两台机器的 1 号会话不是
+        // 同一个),created_at 出自文件内容,同 id 同起点即同一会话;没有 created_at
+        // 的不合并。取更新时间最新的那份(最完整),平局按 host 名(本地 '' 最小)。
+        // scanner 层有意保留全部副本(不变量 8⑦:各机续跑会分叉),只是统计口径
+        // 不能把一份对话数两遍(2026-09-14,0.4.0 遗留)。算一次放临时表——这条
+        // 连接是本次调用私有的,只读连接也能建 temp 表;内联成子查询的话下面
+        // 六条语句会各排一遍序
+        conn.execute_batch(
+            "CREATE TEMP TABLE canonical_sessions AS
+             SELECT key FROM (
+                 SELECT key, ROW_NUMBER() OVER (
+                     PARTITION BY agent_id, native_id, created_at,
+                                  CASE WHEN created_at > 0 THEN '' ELSE key END
+                     ORDER BY updated_at DESC, host) AS rn
+                 FROM sessions WHERE archived = 0) WHERE rn = 1",
+        )?;
         let mut data = InsightsData {
             as_of: today,
             ..Default::default()
@@ -1299,12 +1302,10 @@ impl Store {
             data.first_ts,
             data.project_count,
         ) = conn.query_row(
-            &format!(
-                "SELECT COUNT(*), COALESCE(SUM(tokens_used),0),
-                        COALESCE(MIN(NULLIF(created_at,0)),0),
-                        COUNT(DISTINCT NULLIF(project_path,''))
-                 FROM sessions WHERE archived = 0 AND key IN {CANONICAL_SESSIONS}"
-            ),
+            "SELECT COUNT(*), COALESCE(SUM(tokens_used),0),
+                    COALESCE(MIN(NULLIF(created_at,0)),0),
+                    COUNT(DISTINCT NULLIF(project_path,''))
+             FROM sessions WHERE archived = 0 AND key IN canonical_sessions",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
@@ -1316,7 +1317,7 @@ impl Store {
             "SELECT CASE WHEN m.ts > 0 THEN date(m.ts/1000,'unixepoch','localtime') END d,
                     CASE WHEN m.ts > 0 THEN CAST(strftime('%H', m.ts/1000,'unixepoch','localtime') AS INTEGER) END h,
                     COUNT(*)
-             {prompt_rows}
+             {PROMPT_ROWS}
              GROUP BY d, h ORDER BY d"
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -1357,7 +1358,7 @@ impl Store {
             "SELECT s.agent_id, s.project_path, COALESCE(s.model,''),
                     CASE WHEN m.ts > 0 THEN date(m.ts/1000,'unixepoch','localtime') END d,
                     COUNT(*)
-             {prompt_rows}
+             {PROMPT_ROWS}
              GROUP BY 1, 2, 3, 4"
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -1406,7 +1407,7 @@ impl Store {
          -> Result<Vec<UsageTally>> {
             let sql = format!(
                 "SELECT {display}, {group}, COUNT(*), COALESCE(SUM(s.tokens_used),0)
-                 FROM sessions s WHERE s.archived = 0 AND s.key IN {CANONICAL_SESSIONS}{filter}
+                 FROM sessions s WHERE s.archived = 0 AND s.key IN canonical_sessions{filter}
                  GROUP BY {group} ORDER BY COUNT(*) DESC, {display}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1451,6 +1452,7 @@ impl Store {
         let mut stmt = conn.prepare_cached(
             "SELECT date(created_at/1000,'unixepoch','localtime'), COUNT(*)
              FROM sessions WHERE archived = 0 AND created_at > 0
+               AND key IN canonical_sessions
              GROUP BY 1 ORDER BY 1",
         )?;
         let rows = stmt.query_map([], |r| {

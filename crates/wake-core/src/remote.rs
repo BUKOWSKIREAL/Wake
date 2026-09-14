@@ -209,7 +209,7 @@ pub fn purge_orphan_caches(store: &Store) {
         .into_iter()
         .map(|h| h.name)
         .collect();
-    let Ok(entries) = std::fs::read_dir(db_dir.join("remotes")) else {
+    let Ok(entries) = std::fs::read_dir(remotes_dir(&db_dir)) else {
         return;
     };
     for entry in entries.flatten() {
@@ -220,16 +220,21 @@ pub fn purge_orphan_caches(store: &Store) {
     }
 }
 
+/// 全部镜像的根:`<索引库目录>/remotes/`
+fn remotes_dir(db_dir: &Path) -> PathBuf {
+    db_dir.join("remotes")
+}
+
 /// 单 host 的缓存树(各 host 挂在 `<索引库目录>/remotes/<host>/` 下)。
 pub fn host_cache_dir(db_dir: &Path, host: &str) -> PathBuf {
-    db_dir.join("remotes").join(host)
+    remotes_dir(db_dir).join(host)
 }
 
 /// 全部镜像(`<db 目录>/remotes/`)的磁盘占用。Settings → Data 的 Storage 行把它
 /// 并进索引库的大小——"Wake 在这台机器上占了多少盘"得含镜像(0.4.0 遗留)。
 /// 逐文件 stat,几千个文件也是毫秒级;调用方别放进每帧的 render,目录不存在即 0
 pub fn cache_bytes(db_dir: &Path) -> u64 {
-    walkdir::WalkDir::new(db_dir.join("remotes"))
+    walkdir::WalkDir::new(remotes_dir(db_dir))
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())

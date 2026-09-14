@@ -319,6 +319,20 @@ pub struct SidechainInfo {
     pub tool_use_id: Option<String>,
 }
 
+impl SidechainInfo {
+    /// 边车给的"是谁、干什么":`Explore: find the watcher code`;两项都没有时为空串。
+    /// 导出的 `## ⑂ Subagent:` 标题与 MCP 的 subagent 事实行共用,别各拼一份
+    pub fn label(&self) -> String {
+        [self.agent_type.as_deref(), self.description.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedTranscript {
     pub meta: SessionMeta,

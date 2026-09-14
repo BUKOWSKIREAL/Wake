@@ -465,13 +465,13 @@ pub fn expand_tilde(p: &str) -> String {
     }
 }
 
-/// 这次工具调用是不是 agent 在查 Wake:MCP 工具按四个契约名认,客户端会给名字加
+/// 这次工具调用是不是 agent 在查 Wake:MCP 工具按 `mcp::tools::NAMES` 认(加第五家
+/// 自动覆盖),客户端会给名字加
 /// 自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,别家形态不一),所以
 /// 只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);shell 工具(Bash 等)
 /// 看输入预览里是否以整个词的形态出现 wake-cli / wake-mcp
 fn is_wake_lookup(tool_name: &str, input_preview: &str) -> bool {
-    use crate::mcp::tools::{GET_SESSION, LIST_PROJECTS, LIST_SESSIONS, SEARCH};
-    [SEARCH, LIST_SESSIONS, GET_SESSION, LIST_PROJECTS]
+    crate::mcp::tools::NAMES
         .iter()
         .any(|t| ends_with_word(tool_name, t))
         || ["wake-cli", "wake-mcp"]

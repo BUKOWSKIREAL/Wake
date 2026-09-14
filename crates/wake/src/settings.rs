@@ -227,9 +227,6 @@ pub(crate) struct SettingsView {
     copied: Option<SharedString>,
     /// 连点时只有最后一次的定时器能清掉 copied
     copied_generation: u64,
-    /// remotes/ 镜像的占用:开窗时后台走一遍目录树算出来(不放进每帧都跑的
-    /// render),None = 还没算完,Data 页先只显示索引库的大小
-    remote_cache_bytes: Option<u64>,
     _workbench_observer: Option<Subscription>,
 }
 
@@ -246,24 +243,6 @@ impl SettingsView {
         cx.on_next_frame(window, move |this, _, cx| {
             this._workbench_observer = Some(cx.observe(&observed, |_, _, cx| cx.notify()));
         });
-        let cache_dir = wake_core::db::default_db_path()
-            .parent()
-            .map(std::path::Path::to_path_buf);
-        let remote_bytes = cx.background_spawn(async move {
-            cache_dir
-                .as_deref()
-                .map(wake_core::remote::cache_bytes)
-                .unwrap_or(0)
-        });
-        cx.spawn(async move |this, cx| {
-            let bytes = remote_bytes.await;
-            this.update(cx, |this, cx| {
-                this.remote_cache_bytes = Some(bytes);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
         Self {
             focus_handle: cx.focus_handle(),
             workbench,
@@ -273,7 +252,6 @@ impl SettingsView {
             connect_shown: Default::default(),
             copied: None,
             copied_generation: 0,
-            remote_cache_bytes: None,
             _workbench_observer: None,
         }
     }
@@ -590,19 +568,18 @@ impl SettingsView {
         let theme = cx.theme();
         let snapshot = self.workbench.read(cx).data_settings_snapshot();
         // 会话计数的措辞单点在 workbench 的 session_tally(Locations 与
-        // Remote hosts 也用它);这里只补分隔符,不再复制一遍句子。占用 = 索引库
-        // 三件套 + remotes/ 镜像(后者开窗时后台算,算完前只显示库的大小)
-        let remote_bytes = self.remote_cache_bytes.unwrap_or(0);
+        // Remote hosts 也用它);这里只补分隔符,不再复制一遍句子。占用已含
+        // remotes/ 镜像(Workbench 后台算好放进快照),镜像非零时另注一句
         let mut summary = format!(
             "{} · {}",
             crate::workbench::session_tally(snapshot.session_count),
-            format_storage_size(snapshot.size_bytes + remote_bytes)
+            format_storage_size(snapshot.size_bytes)
         );
-        if remote_bytes > 0 {
+        if snapshot.remote_bytes > 0 {
             summary.push(' ');
             summary.push_str(&crate::tf!(
                 "({} in remote mirrors)",
-                format_storage_size(remote_bytes)
+                format_storage_size(snapshot.remote_bytes)
             ));
         }
         let summary: SharedString = summary.into();
