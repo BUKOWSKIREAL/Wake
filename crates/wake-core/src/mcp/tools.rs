@@ -152,7 +152,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": GET_SESSION,
             "title": "Read a session transcript",
-            "description": "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted. Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point).",
+            "description": "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted. Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -163,6 +163,7 @@ pub fn definitions() -> Vec<Value> {
                     "max_message_chars": { "type": "integer", "minimum": 100, "maximum": 50000, "default": 4000, "description": "Longer messages are truncated to this many characters." },
                     "include_tools": { "type": "boolean", "default": false, "description": "Include tool-call inputs and outputs (verbose)." },
                     "include_thinking": { "type": "boolean", "default": false, "description": "Include the assistant's thinking/reasoning text where the agent recorded it." },
+                    "subagent": { "type": "string", "description": "Read this subagent transcript instead of the session's main transcript. The main transcript lists the ids at its end; paging works the same way." },
                 },
                 "required": ["key"],
             },
@@ -717,6 +718,39 @@ fn find_session(store: &Store, key: &str) -> Result<Result<SessionMeta, String>,
     })
 }
 
+/// 主线页脚最多列多少个子代理转录;再多就 "… and N more"(Task 开得多的会话有上百个)
+const MAX_SUBAGENTS_LISTED: usize = 30;
+
+/// `agent-a1b2 — Explore: find the watcher code`;没有边车信息时只有 id
+fn subagent_label(sc: &SidechainInfo) -> String {
+    let desc = [sc.agent_type.as_deref(), sc.description.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|s| one_line(s, 80))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    if desc.is_empty() {
+        sc.id.clone()
+    } else {
+        format!("{} — {desc}", sc.id)
+    }
+}
+
+fn subagent_lines(sidechains: &[SidechainInfo]) -> String {
+    let mut out = String::new();
+    for sc in sidechains.iter().take(MAX_SUBAGENTS_LISTED) {
+        out.push_str(&format!("- {}\n", subagent_label(sc)));
+    }
+    if sidechains.len() > MAX_SUBAGENTS_LISTED {
+        out.push_str(&format!(
+            "- … and {} more\n",
+            sidechains.len() - MAX_SUBAGENTS_LISTED
+        ));
+    }
+    out
+}
+
 fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     let raw_key = str_arg(args, "key")?
         .map(str::trim)
@@ -732,6 +766,9 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
         include_tools: bool_arg(args, "include_tools", false)?,
         include_thinking: bool_arg(args, "include_thinking", false)?,
     };
+    let subagent = str_arg(args, "subagent")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let meta = match find_session(ctx.store, &key)? {
         Ok(m) => m,
         Err(text) => return Err(ToolError::Failed(text)),
@@ -750,13 +787,54 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
         ))
     })?;
     let live = &transcript.meta;
-    let total_visible = transcript
-        .mainline
+    // 子代理转录按 id 现场解析,不进 TranscriptCache:子代理还在跑时它的文件独立于
+    // 主文件增长,拿主文件的戳当键会一直吐旧内容;文件通常远小于主线,一页一解析
+    let sidechain = match subagent {
+        None => None,
+        Some(id) => {
+            let info = transcript
+                .sidechains
+                .iter()
+                .find(|sc| sc.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    ToolError::Failed(if transcript.sidechains.is_empty() {
+                        format!("`{}` has no subagent transcripts.", meta.key)
+                    } else {
+                        format!(
+                            "`{}` has no subagent transcript `{id}`. It has:\n{}",
+                            meta.key,
+                            subagent_lines(&transcript.sidechains)
+                        )
+                    })
+                })?;
+            let messages = adapter
+                .load_sidechain(&SessionFileRef::from_meta(&meta), id)
+                .map_err(|e| {
+                    ToolError::Failed(format!(
+                        "Could not read subagent transcript `{id}` of `{}`: {e:#}",
+                        meta.key
+                    ))
+                })?;
+            if messages.is_empty() {
+                return Err(ToolError::Failed(format!(
+                    "Subagent transcript `{id}` of `{}` is empty or missing on disk.",
+                    meta.key
+                )));
+            }
+            Some((info, messages))
+        }
+    };
+    let messages: &[TranscriptMessage] = match &sidechain {
+        Some((_, messages)) => messages,
+        None => &transcript.mainline,
+    };
+    let total_visible = messages
         .iter()
         .filter(|m| m.kind != MessageKind::Meta)
         .count();
-    let last_seq = transcript.mainline.last().map(|m| m.seq);
-    let page = render_compact(&transcript.mainline, &opts);
+    let last_seq = messages.last().map(|m| m.seq);
+    let page = render_compact(messages, &opts);
 
     let mut out = String::new();
     let title = if live.title.is_empty() {
@@ -771,6 +849,9 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     ];
     if !meta.host.is_empty() {
         facts.push(format!("host: @{}", meta.host));
+    }
+    if let Some((info, _)) = &sidechain {
+        facts.push(format!("subagent: {}", subagent_label(info)));
     }
     if !live.project_path.is_empty() {
         facts.push(format!(
@@ -789,11 +870,26 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     if let Some(src) = meta.source.as_deref().filter(|v| !v.is_empty()) {
         facts.push(format!("via {src}"));
     }
-    facts.push(format!(
-        "{} – {}",
-        fmt_time(Some(live.created_at)),
-        fmt_time(Some(live.updated_at))
-    ));
+    // 时间范围:主线用会话的起止,子代理用它自己消息的首末时间(没有就不写)
+    let (start, end) = match &sidechain {
+        Some((_, messages)) => messages.iter().filter_map(|m| m.timestamp).fold(
+            (None, None),
+            |(lo, hi): (Option<i64>, Option<i64>), t| {
+                (
+                    Some(lo.map_or(t, |lo| lo.min(t))),
+                    Some(hi.map_or(t, |hi| hi.max(t))),
+                )
+            },
+        ),
+        None => (Some(live.created_at), Some(live.updated_at)),
+    };
+    if let (Some(start), Some(end)) = (start, end) {
+        facts.push(format!(
+            "{} – {}",
+            fmt_time(Some(start)),
+            fmt_time(Some(end))
+        ));
+    }
     facts.push(format!(
         "{total_visible} message{}",
         plural(total_visible as i64)
@@ -814,7 +910,11 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str("—\n");
     let (first, last) = page.seq_range.unwrap_or((from_seq, from_seq));
     let mut summary = format!(
-        "Showing seq {first}–{last}: {} message{}",
+        "Showing seq {first}–{last}{}: {} message{}",
+        sidechain
+            .as_ref()
+            .map(|(info, _)| format!(" of subagent `{}`", info.id))
+            .unwrap_or_default(),
         page.rendered,
         plural(page.rendered as i64)
     );
@@ -825,20 +925,27 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
             plural(page.skipped_meta as i64)
         ));
     }
-    if !transcript.sidechains.is_empty() {
-        summary.push_str(&format!(
-            "; {} subagent transcript{} not included",
-            transcript.sidechains.len(),
-            plural(transcript.sidechains.len() as i64)
-        ));
-    }
     out.push_str(&summary);
     out.push_str(".\n");
-    match page.next_seq {
-        Some(next) => out.push_str(&format!(
+    // 主线页脚列出子代理转录:它们不并进主线(各有自己的 seq),按 id 单独读
+    if sidechain.is_none() && !transcript.sidechains.is_empty() {
+        out.push_str(&format!(
+            "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
+            transcript.sidechains.len(),
+            plural(transcript.sidechains.len() as i64),
+            subagent_lines(&transcript.sidechains)
+        ));
+    }
+    match (page.next_seq, &sidechain) {
+        (Some(next), Some((info, _))) => out.push_str(&format!(
+            "More follows — call {GET_SESSION} again with subagent=\"{}\" and from_seq={next}.\n",
+            info.id
+        )),
+        (Some(next), None) => out.push_str(&format!(
             "More follows — call {GET_SESSION} again with from_seq={next}.\n"
         )),
-        None => out.push_str("End of transcript.\n"),
+        (None, Some(_)) => out.push_str("End of subagent transcript.\n"),
+        (None, None) => out.push_str("End of transcript.\n"),
     }
     Ok(out)
 }

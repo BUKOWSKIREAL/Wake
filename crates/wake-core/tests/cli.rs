@@ -202,6 +202,18 @@ fn cases() -> Vec<(Vec<String>, &'static str, Value)> {
             json!({ "key": reference }),
         ),
         (
+            argv(&[
+                "show",
+                CLAUDE_KEY,
+                "--subagent",
+                "agent-fixture01",
+                "--messages",
+                "2",
+            ]),
+            tools::GET_SESSION,
+            json!({"key":CLAUDE_KEY,"subagent":"agent-fixture01","max_messages":2}),
+        ),
+        (
             argv(&["projects", "--since", ALWAYS, "--limit", "10"]),
             tools::LIST_PROJECTS,
             json!({"since":ALWAYS,"limit":10}),

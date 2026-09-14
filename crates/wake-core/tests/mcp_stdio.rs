@@ -310,6 +310,43 @@ fn stdio_contract_end_to_end() {
         "tool calls fold to one line by default"
     );
 
+    // 4b. 子代理转录:主线页脚列出 id,按 id 读、同一套分页;未知 id 是给 LLM 看
+    // 的失败结果并附上有哪些
+    assert!(
+        plain_page.contains(
+            "1 subagent transcript (pass an id as `subagent` to read one):\n- agent-fixture01 — Explore: find the QR scanner code\n"
+        ),
+        "{plain_page}"
+    );
+    let (sub, is_err) = c.call(
+        "wake_get_session",
+        json!({ "key": CLAUDE_KEY, "subagent": "agent-fixture01", "max_messages": 1 }),
+    );
+    assert!(!is_err, "{sub}");
+    assert!(
+        sub.contains("subagent: agent-fixture01 — Explore: find the QR scanner code"),
+        "{sub}"
+    );
+    assert_eq!(seqs_in(&sub), vec![0]);
+    assert!(sub.contains("QR scanner is wired up"), "{sub}");
+    let next = next_seq_hint(&sub).expect("the fixture subagent has three messages");
+    assert!(
+        sub.contains(&format!("subagent=\"agent-fixture01\" and from_seq={next}")),
+        "{sub}"
+    );
+    let (rest, _) = c.call(
+        "wake_get_session",
+        json!({ "key": CLAUDE_KEY, "subagent": "agent-fixture01", "from_seq": next }),
+    );
+    assert!(rest.ends_with("End of subagent transcript.\n"), "{rest}");
+    assert!(rest.contains("src/qr/scanner.ts"), "{rest}");
+    let (bad, is_err) = c.call(
+        "wake_get_session",
+        json!({ "key": CLAUDE_KEY, "subagent": "agent-nope" }),
+    );
+    assert!(is_err);
+    assert!(bad.contains("- agent-fixture01"), "{bad}");
+
     // 5. 项目匹配:cwd 在项目子目录里、没匹配上、项目清单
     let (listed, is_err) = c.call(
         "wake_list_sessions",

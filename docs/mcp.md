@@ -104,7 +104,7 @@ Everything above happens locally; Wake itself does not change and the other agen
 ### What it does not do
 
 - No write tools: nothing can delete, star, rename or resume a session. Resuming stays in Wake.
-- Subagent transcripts that live inside a session (Claude Code sidechains, Cursor subagents) are not included in `wake_get_session`; their count is reported so the agent knows they exist. Subagent sessions that Wake tracks as separate sessions (Grok) are folded under their parent in `wake_list_sessions` but can be read by key.
+- Subagent transcripts that live inside a session (Claude Code sidechains, Cursor subagents) are not merged into the main transcript: `wake_get_session` lists their ids at the end and reads one when it is passed as `subagent`. Subagent sessions that Wake tracks as separate sessions (Grok) are folded under their parent in `wake_list_sessions` but can be read by key.
 - Antigravity sessions are metadata only — their transcripts are encrypted on disk, so an agent gets the same preview card Wake shows.
 - Archived Codex sessions appear in search results but not in `wake_list_sessions` or `wake_list_projects`.
 
@@ -177,6 +177,7 @@ One transcript as compact Markdown, parsed live from the agent's files.
 | `max_message_chars` | integer 100–50000 | 4000 | budget per message, shared by its text, thinking and tool calls; longer content is truncated and marked |
 | `include_tools` | boolean | false | include tool inputs and outputs (verbose) |
 | `include_thinking` | boolean | false | include the assistant's recorded thinking |
+| `subagent` | string | | read this subagent transcript instead of the main one; the main transcript lists the ids at its end |
 
 The reply starts with a header (title, key, agent, host, project and branch, model, time range, message count), then one block per message:
 
@@ -190,7 +191,7 @@ inotify queues overflow when …
 - 🔧 Grep: need_rescan
 ```
 
-Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Subagent transcripts are not included; their count is reported.
+Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript with their ids; pass one as `subagent` to read it, with the same paging options.
 
 The footer says which seqs were shown and either `End of transcript.` or a `from_seq=<n>` hint for the next page. Seq numbers are the same ones Wake's own search results and transcript view use.
 

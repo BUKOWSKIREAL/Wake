@@ -6,6 +6,7 @@
 - Fix: ⌘K / Ctrl+K results show the `@host` badge for sessions mirrored from a remote host
 - Fix: Insights no longer counts a session twice when it is mirrored from more than one host
 - Fix: Settings → Data includes the remote mirrors in the storage size
+- New: `wake_get_session` and `wake-cli show` can read a subagent transcript — the main transcript now lists their ids; pass one as `subagent` / `--subagent`
 - Update: search favours recently active sessions a little — an equally good match from last week now outranks one from last year, in ⌘K / Ctrl+K, `wake_search` and `wake-cli search`
 - Fix: an agent's own Wake lookups (the `wake_*` tools, `wake-cli` commands) no longer show up as search hits in its session
 - Update: search now matches session titles too, in ⌘K / Ctrl+K, `wake_search` and `wake-cli search` — title hits come first and open the session at its start

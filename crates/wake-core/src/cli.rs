@@ -189,6 +189,13 @@ const F_THINKING: FlagSpec = FlagSpec::new(
     "",
     "include the assistant's thinking where the agent recorded it",
 );
+const F_SUBAGENT: FlagSpec = FlagSpec::new(
+    "--subagent",
+    "subagent",
+    Arity::Value,
+    "ID",
+    "read this subagent transcript instead of the main one (ids are listed at the end of the main transcript)",
+);
 
 const SEARCH_FLAGS: &[FlagSpec] = &[F_PROJECT, F_AGENT, F_SINCE, F_LIMIT];
 const SESSIONS_FLAGS: &[FlagSpec] = &[F_PROJECT, F_AGENT, F_SINCE, F_LIMIT, F_STARRED];
@@ -199,6 +206,7 @@ const SHOW_FLAGS: &[FlagSpec] = &[
     F_MESSAGE_CHARS,
     F_TOOLS,
     F_THINKING,
+    F_SUBAGENT,
 ];
 const PROJECTS_FLAGS: &[FlagSpec] = &[F_SINCE, F_LIMIT];
 
