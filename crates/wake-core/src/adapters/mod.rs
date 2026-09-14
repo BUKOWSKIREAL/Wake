@@ -465,16 +465,35 @@ pub fn expand_tilde(p: &str) -> String {
     }
 }
 
-/// 这次工具调用是不是 agent 在查 Wake。MCP 客户端给工具名加 `mcp__<server>__`
-/// 前缀(Claude Code 实测 `mcp__wake__wake_search`),取最后一段看是否 `wake_*`;
-/// shell 工具(Bash 等)看输入预览里有没有 wake-cli / wake-mcp 命令
+/// 这次工具调用是不是 agent 在查 Wake:MCP 工具按四个契约名认,客户端会给名字加
+/// 自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,别家形态不一),所以
+/// 只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);shell 工具(Bash 等)
+/// 看输入预览里是否以整个词的形态出现 wake-cli / wake-mcp
 fn is_wake_lookup(tool_name: &str, input_preview: &str) -> bool {
-    let bare = tool_name.rsplit("__").next().unwrap_or(tool_name);
-    bare.starts_with("wake_")
-        || input_preview.contains("wake-cli ")
-        || input_preview.contains("wake-mcp ")
-        || input_preview.ends_with("wake-cli")
-        || input_preview.ends_with("wake-mcp")
+    use crate::mcp::tools::{GET_SESSION, LIST_PROJECTS, LIST_SESSIONS, SEARCH};
+    [SEARCH, LIST_SESSIONS, GET_SESSION, LIST_PROJECTS]
+        .iter()
+        .any(|t| ends_with_word(tool_name, t))
+        || ["wake-cli", "wake-mcp"]
+            .iter()
+            .any(|bin| names_binary(input_preview, bin))
+}
+
+fn ends_with_word(s: &str, word: &str) -> bool {
+    s.strip_suffix(word)
+        .is_some_and(|head| !head.chars().next_back().is_some_and(char::is_alphanumeric))
+}
+
+/// `wake-cli search …`、`/Applications/Wake.app/Contents/MacOS/wake-cli sessions`、
+/// `cd x && wake-cli projects`、`WAKE=…/wake-cli`、`wake-cli.exe` 都算;
+/// `wake-cli-old`、`wake-clip` 不算
+fn names_binary(preview: &str, bin: &str) -> bool {
+    let joins = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    preview.match_indices(bin).any(|(i, _)| {
+        let before = preview[..i].chars().next_back();
+        let after = preview[i + bin.len()..].chars().next();
+        !before.is_some_and(joins) && !after.is_some_and(joins)
+    })
 }
 
 #[cfg(test)]
@@ -549,9 +568,19 @@ mod tests {
     fn wake_lookup_detection_is_narrow() {
         assert!(is_wake_lookup("mcp__wake__wake_list_projects", ""));
         assert!(is_wake_lookup("wake_search", "x"));
+        assert!(
+            is_wake_lookup("mcp_wake_wake_get_session", ""),
+            "别家客户端的前缀形态"
+        );
         assert!(is_wake_lookup("Bash", "cd repo && wake-cli projects"));
+        assert!(is_wake_lookup("Bash", "C:\\Wake\\wake-cli.exe sessions"));
+        assert!(is_wake_lookup(
+            "Bash",
+            "WAKE=/Applications/Wake.app/Contents/MacOS/wake-cli"
+        ));
         assert!(!is_wake_lookup("Bash", "cargo test -p wake-core"));
-        assert!(!is_wake_lookup("mcp__other__awake_check", ""));
+        assert!(!is_wake_lookup("Bash", "wake-cli-old --help && wake-clip"));
+        assert!(!is_wake_lookup("mcp__other__awake_search", ""));
         assert!(!is_wake_lookup("Edit", "crates/wake/src/settings.rs"));
     }
 }
