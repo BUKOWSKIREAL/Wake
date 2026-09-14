@@ -16,7 +16,7 @@
 //!
 //! **结果不许走 println!**:Rust 忽略 SIGPIPE,`wake-cli show K | head` 会让
 //! println! panic 成 101。所有输出统一经 cli::emit,BrokenPipe 由 write 收场。
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -24,7 +24,7 @@ use wake_core::cli::{self, Action, CliError, Report, Stream};
 use wake_core::db::{self, Store};
 use wake_core::mcp::{self, tools};
 use wake_core::models::SessionFilter;
-use wake_core::scanner::{self, NullEvents};
+use wake_core::scanner::{self, NullEvents, ScanEvents, ScanProgress};
 use wake_core::text::plural;
 
 fn main() -> ExitCode {
@@ -97,7 +97,15 @@ fn run(db: &Option<PathBuf>, tool: &str, args: &serde_json::Value) -> ExitCode {
 /// 失败一律走 `?`(anyhow → `ToolError::Internal`)交 `cli::report` 收场——
 /// "跑起来了然后失败"退 1,与工具调用失败同一条出口,不另写一份映射
 fn index(path: &Path) -> Result<String, tools::ToolError> {
-    let Some(store) = scanner::build_index(path, &NullEvents)? else {
+    // 进度只给终端看:全量扫描要几秒到几十秒,没有反馈像卡死;管道与 agent
+    // 调用时 stderr 保持安静(它是诊断通道,tests/cli.rs 也这么断言)
+    let tty = TtyProgress;
+    let events: &dyn ScanEvents = if io::stderr().is_terminal() {
+        &tty
+    } else {
+        &NullEvents
+    };
+    let Some(store) = scanner::build_index(path, events)? else {
         return Ok(format!(
             "An index already exists at {}. Launch Wake to update or rebuild it.",
             path.display()
@@ -117,6 +125,23 @@ fn index(path: &Path) -> Result<String, tools::ToolError> {
         plural(agents),
         path.display()
     ))
+}
+
+/// `index` 在终端上的进度:同一行原地刷新 `Indexing done/total`,终态换行收尾,
+/// 结果本身仍由 stdout 给。写失败一律忽略——进度条不是结果
+struct TtyProgress;
+
+impl ScanEvents for TtyProgress {
+    fn on_progress(&self, p: &ScanProgress) {
+        let mut err = io::stderr().lock();
+        let _ = match (p.scanning, p.total) {
+            (true, 0) => write!(err, "\rIndexing…"),
+            (true, total) => write!(err, "\rIndexing {}/{total}…", p.done),
+            (false, _) => writeln!(err, "\rIndexed {}/{} files.", p.done, p.total),
+        };
+        let _ = err.flush();
+    }
+    fn on_sessions_changed(&self) {}
 }
 
 fn setup(db: &Option<PathBuf>) -> String {

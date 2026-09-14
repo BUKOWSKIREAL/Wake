@@ -136,7 +136,8 @@ It scans the agents' files and writes Wake's index, then tells you what it found
 does this when there is **no index yet** — if one already exists it says so and changes
 nothing, because keeping the index current is the app's job (it watches the files while it
 runs, and Refresh forces a pass). There is deliberately no `--force`: a second full scan
-from outside the app would race the one inside it.
+from outside the app would race the one inside it. In a terminal it shows progress while
+it scans; when piped or run by an agent, stderr stays quiet until the summary.
 
 ## When
 
