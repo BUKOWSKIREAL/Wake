@@ -1,7 +1,10 @@
 #!/bin/zsh
-# 提交前门槛:数据层测试 + 全仓编译检查。
+# 提交前门槛:格式检查 + 数据层测试 + 全仓编译检查。
 # 启用(一次):git config core.hooksPath scripts/hooks
 set -e
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --all --check
 
 echo "pre-commit: cargo test -p wake-core"
 cargo test -p wake-core --quiet

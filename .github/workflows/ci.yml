@@ -21,6 +21,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # 格式门槛:rustfmt 漂移一次就红,不让它累积(2026-09-14 归零后加)
+      - name: Check formatting
+        run: cargo fmt --all --check
 
       - name: Install Intel macOS target
         if: runner.os == 'macOS'
