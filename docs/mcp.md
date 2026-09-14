@@ -133,7 +133,7 @@ All four tools are read-only and return Markdown text (`content[0].text`). Param
 
 ### `wake_search`
 
-Full-text search across every indexed transcript: user prompts, assistant replies, tool names and tool inputs (tool outputs are not indexed). Terms are ANDed. CJK text and code substrings such as `useEffect(` both work; terms shorter than three characters fall back to a slower substring scan.
+Full-text search across every indexed session: titles, user prompts, assistant replies, tool names and tool inputs (tool outputs are not indexed). A title match is reported as `title` and its reference points at the start of the session. Terms are ANDed. CJK text and code substrings such as `useEffect(` both work; terms shorter than three characters fall back to a slower substring scan.
 
 | Parameter | Type | Default | Notes |
 |---|---|---|---|

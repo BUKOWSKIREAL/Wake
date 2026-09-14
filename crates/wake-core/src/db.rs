@@ -120,6 +120,14 @@ CREATE TABLE IF NOT EXISTS remote_hosts (
   last_sync_at    INTEGER,
   last_sync_error TEXT
 );
+
+-- 标题的全文索引。独立一张表而不挂在 messages 上:标题不是转录消息、没有 seq
+-- 可对,塞成假消息会破坏 seq 契约。key 不索引、只用来回查/删除
+CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
+  key UNINDEXED,
+  title,
+  tokenize="trigram case_sensitive 0"
+);
 "#;
 
 fn open_conn(path: &Path) -> Result<Connection> {
@@ -174,12 +182,36 @@ fn open_conn(path: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_sessions_host ON sessions(host) WHERE host != ''",
         [],
     )?;
+    // titles_fts 回填(2026-09-14 加表):老库首次打开时表是空的而 sessions 不空,
+    // 把既有标题一次性灌进去;之后由 upsert_session 逐行维护。判据是"空表且有
+    // 会话",不记 schema_meta 旗子——全删过的库再开也只是白查一次 count
+    let needs_titles: bool = conn.query_row(
+        "SELECT (SELECT count(*) FROM titles_fts) = 0 AND EXISTS (SELECT 1 FROM sessions)",
+        [],
+        |r| r.get(0),
+    )?;
+    if needs_titles {
+        conn.execute(
+            "INSERT INTO titles_fts(key, title) SELECT key, title FROM sessions WHERE title != ''",
+            [],
+        )?;
+    }
     Ok(conn)
 }
 
 /// 最近一次迁移加的列——`open_read_only` 用它判断库够不够新。**加新迁移时把
 /// 这里改成新列**,否则只读入口会放行老库、深处查询才报 no such column
 const NEWEST_COLUMN: (&str, &str) = ("sessions", "host");
+/// 最近一次迁移加的表,与 NEWEST_COLUMN 同一用途、同一维护规矩
+const NEWEST_TABLE: &str = "titles_fts";
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1)",
+        params![table],
+        |r| r.get(0),
+    )?)
+}
 
 /// 只读连接:不建表、不迁移、不改 journal_mode(旁路进程用;`open_read_only`
 /// 与只读 Store 的 insights 临时连接共用,别的入口不要直开)
@@ -265,7 +297,9 @@ impl Store {
             );
         }
         let read = open_conn_ro(path)?;
-        if !table_has_column(&read, NEWEST_COLUMN.0, NEWEST_COLUMN.1)? {
+        if !table_has_column(&read, NEWEST_COLUMN.0, NEWEST_COLUMN.1)?
+            || !table_exists(&read, NEWEST_TABLE)?
+        {
             anyhow::bail!(
                 "Wake index at {} is empty or from an older version — launch Wake once to upgrade it",
                 path.display()
@@ -480,6 +514,7 @@ impl Store {
                 fts_del.execute(params![id, text])?;
             }
             tx.execute("DELETE FROM messages WHERE session_key = ?1", params![key])?;
+            tx.execute("DELETE FROM titles_fts WHERE key = ?1", params![key])?;
             tx.execute("DELETE FROM sessions WHERE key = ?1", params![key])?;
             if tombstone {
                 if let Some(fp) = file_path {
@@ -897,7 +932,7 @@ impl Store {
     pub fn rebuild_all(&self) -> Result<()> {
         let conn = self.write.lock().unwrap();
         conn.execute_batch(
-            "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM sessions;",
+            "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM titles_fts; DELETE FROM sessions;",
         )?;
         Ok(())
     }
@@ -1446,40 +1481,48 @@ impl Store {
         let degraded = segs.iter().any(|s| s.chars().count() < 3);
         let limit = if f.limit > 0 { f.limit } else { 60 };
 
+        // 会话侧筛选(agent / 项目并集 / 时间下界):SQL 片段拼一次,参数按需重建
+        // ——正文与标题是两条查询,Box<dyn ToSql> 不能 clone
         let mut filter_sql = String::new();
-        let mut filter_args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !f.agents.is_empty() {
             filter_sql.push_str(&format!(
                 " AND s.agent_id IN ({})",
                 placeholders(f.agents.len())
             ));
-            for a in &f.agents {
-                filter_args.push(Box::new(a.as_str().to_string()));
-            }
         }
         if !f.project_paths.is_empty() {
             filter_sql.push_str(&format!(
                 " AND s.project_path IN ({})",
                 placeholders(f.project_paths.len())
             ));
-            for p in &f.project_paths {
-                filter_args.push(Box::new(p.clone()));
-            }
         }
-        if let Some(t) = f.updated_since {
+        if f.updated_since.is_some() {
             filter_sql.push_str(" AND s.updated_at >= ?");
-            filter_args.push(Box::new(t));
         }
+        let filter_args = |f: &SearchFilter| -> Vec<Box<dyn rusqlite::ToSql>> {
+            let mut v: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            for a in &f.agents {
+                v.push(Box::new(a.as_str().to_string()));
+            }
+            for p in &f.project_paths {
+                v.push(Box::new(p.clone()));
+            }
+            if let Some(t) = f.updated_since {
+                v.push(Box::new(t));
+            }
+            v
+        };
+        // FTS 的 MATCH 表达式(正文与标题两张表共用)
+        let match_expr = segs
+            .iter()
+            .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
 
         let conn = self.read.lock().unwrap();
         let mut raw: Vec<(String, i64, Option<String>, String, Option<i64>, String)> = Vec::new();
 
         if !degraded {
-            let match_expr = segs
-                .iter()
-                .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ");
             let sql = format!(
                 "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts,
                         snippet(messages_fts, 0, ?, ?, '…', 16)
@@ -1493,9 +1536,9 @@ impl Store {
             let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new(HL_OPEN.to_string()),
                 Box::new(HL_CLOSE.to_string()),
-                Box::new(match_expr),
+                Box::new(match_expr.clone()),
             ];
-            all_args.extend(filter_args);
+            all_args.extend(filter_args(f));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
@@ -1530,7 +1573,7 @@ impl Store {
                 .iter()
                 .map(|s| Box::new(format!("%{}%", escape_like(s))) as Box<dyn rusqlite::ToSql>)
                 .collect();
-            all_args.extend(filter_args);
+            all_args.extend(filter_args(f));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
@@ -1558,6 +1601,60 @@ impl Store {
             }
         }
 
+        // 标题命中:独立的 titles_fts。排在正文命中之前——词出现在标题里是最强的
+        // 相关性信号;role 记 "title"、seq 记 0,跳转落到会话开头(标题没有对应的
+        // 转录行,不伪造 seq)
+        let mut title_raw: Vec<(String, String)> = Vec::new();
+        if !degraded {
+            let sql = format!(
+                "SELECT t.key, highlight(titles_fts, 1, ?, ?)
+                 FROM titles_fts t JOIN sessions s ON s.key = t.key
+                 WHERE titles_fts MATCH ?{filter_sql}
+                 ORDER BY bm25(titles_fts) LIMIT ?"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(HL_OPEN.to_string()),
+                Box::new(HL_CLOSE.to_string()),
+                Box::new(match_expr),
+            ];
+            all_args.extend(filter_args(f));
+            all_args.push(Box::new(limit));
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            for r in rows {
+                title_raw.push(r?);
+            }
+        } else {
+            let like_where = segs
+                .iter()
+                .map(|_| "s.title LIKE ? ESCAPE '\\'")
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let sql = format!(
+                "SELECT s.key, s.title FROM sessions s
+                 WHERE {like_where}{filter_sql}
+                 ORDER BY s.updated_at DESC LIMIT ?"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = segs
+                .iter()
+                .map(|s| Box::new(format!("%{}%", escape_like(s))) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            all_args.extend(filter_args(f));
+            all_args.push(Box::new(limit));
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            for r in rows {
+                let (key, title) = r?;
+                title_raw.push((key, make_like_snippet(&title, segs[0])));
+            }
+        }
+
         // 补齐 session meta:按会话只查一次(一个会话常占几十行命中),语句走
         // prepare_cached——Connection::query_row 每次都是裸 prepare
         let mut hits = Vec::new();
@@ -1566,15 +1663,29 @@ impl Store {
             "SELECT {SESSION_COLS} FROM sessions s LEFT JOIN user_data u ON u.session_key = s.key WHERE s.key = ?1"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
+        let mut hydrate = |key: &str| -> Result<Option<SessionMeta>> {
+            if let Some(cached) = metas.get(key) {
+                return Ok(cached.clone());
+            }
+            let meta = stmt.query_row(params![key], row_to_meta).optional()?;
+            metas.insert(key.to_string(), meta.clone());
+            Ok(meta)
+        };
+        for (key, snippet) in title_raw {
+            if let Some(session) = hydrate(&key)? {
+                let timestamp = Some(session.updated_at);
+                hits.push(SearchHit {
+                    session,
+                    seq: 0,
+                    sidechain_id: None,
+                    role: "title".to_string(),
+                    snippet,
+                    timestamp,
+                });
+            }
+        }
         for (key, seq, sidechain_id, role, ts, snippet) in raw {
-            let session = if let Some(cached) = metas.get(&key) {
-                cached.clone()
-            } else {
-                let meta = stmt.query_row(params![key], row_to_meta).optional()?;
-                metas.insert(key.clone(), meta.clone());
-                meta
-            };
-            if let Some(session) = session {
+            if let Some(session) = hydrate(&key)? {
                 hits.push(SearchHit {
                     session,
                     seq,
@@ -1782,6 +1893,16 @@ fn write_session_tx(
 }
 
 fn upsert_session(tx: &rusqlite::Transaction<'_>, m: &SessionMeta, file_mtime: i64) -> Result<()> {
+    // titles_fts 与 sessions.title 同步的**唯一写点**:全量、增量、quick(write_meta_only)
+    // 三条路都经这里,标题一改索引即跟上。按 key 删再插(UNINDEXED 列的 DELETE 是
+    // 整表扫,几千行也就微秒级),空标题不入索引
+    tx.execute("DELETE FROM titles_fts WHERE key = ?1", params![m.key])?;
+    if !m.title.is_empty() {
+        tx.execute(
+            "INSERT INTO titles_fts(key, title) VALUES (?1, ?2)",
+            params![m.key, m.title],
+        )?;
+    }
     tx.execute(
         "INSERT INTO sessions(key, agent_id, native_id, title, project_path, project_name,
            git_branch, created_at, updated_at, message_count, tokens_used, model, source,

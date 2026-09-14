@@ -76,7 +76,7 @@ Wake ships `wake-mcp`, a small read-only [MCP](https://modelcontextprotocol.io) 
 
 | Tool | What it does |
 |---|---|
-| `wake_search` | Full-text search across every agent's transcripts (CJK and code substrings work); each snippet carries a `wake://session/<key>#<seq>` reference |
+| `wake_search` | Full-text search across every agent's session titles and transcripts (CJK and code substrings work); each snippet carries a `wake://session/<key>#<seq>` reference |
 | `wake_list_sessions` | Most recently updated sessions, scoped by project (pass the agent's working directory), agent, time window or starred |
 | `wake_get_session` | One transcript as compact Markdown — user and assistant messages with `[seq N]` markers, tool calls folded to a line, injected context omitted — paginated by `from_seq` |
 | `wake_list_projects` | Projects with indexed sessions, most recently active first |

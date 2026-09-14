@@ -44,7 +44,7 @@ There is no default project scope. Pass `--project "$PWD"` when you mean "here" 
 
 ### `search`
 
-Full-text search across every indexed session — user prompts, assistant replies, tool names and inputs. Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, and a `wake://session/<key>#<seq>` reference per snippet.
+Full-text search across every indexed session — titles, user prompts, assistant replies, tool names and inputs. A title match is listed as `title` with a reference to the start of the session. Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, and a `wake://session/<key>#<seq>` reference per snippet.
 
 | Option | Value | Notes |
 |---|---|---|

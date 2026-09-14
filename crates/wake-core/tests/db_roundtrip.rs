@@ -930,3 +930,106 @@ fn host_column_migration_and_remote_host_roundtrip() {
     store.remove_remote_host("devbox").unwrap();
     assert!(store.list_remote_hosts().unwrap().is_empty());
 }
+
+#[test]
+fn titles_are_searchable_and_tracked_with_the_session() {
+    let (_dir, store) = temp_store();
+    let m = meta("claude-code:t1", "部署脚本重构 deploy");
+    store
+        .write_session(
+            &m,
+            m.updated_at,
+            &[
+                unit(0, Role::User, "hello world"),
+                unit(2, Role::Assistant, "deploy pipeline ok"),
+            ],
+        )
+        .unwrap();
+
+    // 标题命中:role=title、seq=0、高亮哨兵包住命中词
+    let (hits, degraded) = store.search("部署脚本", &[], None, 10).unwrap();
+    assert!(!degraded);
+    assert_eq!(hits.len(), 1, "正文里没有这个词,只有标题命中");
+    assert_eq!(hits[0].role, "title");
+    assert_eq!(hits[0].seq, 0);
+    assert_eq!(hits[0].session.key, "claude-code:t1");
+    assert!(hits[0]
+        .snippet
+        .contains(&format!("{HL_OPEN}部署脚本{HL_CLOSE}")));
+
+    // 短词走 LIKE 降级,标题同样命中
+    let (hits, degraded) = store.search("部署", &[], None, 10).unwrap();
+    assert!(degraded);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].role, "title");
+
+    // 标题与正文都命中时,标题排在前
+    let (hits, _) = store.search("deploy", &[], None, 10).unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.role.as_str()).collect::<Vec<_>>(),
+        ["title", "assistant"]
+    );
+    assert_eq!(hits[1].seq, 2, "正文命中的 seq 契约不受标题影响");
+
+    // 会话侧筛选对标题命中同样生效
+    let (hits, _) = store.search("deploy", &[AgentId::Codex], None, 10).unwrap();
+    assert!(hits.is_empty());
+
+    // quick 路径(write_meta_only)改标题:旧标题不再命中,新标题命中
+    let mut renamed = m.clone();
+    renamed.title = "数据库迁移".into();
+    store.write_meta_only(&[(renamed, m.updated_at)]).unwrap();
+    assert!(store
+        .search("部署脚本", &[], None, 10)
+        .unwrap()
+        .0
+        .is_empty());
+    assert_eq!(
+        store.search("数据库迁移", &[], None, 10).unwrap().0.len(),
+        1
+    );
+
+    // 删除与重建都带走标题索引
+    store.remove_session(&m.key, false).unwrap();
+    assert!(store
+        .search("数据库迁移", &[], None, 10)
+        .unwrap()
+        .0
+        .is_empty());
+    let again = meta("claude-code:t2", "第二个会话标题");
+    store.write_meta_only(&[(again, 1)]).unwrap();
+    assert_eq!(
+        store.search("第二个会话", &[], None, 10).unwrap().0.len(),
+        1
+    );
+    store.rebuild_all().unwrap();
+    assert!(store
+        .search("第二个会话", &[], None, 10)
+        .unwrap()
+        .0
+        .is_empty());
+}
+
+/// 老库(titles_fts 刚由本版建出、还是空的)首次打开时把既有标题灌进去
+#[test]
+fn title_index_is_backfilled_for_older_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    {
+        let store = Store::open(&path).unwrap();
+        let a = meta("claude-code:old1", "旧库里的标题一");
+        let b = meta("codex:old2", "Legacy title two");
+        store.write_meta_only(&[(a, 1), (b, 2)]).unwrap();
+    }
+    // 模拟"表刚建出来":清空标题索引,sessions 照旧
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM titles_fts", []).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.search("旧库里的标题", &[], None, 10).unwrap().0.len(),
+        1
+    );
+    assert_eq!(store.search("Legacy", &[], None, 10).unwrap().0.len(), 1);
+}

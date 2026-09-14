@@ -119,7 +119,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": SEARCH,
             "title": "Search session history",
-            "description": "Full-text search across every indexed coding-agent session on this machine (user prompts, assistant replies, tool names and inputs). Use it when the user asks whether something was discussed, tried or solved before, or wants the conversation about a topic, an error message, a file or a decision — git history does not hold that. Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus a `wake://session/<key>#<seq>` reference per snippet that you can read with wake_get_session.",
+            "description": "Full-text search across every indexed coding-agent session on this machine (session titles, user prompts, assistant replies, tool names and inputs). Use it when the user asks whether something was discussed, tried or solved before, or wants the conversation about a topic, an error message, a file or a decision — git history does not hold that. Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus a `wake://session/<key>#<seq>` reference per snippet that you can read with wake_get_session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -561,6 +561,15 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
         let (meta, snippets) = &groups[key];
         out.push_str(&format!("{}. {}", ix + 1, session_line(meta)));
         for h in snippets {
+            // 标题命中没有对应消息:只报"标题里有",引用落到会话开头
+            if h.role == "title" {
+                out.push_str(&format!(
+                    "  - title: {}\n    ref: {}\n",
+                    clean_snippet(&h.snippet),
+                    session_ref(&meta.key, 0)
+                ));
+                continue;
+            }
             let when = h
                 .timestamp
                 .filter(|t| *t > 0)

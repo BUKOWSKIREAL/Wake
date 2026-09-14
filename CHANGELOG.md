@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Update: search now matches session titles too, in ⌘K / Ctrl+K, `wake_search` and `wake-cli search` — title hits come first and open the session at its start
+
 ## [0.6.4] — 2026-09-14
 
 - New: CodeBuddy and WorkBuddy support — sessions from Tencent's CodeBuddy Code CLI and the WorkBuddy desktop agent now show up alongside every other agent, with search and the transcript view, plus one-click resume for CodeBuddy
