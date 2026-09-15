@@ -19,6 +19,7 @@ use wake_core::adapters::codebuddy::CodebuddyAdapter;
 use wake_core::adapters::codex::CodexAdapter;
 use wake_core::adapters::copilot::CopilotAdapter;
 use wake_core::adapters::cursor::CursorAdapter;
+use wake_core::adapters::cursor_ide::CursorIdeAdapter;
 use wake_core::adapters::dsh::DshAdapter;
 use wake_core::adapters::gemini::GeminiAdapter;
 use wake_core::adapters::grok::GrokAdapter;
@@ -45,6 +46,7 @@ struct TestEnv {
     dsh_log: PathBuf,
     hermes_db: PathBuf,
     openclaw_db: PathBuf,
+    cursor_ide_db: PathBuf,
     /// 假 HOME 目录本体,持有 TempDir 保证整个测试进程期间不被清理
     _home: tempfile::TempDir,
 }
@@ -73,6 +75,7 @@ fn setup() -> &'static TestEnv {
             dsh_log: sc.dsh_log,
             hermes_db: sc.hermes_db,
             openclaw_db: sc.openclaw_db,
+            cursor_ide_db: sc.cursor_ide_db,
             _home: home,
         }
     })
@@ -97,6 +100,12 @@ fn fs_ref(agent: AgentId, path: &Path, native_id: &str) -> SessionFileRef {
         size: meta.len() as i64,
     }
 }
+
+/// 默认 roster 的实例数。**不等于 `AgentId::ALL.len()`**:Cursor 一家有两个
+/// 数据源(CLI 的 agent-transcripts 与 IDE 的 state.vscdb),各占一个实例。
+/// 新增 agent 或给某家再加数据源时,这个数跟着加一——契约要卡的是"漏了实例
+/// 就爆",而不是"每家恰好一个"
+const DEFAULT_INSTANCES: usize = AgentId::ALL.len() + 1;
 
 /// SQLite 型 agent 的虚拟路径引用(`<db>#<id>`,与 sqlite_ro::virtual_path 同构)
 fn db_ref(agent: AgentId, db: &Path, id: &str) -> SessionFileRef {
@@ -689,6 +698,209 @@ fn qoder_explicit_null_active_leaf_is_empty() {
     assert!(s.units.is_empty());
     assert!(t.mainline.is_empty());
     assert_eq!(s.unknown_line_count, 0);
+}
+
+/// Cursor IDE(state.vscdb):正文按 `fullConversationHeadersOnly` 的气泡顺序
+/// 组装。fixture 里 KV 的 key 字典序(aa/bb/cc/kk/mm/zz)与对话顺序
+/// (zz→aa→mm→bb→cc→kk)**故意相反**——照 key 序读就会把对话打乱,这是
+/// 本测试要防的主要回归。
+/// Cursor 一家两源:移除其中一条 location 不得连带关掉另一条。
+/// 两个实例都必须开 `supports_individual_root_removal`——否则面板的 Remove
+/// 会退回 `removed_defaults` 的按 agent 整家压制,用户移除 CLI 转录目录时
+/// IDE 会话会一起消失(反之亦然)。
+#[test]
+fn cursor_two_sources_remove_independently() {
+    let _env = setup();
+    let roster = wake_core::adapters::create_adapters();
+    let cursors: Vec<&Box<dyn wake_core::adapters::AgentAdapter>> = roster
+        .iter()
+        .filter(|a| a.agent() == AgentId::Cursor)
+        .collect();
+    assert_eq!(cursors.len(), 2, "Cursor 应有 CLI 与 IDE 两个数据源");
+    for a in &cursors {
+        assert!(
+            a.supports_individual_root_removal(),
+            "两源都要能单独移除,只开一边等于没开"
+        );
+    }
+
+    // 排除 A 的根:A 交出空根实例(roster 组装处据此丢弃),B 原样保留
+    let (a, b) = (cursors[0], cursors[1]);
+    let a_root = a.data_roots();
+    assert_eq!(a_root.len(), 1, "两源各自单根");
+    let trimmed = a
+        .excluding_data_roots(&a_root)
+        .expect("移除自己的根应给出替代实例");
+    assert!(
+        trimmed.data_roots().is_empty(),
+        "自己的根被移除后不应再声明数据根"
+    );
+    assert!(
+        b.excluding_data_roots(&a_root).is_none(),
+        "另一源的根与我无关,应原样保留"
+    );
+}
+
+/// 同 AgentId 两实例下的路由:会话必须落到**拥有其 file_path 的那个源**。
+/// 这条不成立时后果不对称——IDE 会话的虚拟路径 `<db>#<id>` 若被路由到 CLI
+/// 实例,`cursor.rs::session_paths` 会取其父目录(= 整个 globalStorage/)
+/// 交给删除流程,一次删除就会端掉 Cursor 的全部 IDE 数据。
+#[test]
+fn cursor_two_sources_route_by_path() {
+    let env = setup();
+    let roster = wake_core::adapters::create_adapters();
+
+    // IDE 的虚拟路径 → IDE 实例,且它不把库文件的父目录当会话目录
+    let ide_path = format!("{}#cide-0001", env.cursor_ide_db.display());
+    let ide = wake_core::adapters::adapter_for(&roster, AgentId::Cursor, &ide_path)
+        .expect("IDE 虚拟路径必须有实例认领");
+    assert_eq!(ide.data_roots(), vec![env.cursor_ide_db.clone()]);
+    let ide_meta = ide
+        .parse_session(&db_ref(AgentId::Cursor, &env.cursor_ide_db, "cide-0001"))
+        .expect("ide parse")
+        .meta;
+    let targets = ide.session_paths(&ide_meta);
+    assert_eq!(
+        targets,
+        vec![ide_path.clone()],
+        "SQLite 型会话的删除目标是虚拟路径本身(磁盘上不存在,trash 会跳过),\
+         绝不能是库文件所在目录"
+    );
+    assert!(
+        !targets.iter().any(|t| t.ends_with("globalStorage")),
+        "删除目标落到 globalStorage 目录就会端掉整个 Cursor IDE 数据"
+    );
+
+    // CLI 的真实文件路径 → CLI 实例
+    let cli_path = fixture(
+        "cursor/projects/wakefx-cursor-proj/agent-transcripts/33333333-aaaa-bbbb-cccc-000000000003/33333333-aaaa-bbbb-cccc-000000000003.jsonl",
+    );
+    let cli =
+        wake_core::adapters::adapter_for(&roster, AgentId::Cursor, &cli_path.to_string_lossy())
+            .expect("CLI 路径必须有实例认领");
+    assert_ne!(
+        cli.data_roots(),
+        vec![env.cursor_ide_db.clone()],
+        "CLI 转录不该落到 IDE 实例"
+    );
+}
+
+#[test]
+fn cursor_ide_parse_contract() {
+    let env = setup();
+    let adapter = CursorIdeAdapter::new();
+
+    // 枚举:零气泡的草稿不进列表,有正文的三条都在
+    let mut ids: Vec<String> = adapter
+        .list_session_files()
+        .expect("cursor ide list")
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["cide-0001", "cide-0002", "cide-0004"]);
+
+    let r = db_ref(AgentId::Cursor, &env.cursor_ide_db, "cide-0001");
+    let s = adapter.parse_session(&r).expect("cursor ide parse_session");
+    let t = adapter
+        .parse_transcript(&r)
+        .expect("cursor ide parse_transcript");
+
+    // 与 cursor.rs(CLI 源)共用 AgentId 与 key 前缀:同一 composer 在两源
+    // 各有一份时,scanner 才能按同一 key 去重裁决
+    assert_eq!(s.meta.key, "cursor:cide-0001");
+    assert_eq!(s.meta.agent, AgentId::Cursor);
+    assert_eq!(s.meta.title, "Cursor IDE QR fix");
+    assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(s.meta.project_name, "wakefx");
+    assert_eq!(s.meta.created_at, 1786300000000);
+    assert_eq!(s.meta.updated_at, 1786300600000);
+    assert!(s.meta.file_path.ends_with("#cide-0001"));
+    assert_eq!(s.unknown_line_count, 0);
+
+    // 空壳流式气泡(bb)与已被清理的气泡(cc)都不产出消息
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(t.mainline[0].text.contains("二维码扫描为何闪退"));
+    assert_eq!(
+        t.mainline[1].thinking.as_deref(),
+        Some("先查 effect 依赖和清理函数")
+    );
+    assert_eq!(t.mainline[2].tool_calls.len(), 1);
+    assert_eq!(t.mainline[2].tool_calls[0].name, "grep");
+    assert_eq!(t.mainline[2].tool_calls[0].id, "call_ide_1");
+    assert!(t.mainline[2].tool_calls[0]
+        .output
+        .as_deref()
+        .is_some_and(|o| o.contains("QrScanner.tsx")));
+    assert!(!t.mainline[2].tool_calls[0].is_error);
+
+    // rawArgs 为空、参数只在 params 的形态(真实库里占 11%,且全是
+    // 终端命令/文件编辑这类最该被搜到的调用)
+    let term = &t.mainline[3].tool_calls[0];
+    assert_eq!(term.name, "run_terminal_command_v2");
+    assert!(
+        term.input
+            .as_deref()
+            .is_some_and(|i| i.contains("cargo test -p wakefx")),
+        "params 里的命令行必须进 input,否则终端调用在索引里是空的"
+    );
+    assert!(
+        term.input_preview.contains("cargo test"),
+        "FTS 收的是 preview,命令行必须出现在这里"
+    );
+    assert_eq!(
+        term.output.as_deref(),
+        Some("test result: ok. 3 passed"),
+        "终端结果包在 {{\"output\":…}} 对象里,应展平成人读文本"
+    );
+    assert!(t.mainline[4].text.contains("已在清理回调里停止扫描"));
+    assert_eq!(
+        t.mainline[0].timestamp,
+        Some(ms("2026-08-09T10:00:05.000Z"))
+    );
+    assert_eq!(
+        t.mainline[4].timestamp,
+        Some(ms("2026-08-09T10:00:12.000Z"))
+    );
+    // FTS 单元只收 text 与工具名/输入摘要(units_from_messages 的全局口径),
+    // seq 1 是纯 thinking 消息、正文为空,故不进索引——详情页仍然有它
+    assert_eq!(
+        s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
+        vec![0, 2, 3, 4]
+    );
+    assert!(
+        s.units.iter().any(|u| u.text.contains("cargo test")),
+        "终端命令必须能被搜到"
+    );
+
+    // name 为空 + 无 lastUpdatedAt:标题回退首条用户消息,
+    // updated_at 回退末条气泡的 ISO createdAt
+    let r2 = db_ref(AgentId::Cursor, &env.cursor_ide_db, "cide-0002");
+    let s2 = adapter
+        .parse_session(&r2)
+        .expect("cursor ide fallback parse");
+    assert_eq!(s2.meta.title, "空 name 会话的兜底标题应取这句");
+    assert_eq!(s2.meta.created_at, 1786310000000);
+    assert_eq!(s2.meta.updated_at, ms("2026-08-09T11:00:20.000Z"));
+
+    // 子代理归属来自 composerHeaders.subagentInfo
+    assert!(adapter.manages_parent_links());
+    assert_eq!(
+        adapter.parent_links(),
+        vec![(
+            "cursor:cide-0004".to_string(),
+            "cursor:cide-0001".to_string()
+        )]
+    );
 }
 
 #[test]
@@ -1381,16 +1593,16 @@ fn overlapping_watch_roots_dispatch_to_deepest() {
 
 #[test]
 fn data_roots_contract() {
-    // roster 单实例契约:create_adapters 返回全量各家(不按 detect 过滤,
-    // scanner 对缺根家靠各自 list_session_files 降级为空);每家必须给出
+    // roster 覆盖契约:create_adapters 返回全量各家(不按 detect 过滤,
+    // scanner 对缺根家靠各自 list_session_files 降级为空);每个实例必须给出
     // 绝对路径的数据根——"Session locations" 面板、watch_paths 派生、按
     // (agent, 根) 计数全都建立在它上面
     let _env = setup();
     let adapters = wake_core::adapters::create_adapters();
     assert_eq!(
         adapters.len(),
-        AgentId::ALL.len(),
-        "全量 roster 必须每家一个实例,含本机没装的"
+        DEFAULT_INSTANCES,
+        "全量 roster 必须含每家(本机没装的也在)与每个数据源"
     );
     for a in &adapters {
         let tag = a.agent().as_str();
@@ -2068,6 +2280,9 @@ fn agent_id_all_matches_ord_and_roster() {
         .map(|a| a.agent())
         .collect();
     roster.sort();
+    // 一家可以有多个数据源(Cursor 的 CLI + IDE),集合比较前先去重——
+    // 这里要卡的是"某家整个漏出 roster 或漏出 ALL",不是实例个数
+    roster.dedup();
     let mut all = AgentId::ALL.to_vec();
     all.sort();
     assert_eq!(all, roster, "ALL 与 roster 的 agent 集合不一致");
@@ -2079,7 +2294,7 @@ fn agent_id_all_matches_ord_and_roster() {
 fn removed_defaults_suppress_instances() {
     setup();
     let roster = wake_core::adapters::create_adapters_with(&[], &[AgentId::ClaudeCode]);
-    assert_eq!(roster.len(), AgentId::ALL.len() - 1);
+    assert_eq!(roster.len(), DEFAULT_INSTANCES - 1);
     assert!(roster.iter().all(|a| a.agent() != AgentId::ClaudeCode));
 
     let dir = tempfile::tempdir().unwrap();
@@ -2385,7 +2600,7 @@ fn adapter_ix_for_routes_to_owning_instance() {
     let custom = dir.path().to_path_buf();
     let roster =
         wake_core::adapters::create_adapters_with(&[(AgentId::ClaudeCode, custom.clone())], &[]);
-    let defaults = AgentId::ALL.len();
+    let defaults = DEFAULT_INSTANCES;
     assert_eq!(roster.len(), defaults + 1, "全量默认 + 1 自定义");
     assert_eq!(roster[defaults].agent(), AgentId::ClaudeCode);
 
