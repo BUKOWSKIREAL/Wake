@@ -57,6 +57,7 @@ pub struct Sidecars {
     pub dsh_log: PathBuf,
     pub hermes_db: PathBuf,
     pub openclaw_db: PathBuf,
+    pub cursor_ide_db: PathBuf,
 }
 
 /// 侧档与 SQLite 型 fixture 库:copilot/opencode(两代)/antigravity 现建库,
@@ -146,6 +147,13 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     let openclaw_db = claw_dir.join("openclaw-agent.sqlite");
     build_openclaw_db(&openclaw_db);
 
+    // Cursor IDE:VS Code 系的用户数据根三平台不同,与 adapter 的 storage_dir
+    // 同一推导(WAKE_HOME 下派生,不走 dirs::config_dir)
+    let cursor_ide_dir = cursor_ide_storage_dir(home);
+    fs::create_dir_all(&cursor_ide_dir).expect("mkdir cursor globalStorage");
+    let cursor_ide_db = cursor_ide_dir.join("state.vscdb");
+    build_cursor_ide_db(&cursor_ide_db);
+
     Sidecars {
         copilot_db,
         opencode_db,
@@ -154,7 +162,21 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
         dsh_log,
         hermes_db,
         openclaw_db,
+        cursor_ide_db,
     }
+}
+
+/// `<home>/…/Cursor/User/globalStorage`,与 adapters::cursor_ide::storage_dir
+/// 的平台分支逐条对应(改一处必须改另一处,契约测试会因路径不符而空列)
+pub fn cursor_ide_storage_dir(home: &Path) -> PathBuf {
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else if cfg!(target_os = "windows") {
+        home.join("AppData").join("Roaming")
+    } else {
+        home.join(".config")
+    };
+    base.join("Cursor").join("User").join("globalStorage")
 }
 
 /// Hermes `state.db` 最小同构库:sessions + messages(时间戳 unix 秒 REAL)。
@@ -437,6 +459,103 @@ pub fn build_antigravity_db(path: &Path) {
     .expect("populate antigravity fixture db");
 }
 
+/// Cursor IDE `state.vscdb` 最小同构库:VS Code 的两张 KV 表 + 2026 新增的
+/// composerHeaders 索引表。
+/// - `cide-0001`:正常会话。气泡顺序只在 `fullConversationHeadersOnly` 里,
+///   KV 的 key 序(随机 UUID)与它**故意不一致**——照 key 序读会打乱对话,
+///   这条是防回归的主要断言。含 thinking 气泡、工具气泡(rawArgs 形态)、
+///   **只有 params 没有 rawArgs 的终端气泡**(实测占工具调用的 11%,且
+///   结果是 `{"output":…}` 对象而非字符串)、空壳流式气泡
+///   (Cursor 每个分片都落一条,绝大多数没有 text),以及一条顺序表里有、
+///   KV 里已被清理的气泡。
+/// - `cide-0002`:`name` 为空且无 lastUpdatedAt,验证标题回退首条用户消息、
+///   updated_at 回退末条气泡的 ISO createdAt。
+/// - `cide-0003`:零气泡的草稿 composer,不进列表。
+/// - `cide-0004`:子代理会话,composerHeaders 给出 parentComposerId。
+pub fn build_cursor_ide_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create cursor ide fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        CREATE TABLE composerHeaders (
+            composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+            lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+            recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT
+        );
+
+        INSERT INTO cursorDiskKV (key, value) VALUES
+          ('composerData:cide-0001',
+           '{"_v":18,"composerId":"cide-0001","name":"Cursor IDE QR fix",
+             "createdAt":1786300000000,"lastUpdatedAt":1786300600000,
+             "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
+             "trackedGitRepos":[],
+             "fullConversationHeadersOnly":[
+               {"bubbleId":"zz-user-1","type":1,"createdAt":"2026-08-09T10:00:05.000Z"},
+               {"bubbleId":"aa-think-1","type":2,"createdAt":"2026-08-09T10:00:08.000Z"},
+               {"bubbleId":"mm-tool-1","type":2,"createdAt":"2026-08-09T10:00:09.000Z"},
+               {"bubbleId":"nn-term-1","type":2,"createdAt":"2026-08-09T10:00:09.500Z"},
+               {"bubbleId":"bb-empty-1","type":2,"createdAt":"2026-08-09T10:00:10.000Z"},
+               {"bubbleId":"cc-gone-1","type":2,"createdAt":"2026-08-09T10:00:11.000Z"},
+               {"bubbleId":"kk-final-1","type":2,"createdAt":"2026-08-09T10:00:12.000Z"}]}'),
+          ('bubbleId:cide-0001:zz-user-1',
+           '{"_v":3,"type":1,"bubbleId":"zz-user-1","createdAt":"2026-08-09T10:00:05.000Z",
+             "text":"Cursor IDE 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}'),
+          ('bubbleId:cide-0001:aa-think-1',
+           '{"_v":3,"type":2,"bubbleId":"aa-think-1","createdAt":"2026-08-09T10:00:08.000Z",
+             "text":"","thinking":{"text":"先查 effect 依赖和清理函数"}}'),
+          ('bubbleId:cide-0001:mm-tool-1',
+           '{"_v":3,"type":2,"bubbleId":"mm-tool-1","createdAt":"2026-08-09T10:00:09.000Z","text":"",
+             "toolFormerData":{"toolCallId":"call_ide_1","name":"grep","status":"completed",
+               "rawArgs":"{\"pattern\":\"useEffect\"}",
+               "result":"src/QrScanner.tsx: useEffect(() => watch())"}}'),
+          ('bubbleId:cide-0001:nn-term-1',
+           '{"_v":3,"type":2,"bubbleId":"nn-term-1","createdAt":"2026-08-09T10:00:09.500Z","text":"",
+             "toolFormerData":{"toolCallId":"call_ide_2","name":"run_terminal_command_v2","status":"completed",
+               "rawArgs":"",
+               "params":{"command":"cargo test -p wakefx","cwd":""},
+               "result":{"output":"test result: ok. 3 passed","rejected":false}}}'),
+          ('bubbleId:cide-0001:bb-empty-1',
+           '{"_v":3,"type":2,"bubbleId":"bb-empty-1","createdAt":"2026-08-09T10:00:10.000Z","text":""}'),          ('bubbleId:cide-0001:kk-final-1',
+           '{"_v":3,"type":2,"bubbleId":"kk-final-1","createdAt":"2026-08-09T10:00:12.000Z",
+             "text":"找到泄漏点,已在清理回调里停止扫描。"}'),
+
+          ('composerData:cide-0002',
+           '{"_v":13,"composerId":"cide-0002","name":"",
+             "createdAt":1786310000000,
+             "fullConversationHeadersOnly":[
+               {"bubbleId":"q1","type":1},
+               {"bubbleId":"q2","type":2,"createdAt":"2026-08-09T11:00:20.000Z"}]}'),
+          ('bubbleId:cide-0002:q1',
+           '{"_v":3,"type":1,"bubbleId":"q1","createdAt":"2026-08-09T11:00:10.000Z",
+             "text":"空 name 会话的兜底标题应取这句"}'),
+          ('bubbleId:cide-0002:q2',
+           '{"_v":3,"type":2,"bubbleId":"q2","createdAt":"2026-08-09T11:00:20.000Z","text":"好的。"}'),
+
+          ('composerData:cide-0003',
+           '{"_v":18,"composerId":"cide-0003","name":"Draft never sent",
+             "createdAt":1786320000000,"fullConversationHeadersOnly":[]}'),
+
+          ('composerData:cide-0004',
+           '{"_v":18,"composerId":"cide-0004","name":"Explore subagent",
+             "createdAt":1786330000000,"lastUpdatedAt":1786330100000,
+             "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
+             "fullConversationHeadersOnly":[{"bubbleId":"s1","type":1}]}'),
+          ('bubbleId:cide-0004:s1',
+           '{"_v":3,"type":1,"bubbleId":"s1","createdAt":"2026-08-09T12:00:00.000Z","text":"child task"}');
+
+        INSERT INTO composerHeaders
+            (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value, subagentTypeName)
+        VALUES
+          ('cide-0001','ws1',1786300000000,1786300600000,0,0,1786300600000,NULL,
+           '{"type":"head","composerId":"cide-0001","name":"Cursor IDE QR fix"}',NULL),
+          ('cide-0004','ws1',1786330000000,1786330100000,0,1,1786330100000,NULL,
+           '{"type":"head","composerId":"cide-0004","name":"Explore subagent","subagentInfo":{"subagentType":3,"parentComposerId":"cide-0001","subagentTypeName":"explore"}}','explore');
+        "#,
+    )
+    .expect("populate cursor ide fixture db");
+}
+
 /// 让本进程(及其子进程)的全部 adapter 只看这个假 HOME:WAKE_HOME 是 adapter
 /// 侧的统一改道开关,三端一致;HOME 仍设一份供其他 POSIX 依赖(Windows 上 dirs
 /// 不看 HOME,单设它等于没设)。再清掉各家的 env 根覆盖——开发机或 CI 上设了
@@ -452,6 +571,7 @@ pub fn isolate_home(home: &Path) {
 pub fn clear_agent_env_overrides() {
     for var in [
         "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
         "CODEX_HOME",
         "QODER_CONFIG_DIR",
         "HERMES_HOME",

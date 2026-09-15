@@ -4,6 +4,7 @@ pub mod codebuddy;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod cursor_ide;
 pub mod dsh;
 pub mod gemini;
 pub mod grok;
@@ -186,7 +187,12 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 /// 对 Err 会 `?` 截断整轮,新 adapter 必须维持这条降级约定,contract 测试
 /// 有卡)。**不要为任何用途二次构造 roster**:根路径是构造时刻对 env
 /// (CODEX_HOME/XDG_DATA_HOME)与文件系统的快照,两份实例可能解析出不同的
-/// 根,UI 就会展示一个扫描器并不在读的路径
+/// 根,UI 就会展示一个扫描器并不在读的路径。
+///
+/// **家数 ≠ 实例数**:Cursor 一家有两个数据源(CLI 的 agent-transcripts
+/// 与 IDE 的 state.vscdb),各占一个实例、共用 `AgentId::Cursor`。两源对
+/// 同一 composer 都有记录时(IDE 会话在 JSONL 侧是只含 turn_ended 的空壳),
+/// 由 scanner 的同家同 ID 去重按 mtime/size 裁决
 pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
     vec![
         Box::new(claude::ClaudeAdapter::new()),
@@ -194,6 +200,7 @@ pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(qoder::QoderAdapter::new()),
         Box::new(copilot::CopilotAdapter::new()),
         Box::new(cursor::CursorAdapter::new()),
+        Box::new(cursor_ide::CursorIdeAdapter::new()),
         Box::new(opencode::OpencodeAdapter::new()),
         Box::new(kiro::KiroAdapter::new()),
         Box::new(gemini::GeminiAdapter::new()),

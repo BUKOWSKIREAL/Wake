@@ -86,6 +86,12 @@ pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
     },
     RemoteAgentLayout {
         agent: AgentId::Cursor,
+        // 只覆盖 CLI 源。Cursor 还有一个 IDE 源(adapters/cursor_ide.rs,
+        // `globalStorage/state.vscdb`),**不在远程同步范围内**:本表每个
+        // AgentId 一行、create_remote_adapters 按 agent 取首个模板,同家第二
+        // 个源拿不到自己的行;且该库路径含空格,过不了下方
+        // `sync_paths_are_shell_safe`(路径不加引号直接进 sh -c 与 rsync)。
+        // 要补齐得先给同步管线加引用机制,是独立改动(2026-09-14 review)
         mount: ".cursor/projects",
         sync_paths: &[".cursor/projects"],
         exclude: &[],

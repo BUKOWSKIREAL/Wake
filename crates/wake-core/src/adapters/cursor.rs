@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 /// Cursor CLI:`~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl` 明文。
 /// 行结构 {role, message:{content:[{type:text|tool_use}]}} + {type:"turn_ended"}。
 /// user 正文包在 <timestamp>/<user_query> 壳里;transcript 不含 cwd,
-/// 从有损 slug 目录名 DFS 反推真实路径。IDE chats(store.db 加密)不做。
+/// 从有损 slug 目录名 DFS 反推真实路径。
+///
+/// **同一家的另一个源**:IDE 面板(Chat/Composer)的会话正文在
+/// `globalStorage/state.vscdb`,由 cursor_ide.rs 读;它在本源只留
+/// `{"type":"turn_ended"}` 空壳,枚举时按 `is_turn_marker_only` 跳过。
 pub struct CursorAdapter {
     root: PathBuf,
 }
@@ -300,6 +304,54 @@ fn build_meta(r: &SessionFileRef, p: &CursorParse) -> SessionMeta {
     }
 }
 
+/// 这个 transcript 只有回合标记、没有任何对话行吗?
+///
+/// IDE 面板里跑的会话在这里只留 `{"type":"turn_ended"}`,正文全在
+/// `state.vscdb`(cursor_ide.rs 读)。两源同 native_id,而 Cursor 是**回合结束
+/// 之后**才写 turn_ended——空壳的 mtime 必然晚于库里的 lastUpdatedAt,scanner
+/// 的 mtime 裁决会让空壳稳赢,于是 IDE 会话在列表里显示成 0 条消息。空壳压根
+/// 不是一个会话,枚举阶段就不该让它参与竞争。
+///
+/// 判据是"有没有 `"role"` 字段":CLI 会话每一行都是 `{"role":…}`,IDE 空壳
+/// 只有 turn_ended。
+///
+/// **不设文件大小上限**:空壳按每回合一行(约 40 字节)增长,长会话的空壳
+/// 可以很大——"大文件必有正文"是经验观测、不是结构保证,拿它当早退条件会让
+/// 恰好最长最活跃的那些 IDE 会话重新落回 0 消息(2026-09-14 review)。改为
+/// 流式扫描、命中即停:带正文的文件首行就命中(代价与读定长前缀相同),
+/// 只有纯空壳才会读到尾,而它每行都是同一个短标记、总量本就小。
+fn is_turn_marker_only(path: &Path) -> bool {
+    /// 一次读一块,跨块边界靠保留尾巴(见下)
+    const CHUNK: usize = 16 * 1024;
+    /// 跨块保留的字节数:必须 ≥ needle 长度 - 1,否则骑在块边界上的
+    /// `"role"` 会被劈成两半、两块都不命中
+    const NEEDLE: &[u8] = b"\"role\"";
+
+    let Ok(file) = fs::File::open(path) else {
+        // 读不到就别替它下结论,交给解析阶段
+        return false;
+    };
+    let mut reader = std::io::BufReader::with_capacity(CHUNK, file);
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + NEEDLE.len());
+    loop {
+        let start = window.len();
+        window.resize(start + CHUNK, 0);
+        let read = match std::io::Read::read(&mut reader, &mut window[start..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        window.truncate(start + read);
+        if window.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            return false;
+        }
+        // 只留够拼出跨界 needle 的尾巴,其余丢弃——整文件不进内存
+        let keep = window.len().saturating_sub(NEEDLE.len() - 1);
+        window.drain(..keep);
+    }
+    true
+}
+
 impl AgentAdapter for CursorAdapter {
     fn agent(&self) -> AgentId {
         AgentId::Cursor
@@ -328,12 +380,17 @@ impl AgentAdapter for CursorAdapter {
                     if !meta.is_file() || meta.len() == 0 {
                         continue;
                     }
+                    let size = meta.len() as i64;
+                    // 只有回合标记 = IDE 会话在本源的空壳,正文归 cursor_ide
+                    if is_turn_marker_only(&entry.path()) {
+                        continue;
+                    }
                     refs.push(SessionFileRef {
                         agent: AgentId::Cursor,
                         native_id: name.trim_end_matches(".jsonl").to_string(),
                         file_path: entry.path().to_string_lossy().to_string(),
                         mtime_ms: mtime_ms(&meta),
-                        size: meta.len() as i64,
+                        size,
                     });
                 }
             }
@@ -347,7 +404,13 @@ impl AgentAdapter for CursorAdapter {
         if !p.contains("/agent-transcripts/") || p.contains("/subagents/") {
             return None;
         }
-        default_file_ref(self.agent(), path)
+        let r = default_file_ref(self.agent(), path)?;
+        // 与枚举同一判据:IDE 会话每个回合都会 append 一行 turn_ended,
+        // 这里不挡的话 watcher 会把空壳一次次写回,压掉 cursor_ide 的正文
+        if is_turn_marker_only(path) {
+            return None;
+        }
+        Some(r)
     }
 
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
@@ -419,6 +482,106 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
-        vec![self.root.clone()]
+        // 空根 = 本条 location 已被用户移除(见 excluding_data_roots)
+        if self.root.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            vec![self.root.clone()]
+        }
+    }
+
+    /// Cursor 一家两源(本实例的 agent-transcripts 与 cursor_ide 的 state.vscdb),
+    /// 彼此独立:移除其一不该连带关掉另一个。与 cursor_ide 成对,两边必须同时
+    /// 开启——只开一边的话,面板对另一边的 Remove 仍会按 agent 整家压制
+    fn supports_individual_root_removal(&self) -> bool {
+        true
+    }
+
+    /// 单根实例:被排除的是自己的根就交出空根实例(roster 丢弃它);
+    /// 排除列表里是另一个源的根时返回 None(与我无关,原样保留)
+    fn excluding_data_roots(&self, roots: &[PathBuf]) -> Option<Box<dyn AgentAdapter>> {
+        if roots.contains(&self.root) {
+            Some(Box::new(Self {
+                root: PathBuf::new(),
+            }))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        let mut f = fs::File::create(&p).expect("write fixture");
+        f.write_all(body.as_bytes()).expect("write body");
+        p
+    }
+
+    /// 判据必须与文件大小无关。曾经的实现对 >64KB 的文件直接判"有正文"
+    /// 早退——空壳按每回合一行增长,约 1600 轮后就会越过这条线,于是
+    /// **恰好最长最活跃**的那些 IDE 会话重新落回 0 消息(2026-09-14 review)
+    #[test]
+    fn oversized_stub_is_still_a_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let line = "{\"type\":\"turn_ended\",\"status\":\"success\"}\n";
+        let huge: String = line.repeat(3000); // ~120KB,远超任何定长探测窗口
+        assert!(huge.len() > 100 * 1024, "这个用例要的就是超大空壳");
+        let p = write(dir.path(), "huge-stub.jsonl", &huge);
+        assert!(
+            is_turn_marker_only(&p),
+            "空壳不因体积变大就变成会话——这正是回归点"
+        );
+    }
+
+    /// 正文判定要命中就停:首行即 role 的常规会话、以及正文远在文件深处
+    /// (前面堆了大量回合标记)的会话,都必须被认成真会话
+    #[test]
+    fn any_role_line_means_real_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let role = "{\"role\":\"user\",\"message\":{\"content\":[]}}\n";
+        let marker = "{\"type\":\"turn_ended\",\"status\":\"success\"}\n";
+
+        let head = write(dir.path(), "head.jsonl", &format!("{role}{marker}"));
+        assert!(!is_turn_marker_only(&head), "首行即 role");
+
+        // role 藏在 100KB 标记之后:定长窗口的实现会漏判,流式扫描不会
+        let deep = write(
+            dir.path(),
+            "deep.jsonl",
+            &format!("{}{role}", marker.repeat(2600)),
+        );
+        assert!(!is_turn_marker_only(&deep), "正文在深处也算真会话");
+    }
+
+    /// `"role"` 骑在读块边界上时不能被劈成两半漏掉。构造:让 needle 的
+    /// 起点正好落在 CHUNK 前一字节处
+    #[test]
+    fn needle_across_chunk_boundary_is_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk = 16 * 1024;
+        for offset in [chunk - 3, chunk - 1, chunk, chunk + 1] {
+            let mut body = "x".repeat(offset);
+            body.push_str("{\"role\":\"user\"}");
+            let p = write(dir.path(), &format!("edge-{offset}.jsonl"), &body);
+            assert!(
+                !is_turn_marker_only(&p),
+                "needle 起点在 {offset} 字节处(跨块)也必须命中"
+            );
+        }
+    }
+
+    /// 读不到的文件不下结论:判为"非空壳"交给解析阶段,
+    /// 绝不能因为打不开就把一个真会话从索引里抹掉
+    #[test]
+    fn unreadable_file_is_not_judged_a_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!is_turn_marker_only(
+            &dir.path().join("does-not-exist.jsonl")
+        ));
     }
 }
