@@ -657,7 +657,9 @@ fn guarded_write_respects_winner() {
     let mut loser = meta("codex:g", "败方");
     loser.file_path = "/backup/g.jsonl".into();
     assert!(
-        !store.write_session_guarded(&loser, 5, &[], &|_| 0).unwrap(),
+        !store
+            .write_session_guarded(&loser, 5, &[], &|_| 0, None)
+            .unwrap(),
         "败方不该写入"
     );
     assert_eq!(
@@ -667,7 +669,7 @@ fn guarded_write_respects_winner() {
 
     assert!(
         store
-            .write_session_guarded(&loser, 12, &[], &|_| 0)
+            .write_session_guarded(&loser, 12, &[], &|_| 0, None)
             .unwrap(),
         "反超应接管"
     );
@@ -686,7 +688,9 @@ fn guarded_write_respects_winner() {
     let mut cli = meta("cursor:h", "转录");
     cli.file_path = "/cli/h.jsonl".into();
     assert!(
-        store.write_session_guarded(&cli, 5, &[], &rank_of).unwrap(),
+        store
+            .write_session_guarded(&cli, 5, &[], &rank_of, None)
+            .unwrap(),
         "rank 靠前的较旧副本应接管"
     );
     assert_eq!(
@@ -695,9 +699,36 @@ fn guarded_write_respects_winner() {
     );
     assert!(
         !store
-            .write_session_guarded(&ide, 12, &[], &rank_of)
+            .write_session_guarded(&ide, 12, &[], &rank_of, None)
             .unwrap(),
         "rank 靠后的较新副本不得反超"
+    );
+
+    // supersedes:库里的行正是刚解析失败的那份副本时它让位,回退副本直接接管
+    //(判定与写入同一事务);库里若已被并发写成另一份副本,照常裁决、不误删
+    //(2026-09-15 Codex review 第三轮)
+    assert!(
+        store
+            .write_session_guarded(&ide, 12, &[], &rank_of, Some("/cli/h.jsonl"))
+            .unwrap(),
+        "失效的胜者行让位给回退副本"
+    );
+    assert_eq!(
+        store.get_session("cursor:h").unwrap().unwrap().file_path,
+        "/store/state.vscdb#h"
+    );
+    // 同级(都是 IDE 库副本)且更旧的第三份:库里已不是让位的那份,照常裁决
+    let mut third = meta("cursor:h", "第三份副本");
+    third.file_path = "/store2/state.vscdb#h".into();
+    assert!(
+        !store
+            .write_session_guarded(&third, 3, &[], &rank_of, Some("/cli/h.jsonl"))
+            .unwrap(),
+        "库里已是别的副本时 supersedes 不生效,按位次与 mtime 照常裁决"
+    );
+    assert_eq!(
+        store.get_session("cursor:h").unwrap().unwrap().file_path,
+        "/store/state.vscdb#h"
     );
 }
 

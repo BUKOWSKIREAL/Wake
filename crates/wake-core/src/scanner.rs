@@ -398,6 +398,7 @@ fn run_scan_inner(
                     item.r.mtime_ms,
                     &parsed.units,
                     &rank_of(adapters, meta.agent),
+                    None,
                 ) {
                     Ok(written) => item_written = written,
                     Err(e) => eprintln!("[scanner] write failed {}: {e}", item.r.file_path),
@@ -424,22 +425,15 @@ fn run_scan_inner(
                             }
                             // 库里这条 key 的行若正是刚解析失败的胜者(quick 阶段
                             // 的占位,或早先入库、后来损坏的转录),位次会让它挡住
-                            // 回退副本——先清掉失效行:它的正文已经读不出来,留着
-                            // 只会让详情页永远打不开(2026-09-15 Codex review 第二轮)
-                            if store
-                                .key_for_path(&item.r.file_path)
-                                .ok()
-                                .flatten()
-                                .as_deref()
-                                == Some(meta.key.as_str())
-                            {
-                                let _ = store.remove_session(&meta.key, false);
-                            }
+                            // 回退副本——把它作为 supersedes 交给写事务:它的正文
+                            // 已经读不出来,留着只会让详情页永远打不开;让位的判定
+                            // 与写入同一事务,不在这里先删(Codex review 第二、三轮)
                             match store.write_session_guarded(
                                 &meta,
                                 fb.mtime_ms,
                                 &parsed.units,
                                 &rank_of(adapters, meta.agent),
+                                Some(&item.r.file_path),
                             ) {
                                 Ok(written) => item_written = written,
                                 Err(e) => eprintln!(
@@ -634,6 +628,7 @@ fn reparse_for_parent_change(
         reference.mtime_ms,
         &parsed.units,
         &rank_of(adapters, agent),
+        None,
     ) {
         Ok(written) => written,
         Err(error) => {
@@ -709,6 +704,7 @@ pub fn scan_files(
                             r.mtime_ms,
                             &parsed.units,
                             &rank_of(adapters, meta.agent),
+                            None,
                         )
                         .unwrap_or(false)
                     {

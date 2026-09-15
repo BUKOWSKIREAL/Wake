@@ -371,16 +371,19 @@ impl Store {
     /// (2026-08-24 Codex review)。裁决与 scanner 枚举时的候选排序是同一把尺子:
     /// 先比副本所属实例的 `dedup_rank`(`rank_of` 按 file_path 给出,小者胜),
     /// 同级再比 mtime 新者、平局路径字典序——两条路径尺子不一,会话就会在两份
-    /// 副本之间摇摆(2026-09-15 Codex review)。这里不认任何"占位行"——胜者解析
-    /// 失败后的回退由 scanner 先清掉失效行再来写(run_scan_inner 的回退分支),
-    /// 按 file_mtime=0 推断占位既不唯一(真实文件也可能给 0)也盖不住早先入库、
-    /// 后来损坏的副本。返回 false = 本次是败方副本,一字未写
+    /// 副本之间摇摆(2026-09-15 Codex review)。`supersedes` 是刚解析失败的那份
+    /// 副本的路径(scanner 回退分支传入):库里这条 key 的行若正是它(quick 阶段
+    /// 为它写的占位,或早先入库、后来损坏的转录),它已不是竞争者,本次写入直接
+    /// 接管——判定与写入必须同一事务,先查再删再写会让 watcher 并发写入的第三份
+    /// 副本被误删;按 file_mtime=0 推断占位也不行,真实文件同样可能给 0
+    /// (Codex review 第二、三轮)。返回 false = 本次是败方副本,一字未写
     pub fn write_session_guarded(
         &self,
         meta: &SessionMeta,
         file_mtime: i64,
         units: &[IndexUnit],
         rank_of: &dyn Fn(&str) -> u8,
+        supersedes: Option<&str>,
     ) -> Result<bool> {
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
@@ -392,7 +395,8 @@ impl Store {
             )
             .optional()?;
         if let Some((cur_path, cur_mtime)) = cur {
-            if cur_path != meta.file_path {
+            let yields = supersedes.is_some_and(|failed| failed == cur_path);
+            if cur_path != meta.file_path && !yields {
                 let (cur_rank, new_rank) = (rank_of(&cur_path), rank_of(&meta.file_path));
                 let loses = cur_rank < new_rank
                     || (cur_rank == new_rank
