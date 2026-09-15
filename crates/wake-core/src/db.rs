@@ -371,7 +371,10 @@ impl Store {
     /// (2026-08-24 Codex review)。裁决与 scanner 枚举时的候选排序是同一把尺子:
     /// 先比副本所属实例的 `dedup_rank`(`rank_of` 按 file_path 给出,小者胜),
     /// 同级再比 mtime 新者、平局路径字典序——两条路径尺子不一,会话就会在两份
-    /// 副本之间摇摆(2026-09-15 Codex review)。返回 false = 本次是败方副本,一字未写
+    /// 副本之间摇摆(2026-09-15 Codex review)。这里不认任何"占位行"——胜者解析
+    /// 失败后的回退由 scanner 先清掉失效行再来写(run_scan_inner 的回退分支),
+    /// 按 file_mtime=0 推断占位既不唯一(真实文件也可能给 0)也盖不住早先入库、
+    /// 后来损坏的副本。返回 false = 本次是败方副本,一字未写
     pub fn write_session_guarded(
         &self,
         meta: &SessionMeta,
@@ -389,10 +392,7 @@ impl Store {
             )
             .optional()?;
         if let Some((cur_path, cur_mtime)) = cur {
-            // 既有行是 quick 阶段的占位(write_meta_only 写 file_mtime=0,正文尚未
-            // 解析)时不裁决:胜者解析失败后回退副本要能接管它——旧规则里 0 天然
-            // 比不过任何 mtime,位次进来后必须把这一层说明白
-            if cur_path != meta.file_path && cur_mtime != 0 {
+            if cur_path != meta.file_path {
                 let (cur_rank, new_rank) = (rank_of(&cur_path), rank_of(&meta.file_path));
                 let loses = cur_rank < new_rank
                     || (cur_rank == new_rank

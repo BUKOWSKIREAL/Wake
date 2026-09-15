@@ -422,6 +422,19 @@ fn run_scan_inner(
                                 item_written = true;
                                 break;
                             }
+                            // 库里这条 key 的行若正是刚解析失败的胜者(quick 阶段
+                            // 的占位,或早先入库、后来损坏的转录),位次会让它挡住
+                            // 回退副本——先清掉失效行:它的正文已经读不出来,留着
+                            // 只会让详情页永远打不开(2026-09-15 Codex review 第二轮)
+                            if store
+                                .key_for_path(&item.r.file_path)
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some(meta.key.as_str())
+                            {
+                                let _ = store.remove_session(&meta.key, false);
+                            }
                             match store.write_session_guarded(
                                 &meta,
                                 fb.mtime_ms,

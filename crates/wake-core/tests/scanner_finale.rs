@@ -785,6 +785,23 @@ fn cursor_transcript_outranks_ide_copy() {
         );
         assert_eq!(corrupt.title, "Corrupt twin");
     }
+
+    // 早先正常入库的转录后来损坏:胜者行已在库里、mtime 也不是占位,位次不能
+    // 让它挡住回退——回退分支先清掉失效行,IDE 副本接管(Codex review 第二轮)
+    std::fs::write(&transcript, "{\"role\":\n").unwrap();
+    let cli: Box<dyn AgentAdapter> = CursorAdapter::new().with_custom_root(projects.clone());
+    let ide: Box<dyn AgentAdapter> = CursorIdeAdapter::new().with_custom_root(ide_db.clone());
+    let store = temp_store(&dir.path().join("store-false"));
+    run_scan(&vec![cli, ide], &store, &Recorder::new(), true).unwrap();
+    let taken_over = store
+        .get_session(WITH_BODY)
+        .unwrap()
+        .expect("转录损坏后会话不该消失");
+    assert!(
+        taken_over.file_path.contains("state.vscdb#"),
+        "已入库的转录损坏后由 IDE 副本接管"
+    );
+    assert_eq!(taken_over.title, "CLI twin");
 }
 
 /// 跨 agent 重叠根:文件只归**最长根**的实例(与 watcher 分派同一语义)。
