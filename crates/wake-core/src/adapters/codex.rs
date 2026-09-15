@@ -4,6 +4,7 @@ use super::{units_from_messages, AgentAdapter};
 use crate::models::*;
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -42,35 +43,66 @@ fn rollout_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// Codex Desktop 会为内部命令审批启动 guardian reviewer，并把它们写进与用户
-/// 会话相同的 rollout 树。Desktop/TUI 不把这类内部线程当会话展示，Wake 也应在
-/// adapter 边界排除，而不是让 UI、FTS 与 MCP 各自猜一次。
+/// Codex 把它启动的**每一条**线程都写进同一棵 rollout 树:用户线程之外还有
+/// guardian auto-review、`/review`、compaction、memory consolidation 与
+/// thread_spawn 子代理。它自家的历史只列交互来源(cli/vscode/atlas/chatgpt),
+/// Wake 则把"非用户线程"整族挡在 adapter 文件边界——UI、FTS、MCP 共用同一份
+/// 索引,不必各猜一次(issue #30)。
 ///
-/// `source.subagent.other = "guardian"` 是目前最稳定的结构化标记；早期/过渡格式
-/// 也可能只给出 `thread_source = "guardian_review"`。只读首条 session_meta，
-/// 解析失败时保守地保留文件，避免因半写入或未来格式变化误伤真实会话。
-fn is_guardian_review(path: &Path) -> bool {
+/// 判据只读首行 session_meta:`source` 是对象即结构化来源——`subagent` 的
+/// review/compact/thread_spawn/memory_consolidation/other,`internal` 的
+/// guardian/memory_consolidation——字符串来源(cli/vscode/exec/mcp/unknown/
+/// 自定义)才是用户线程;`thread_source` 另认 subagent/guardian_review/
+/// memory_consolidation 三个内部值(issue 里的过渡格式只带这个字段)。上游落盘
+/// 时把 Internal(Guardian) 改写成 SubAgent(Other("guardian")),两套写法都要认。
+/// `thread_source` 的其余值是 `codex exec --thread-source` 给自动化打的 Feature
+/// 标签,走 exec 这条 Wake 本就展示的路,照常保留。首行读不出、不是 JSON 或
+/// 不是 session_meta(2025 老格式)一律保守放行:半写入或未来格式不能让真实
+/// 会话消失。review 子线程的结果本就经 `<user_action>` 注入父会话渲染;
+/// thread_spawn 子代理转录暂不展示,日后可走 parent_links 挂回父会话。
+fn is_internal_thread(path: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
-    let mut first_line = String::new();
-    if BufReader::new(file).read_line(&mut first_line).ok() == Some(0) {
+    // payload 还带 base_instructions:实测首行中位数 18 KB、最大 49 KB
+    // (2026-09-15),预留容量免得 read_line 反复倍增
+    let mut first_line = String::with_capacity(1 << 16);
+    if BufReader::new(file).read_line(&mut first_line).unwrap_or(0) == 0 {
         return false;
     }
-    let Ok(row) = serde_json::from_str::<Value>(&first_line) else {
+    let Ok(head) = serde_json::from_str::<SessionMetaHead>(&first_line) else {
         return false;
     };
-    if row.get("type").and_then(Value::as_str) != Some("session_meta") {
+    if head.kind != "session_meta" {
         return false;
     }
-    let Some(payload) = row.get("payload") else {
+    let Some(payload) = head.payload else {
         return false;
     };
-    payload
-        .pointer("/source/subagent/other")
-        .and_then(Value::as_str)
-        == Some("guardian")
-        || payload.get("thread_source").and_then(Value::as_str) == Some("guardian_review")
+    payload.source.is_some_and(|source| source.is_object())
+        || matches!(
+            payload.thread_source.as_deref(),
+            Some("subagent" | "guardian_review" | "memory_consolidation")
+        )
+}
+
+/// `is_internal_thread` 只看的两个键。按窄结构反序列化,serde 跳过
+/// base_instructions 那几十 KB 而不是整棵 Value 建起来再丢——别换回 Value
+#[derive(Deserialize)]
+struct SessionMetaHead {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    payload: Option<SessionMetaPayloadHead>,
+}
+
+#[derive(Deserialize)]
+struct SessionMetaPayloadHead {
+    /// 字符串 = 用户线程来源;对象 = subagent / internal 结构化来源(本身很小)
+    #[serde(default)]
+    source: Option<Value>,
+    #[serde(default)]
+    thread_source: Option<String>,
 }
 
 /// rollout 存储本体(用户选中的是数据目录而非 codex home):自身不含
@@ -751,20 +783,14 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let mut refs = if self.scan_sessions {
-            list_jsonl_refs(&self.sessions_dir, AgentId::Codex, rollout_native_id)
-        } else {
-            Vec::new()
-        };
-        if self.scan_archived {
-            refs.extend(list_jsonl_refs(
-                &self.archived_dir,
-                AgentId::Codex,
-                rollout_native_id,
-            ));
-        }
-        refs.retain(|r| !is_guardian_review(Path::new(&r.file_path)));
-        Ok(refs)
+        // 全量枚举与 watcher 同走 file_ref 这一个漏斗(dsh 同款):native id 剥离
+        // 与内部线程判定只存在一处,两条入口不可能分家;缺根时 jsonl_entries 给空
+        Ok(self
+            .data_roots()
+            .iter()
+            .flat_map(|root| jsonl_entries(root))
+            .filter_map(|entry| self.file_ref(entry.path()))
+            .collect())
     }
 
     fn quick_meta(&self, refs: &[SessionFileRef]) -> Option<HashMap<String, SessionMeta>> {
@@ -830,7 +856,7 @@ impl AgentAdapter for CodexAdapter {
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
         let mut r = default_file_ref(self.agent(), path)?;
-        if is_guardian_review(path) {
+        if is_internal_thread(path) {
             return None;
         }
         r.native_id = rollout_native_id(&r.native_id);

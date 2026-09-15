@@ -254,7 +254,7 @@ fn codex_inline_images_decode_and_strip_desktop_wrappers() {
     );
     assert_eq!(session.meta.title, "这个按钮颜色不对");
 }
-fn codex_subagent_ref() -> SessionFileRef {
+fn codex_branch_ref() -> SessionFileRef {
     fs_ref(
         AgentId::Codex,
         &fixture("codex/sessions/2026/08/07/rollout-2026-08-07T12-44-01-33333333-aaaa-bbbb-cccc-000000000003.jsonl"),
@@ -460,60 +460,25 @@ fn codex_parse_contract() {
     );
 }
 
+/// Codex 把非用户线程与用户会话写进同一棵树;文件边界按首行 session_meta 把
+/// 整族挡掉。全量枚举走 file_ref 漏斗,这里两道都断言,守住"不可能分家"。
+/// 判不出用途的首行——老写端无 thread_source、exec 的 Feature 标签、2025 老格式、
+/// 截断的 JSON——一律保守可见(issue #30)
 #[test]
-fn codex_guardian_reviews_are_excluded_without_hiding_regular_subagents() {
+fn codex_internal_threads_are_excluded_at_the_file_boundary() {
     setup();
     let home = tempfile::tempdir().unwrap();
     let day = home.path().join("sessions/2026/09/14");
     fs::create_dir_all(&day).unwrap();
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
 
-    let cases = [
-        (
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            serde_json::json!({
-                "source": { "subagent": { "other": "guardian" } },
-                "thread_source": "subagent"
-            }),
-            false,
-        ),
-        (
-            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-            serde_json::json!({
-                "source": { "subagent": { "other": "guardian" } }
-            }),
-            false,
-        ),
-        (
-            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            serde_json::json!({
-                "source": "cli",
-                "thread_source": "guardian_review"
-            }),
-            false,
-        ),
-        (
-            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-            serde_json::json!({
-                "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-                "source": {
-                    "subagent": {
-                        "thread_spawn": {
-                            "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-                            "depth": 1,
-                            "agent_path": "/root/research"
-                        }
-                    }
-                },
-                "thread_source": "subagent"
-            }),
-            true,
-        ),
-    ];
-
-    let mut expected = HashSet::new();
-    for (index, (id, source_fields, visible)) in cases.iter().enumerate() {
+    fn id(n: u32) -> String {
+        format!("00000000-0000-4000-8000-{n:012}")
+    }
+    // 一条 session_meta 首行;extra 是要试的 source / thread_source 字段
+    let meta = |n: u32, extra: serde_json::Value| {
         let mut payload = serde_json::json!({
-            "id": id,
+            "id": id(n),
             "timestamp": "2026-09-14T00:00:00.000Z",
             "cwd": "/work/wake",
             "originator": "codex_work_desktop"
@@ -521,33 +486,87 @@ fn codex_guardian_reviews_are_excluded_without_hiding_regular_subagents() {
         payload
             .as_object_mut()
             .unwrap()
-            .extend(source_fields.as_object().unwrap().clone());
-        let path = day.join(format!("rollout-2026-09-14T00-00-0{index}-{id}.jsonl"));
-        fs::write(
-            &path,
-            format!(
-                "{}\n",
-                serde_json::json!({
-                    "timestamp": "2026-09-14T00:00:00.000Z",
-                    "type": "session_meta",
-                    "payload": payload
-                })
-            ),
-        )
-        .unwrap();
+            .extend(extra.as_object().unwrap().clone());
+        let line = serde_json::json!({
+            "timestamp": "2026-09-14T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": payload
+        });
+        (id(n), line.to_string())
+    };
+    let spawn = serde_json::json!({
+        "parent_thread_id": id(99), "depth": 1, "agent_path": "/root/research"
+    });
+    // 隐藏的那组是上游各种落盘形态的抽样:`source` 是对象这一条就够判,列全是
+    // 为了谁把它收窄成按路径取值(pointer("/source/subagent/other"))时立刻红
+    let cases = [
+        // guardian auto-review:早期写端 thread_source 仍是 subagent;只带对象;
+        // issue #30 的过渡格式只带 thread_source;字符串来源 + thread_source=subagent
+        (meta(1, serde_json::json!({"source": {"subagent": {"other": "guardian"}}, "thread_source": "subagent"})), false),
+        (meta(2, serde_json::json!({"source": {"subagent": {"other": "guardian"}}})), false),
+        (meta(3, serde_json::json!({"source": "cli", "thread_source": "guardian_review"})), false),
+        (meta(4, serde_json::json!({"source": "exec", "thread_source": "subagent"})), false),
+        // `/review`、compaction、thread_spawn 子代理
+        (meta(5, serde_json::json!({"source": {"subagent": "review"}, "thread_source": "subagent"})), false),
+        (meta(6, serde_json::json!({"source": {"subagent": "compact"}, "thread_source": "subagent"})), false),
+        (meta(7, serde_json::json!({"parent_thread_id": id(99), "source": {"subagent": {"thread_spawn": spawn}}, "thread_source": "subagent"})), false),
+        // memory consolidation 的 subagent / internal 两种写法;上游今天落盘前会把
+        // Internal(Guardian) 改写成 subagent/other,哪天不改写了也要认
+        (meta(8, serde_json::json!({"source": {"subagent": "memory_consolidation"}})), false),
+        (meta(9, serde_json::json!({"source": {"internal": "memory_consolidation"}, "thread_source": "memory_consolidation"})), false),
+        (meta(10, serde_json::json!({"source": {"internal": "guardian"}, "thread_source": "guardian_review"})), false),
+        // 用户线程:字符串来源的各种写法,含 `codex exec --thread-source` 的 Feature 标签
+        (meta(11, serde_json::json!({"source": "vscode", "thread_source": "user"})), true),
+        (meta(12, serde_json::json!({"source": "exec"})), true),
+        (meta(13, serde_json::json!({"source": "exec", "thread_source": "nightly_automation"})), true),
+        (meta(14, serde_json::json!({"source": "unknown"})), true),
+        // 首行不是 session_meta(2025 老格式)或 JSON 截断:判不出用途就保守放行
+        ((id(15), format!(r#"{{"id":"{}","timestamp":"2025-09-15T07:46:43.457Z","instructions":null}}"#, id(15))), true),
+        ((id(16), r#"{"timestamp":"2026-09-14T00:20:00.000Z","type":"session_meta","payload":{"id":""#.to_string()), true),
+    ];
 
-        let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let mut expected = HashSet::new();
+    for (index, ((id, line), visible)) in cases.into_iter().enumerate() {
+        let path = day.join(format!("rollout-2026-09-14T00-{index:02}-00-{id}.jsonl"));
+        fs::write(&path, format!("{line}\n")).unwrap();
         assert_eq!(
             adapter.file_ref(&path).is_some(),
-            *visible,
+            visible,
             "watcher file_ref visibility for {id}"
         );
-        if *visible {
-            expected.insert((*id).to_string());
+        if visible {
+            expected.insert(id);
         }
     }
 
-    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    // archived_sessions(平铺布局)走同一漏斗:内部线程照样挡、用户线程照样进
+    let archived = home.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    for (n, extra, visible) in [
+        (
+            17,
+            serde_json::json!({"source": "cli", "thread_source": "user"}),
+            true,
+        ),
+        (
+            18,
+            serde_json::json!({"source": {"subagent": "review"}, "thread_source": "subagent"}),
+            false,
+        ),
+    ] {
+        let (id, line) = meta(n, extra);
+        let path = archived.join(format!("rollout-2026-09-14T01-00-00-{id}.jsonl"));
+        fs::write(&path, format!("{line}\n")).unwrap();
+        assert_eq!(
+            adapter.file_ref(&path).is_some(),
+            visible,
+            "archived file_ref visibility for {id}"
+        );
+        if visible {
+            expected.insert(id);
+        }
+    }
+
     let actual: HashSet<String> = adapter
         .list_session_files()
         .unwrap()
@@ -2079,18 +2098,26 @@ fn removed_defaults_suppress_instances() {
         .all(|r| r.starts_with(dir.path())));
 }
 
+/// 注入模板出现在 role=user 消息里时归 Meta。fixture 3 是从父会话分出来的
+/// **用户**线程(forked_from_id、字符串 source),走得到文件边界——guardian
+/// 形态已在 codex_internal_threads_are_excluded_at_the_file_boundary 里覆盖,
+/// 这里不能再用一个枚举不到的文件当被测对象
 #[test]
-fn codex_subagent_transcript_injection_is_meta() {
+fn codex_branch_transcript_injection_is_meta() {
     setup();
     let adapter = CodexAdapter::new();
-    let r = codex_subagent_ref();
+    let r = codex_branch_ref();
+    assert!(
+        adapter.file_ref(Path::new(&r.file_path)).is_some(),
+        "用户分支线程在文件边界可见"
+    );
     let t = adapter
         .parse_transcript(&r)
-        .expect("codex subagent parse_transcript");
+        .expect("codex branch parse_transcript");
 
-    // 分支 / subagent 线程把**父会话的整段 transcript** 打包成一条
-    // role=user 的消息喂进来,里面含父会话的 assistant 输出。不识别的话,
-    // 父会话里 AI 说的话会显示成这个会话里用户发的
+    // 父会话的整段 transcript 被打包成一条 role=user 的消息喂进来,里面含
+    // 父会话的 assistant 输出。不识别的话,父会话里 AI 说的话会显示成这个
+    // 会话里用户发的
     let injected = t
         .mainline
         .iter()
@@ -2125,7 +2152,7 @@ fn codex_subagent_transcript_injection_is_meta() {
     // Meta 不进 FTS:注入进来的父会话内容不该被搜索命中
     let s = adapter
         .parse_session(&r)
-        .expect("codex subagent parse_session");
+        .expect("codex branch parse_session");
     assert!(
         !s.units.iter().any(|u| u.text.contains("[2] assistant:")),
         "注入的父会话 transcript 不得进入检索单元"

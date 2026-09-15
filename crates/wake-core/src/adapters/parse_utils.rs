@@ -224,6 +224,19 @@ pub fn usage_tokens(usage: &Value) -> i64 {
         .sum()
 }
 
+/// 递归枚举 `dir` 下的 `*.jsonl` 普通文件。file_type 来自 readdir、不额外
+/// stat;根不存在或不是目录给空迭代(各家 list_session_files 对缺根自行降级,
+/// 不变量 8①)。想在文件边界再加判据的家(codex)拿它喂自己的 `file_ref` 漏斗
+pub fn jsonl_entries(dir: &std::path::Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".jsonl")
+        })
+}
+
 /// 递归枚举目录下非空 .jsonl 为 SessionFileRef;`native_id` 从文件 stem 提取
 /// 会话 id(多数家恒等,codex 需剥 rollout 前缀)
 pub fn list_jsonl_refs(
@@ -232,14 +245,8 @@ pub fn list_jsonl_refs(
     native_id: impl Fn(&str) -> String,
 ) -> Vec<SessionFileRef> {
     let mut refs = Vec::new();
-    if !dir.is_dir() {
-        return refs;
-    }
-    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
+    for entry in jsonl_entries(dir) {
+        let name = entry.file_name().to_string_lossy();
         let Some(stem) = name.strip_suffix(".jsonl") else {
             continue;
         };

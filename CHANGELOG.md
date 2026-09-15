@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix: Codex's background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — no longer show up as sessions; they were listed as `Untitled` or as a copy of their parent, and reached search, project counts and the MCP tools too. Existing indexes drop them on the next scan
+
 ## [0.6.5] — 2026-09-14
 
 - New: `wake_get_session` and `wake-cli show` can read a subagent transcript — the main transcript now lists their ids; pass one as `subagent` / `--subagent`, or `*` to list them all
