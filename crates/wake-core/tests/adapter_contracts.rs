@@ -461,6 +461,103 @@ fn codex_parse_contract() {
 }
 
 #[test]
+fn codex_guardian_reviews_are_excluded_without_hiding_regular_subagents() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2026/09/14");
+    fs::create_dir_all(&day).unwrap();
+
+    let cases = [
+        (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            serde_json::json!({
+                "source": { "subagent": { "other": "guardian" } },
+                "thread_source": "subagent"
+            }),
+            false,
+        ),
+        (
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            serde_json::json!({
+                "source": { "subagent": { "other": "guardian" } }
+            }),
+            false,
+        ),
+        (
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            serde_json::json!({
+                "source": "cli",
+                "thread_source": "guardian_review"
+            }),
+            false,
+        ),
+        (
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            serde_json::json!({
+                "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                            "depth": 1,
+                            "agent_path": "/root/research"
+                        }
+                    }
+                },
+                "thread_source": "subagent"
+            }),
+            true,
+        ),
+    ];
+
+    let mut expected = HashSet::new();
+    for (index, (id, source_fields, visible)) in cases.iter().enumerate() {
+        let mut payload = serde_json::json!({
+            "id": id,
+            "timestamp": "2026-09-14T00:00:00.000Z",
+            "cwd": "/work/wake",
+            "originator": "codex_work_desktop"
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(source_fields.as_object().unwrap().clone());
+        let path = day.join(format!("rollout-2026-09-14T00-00-0{index}-{id}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-09-14T00:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": payload
+                })
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+        assert_eq!(
+            adapter.file_ref(&path).is_some(),
+            *visible,
+            "watcher file_ref visibility for {id}"
+        );
+        if *visible {
+            expected.insert((*id).to_string());
+        }
+    }
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let actual: HashSet<String> = adapter
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    assert_eq!(actual, expected, "full scan must use the same boundary");
+}
+
+#[test]
 fn codex_review_output_is_readable_and_not_duplicated() {
     setup();
     let adapter = CodexAdapter::new();

@@ -6,8 +6,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
+use serde_json::json;
+use wake_core::adapters::codex::CodexAdapter;
 use wake_core::adapters::AgentAdapter;
 use wake_core::db::Store;
+use wake_core::mcp::tools::{self, TranscriptCache};
 use wake_core::models::*;
 use wake_core::scanner::{refresh_parent_links, run_scan, ScanEvents, ScanProgress};
 
@@ -721,6 +724,163 @@ fn pure_deletion_scan_notifies_sessions_changed() {
         rec.changed() > 0,
         "纯删除轮未发 on_sessions_changed,UI 不会刷新"
     );
+}
+
+/// v0.6.4 已把 guardian reviewer 当根会话写进库的升级场景：原始 rollout 仍在
+/// 磁盘，但新 adapter 不再枚举它，常规扫描应同时清掉 session 与 FTS；MCP 的
+/// 搜索、列表、详情和项目计数都必须随同一份索引恢复，不能另加展示层补丁。
+#[test]
+fn codex_guardian_rescan_prunes_stale_index_and_all_mcp_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let day = codex_home.join("sessions/2026/09/14");
+    std::fs::create_dir_all(&day).unwrap();
+
+    let guardian_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let guardian_key = format!("codex:{guardian_id}");
+    let guardian_path = day.join(format!("rollout-2026-09-14T01-00-00-{guardian_id}.jsonl"));
+    std::fs::write(
+        &guardian_path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": "2026-09-14T01:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": guardian_id,
+                    "parent_thread_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                    "thread_source": "subagent",
+                    "source": { "subagent": { "other": "guardian" } },
+                    "cwd": "/work/wake",
+                    "originator": "codex_work_desktop"
+                }
+            }),
+            json!({
+                "timestamp": "2026-09-14T01:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "guardianartifact7429" }]
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let normal_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let normal_key = format!("codex:{normal_id}");
+    let normal_path = day.join(format!("rollout-2026-09-14T02-00-00-{normal_id}.jsonl"));
+    std::fs::write(
+        &normal_path,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": "2026-09-14T02:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": normal_id,
+                    "thread_source": "cli",
+                    "source": "cli",
+                    "cwd": "/work/wake",
+                    "originator": "codex_cli_rs"
+                }
+            }),
+            json!({
+                "timestamp": "2026-09-14T02:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "keep the normal session" }]
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(codex_home.clone())];
+
+    // 绕过新枚举边界手工种一条旧版索引，模拟用户从 v0.6.4 升级。
+    let stale_ref = SessionFileRef {
+        agent: AgentId::Codex,
+        native_id: guardian_id.to_string(),
+        file_path: guardian_path.to_string_lossy().to_string(),
+        mtime_ms: 1,
+        size: std::fs::metadata(&guardian_path).unwrap().len() as i64,
+    };
+    let stale = adapters[0].parse_session(&stale_ref).unwrap();
+    store
+        .write_session(&stale.meta, stale_ref.mtime_ms, &stale.units)
+        .unwrap();
+    assert!(store.get_session(&guardian_key).unwrap().is_some());
+    let before = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &TranscriptCache::default(),
+        tools::SEARCH,
+        &json!({ "query": "guardianartifact7429", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(
+        before.contains(&guardian_key),
+        "stale fixture was not indexed"
+    );
+
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert!(guardian_path.exists(), "扫描不得删除 Codex 原始 rollout");
+    assert!(store.get_session(&guardian_key).unwrap().is_none());
+    assert!(store.get_session(&normal_key).unwrap().is_some());
+
+    let cache = TranscriptCache::default();
+    let searched = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::SEARCH,
+        &json!({ "query": "guardianartifact7429", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(searched.contains("No matches"), "{searched}");
+
+    let listed = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::LIST_SESSIONS,
+        &json!({ "project": "/work/wake", "agents": ["codex"] }),
+    )
+    .unwrap();
+    assert!(listed.contains(&normal_key), "{listed}");
+    assert!(!listed.contains(&guardian_key), "{listed}");
+    assert!(
+        tools::invoke(
+            store.as_ref(),
+            &adapters,
+            &cache,
+            tools::GET_SESSION,
+            &json!({ "key": guardian_key })
+        )
+        .is_err(),
+        "已清理的 reviewer key 不应继续可读"
+    );
+
+    let projects = tools::invoke(
+        store.as_ref(),
+        &adapters,
+        &cache,
+        tools::LIST_PROJECTS,
+        &json!({}),
+    )
+    .unwrap();
+    let wake = projects
+        .lines()
+        .find(|line| line.contains("/work/wake"))
+        .unwrap_or_else(|| panic!("Wake project missing:\n{projects}"));
+    assert!(wake.contains("· 1 session ·"), "{wake}");
 }
 
 /// 胜者副本损坏时按裁决顺位回退:会话不得从索引消失(2026-08-24 Codex review P2)

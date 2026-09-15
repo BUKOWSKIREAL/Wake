@@ -42,6 +42,37 @@ fn rollout_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// Codex Desktop 会为内部命令审批启动 guardian reviewer，并把它们写进与用户
+/// 会话相同的 rollout 树。Desktop/TUI 不把这类内部线程当会话展示，Wake 也应在
+/// adapter 边界排除，而不是让 UI、FTS 与 MCP 各自猜一次。
+///
+/// `source.subagent.other = "guardian"` 是目前最稳定的结构化标记；早期/过渡格式
+/// 也可能只给出 `thread_source = "guardian_review"`。只读首条 session_meta，
+/// 解析失败时保守地保留文件，避免因半写入或未来格式变化误伤真实会话。
+fn is_guardian_review(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut first_line = String::new();
+    if BufReader::new(file).read_line(&mut first_line).ok() == Some(0) {
+        return false;
+    }
+    let Ok(row) = serde_json::from_str::<Value>(&first_line) else {
+        return false;
+    };
+    if row.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return false;
+    }
+    let Some(payload) = row.get("payload") else {
+        return false;
+    };
+    payload
+        .pointer("/source/subagent/other")
+        .and_then(Value::as_str)
+        == Some("guardian")
+        || payload.get("thread_source").and_then(Value::as_str) == Some("guardian_review")
+}
+
 /// rollout 存储本体(用户选中的是数据目录而非 codex home):自身不含
 /// sessions/archived 子目录,且顶层有 YYYY 日期目录(sessions 树)**或**
 /// 平铺的 rollout-*.jsonl(archived_sessions 的真实布局,实测平铺)。
@@ -732,6 +763,7 @@ impl AgentAdapter for CodexAdapter {
                 rollout_native_id,
             ));
         }
+        refs.retain(|r| !is_guardian_review(Path::new(&r.file_path)));
         Ok(refs)
     }
 
@@ -798,6 +830,9 @@ impl AgentAdapter for CodexAdapter {
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
         let mut r = default_file_ref(self.agent(), path)?;
+        if is_guardian_review(path) {
+            return None;
+        }
         r.native_id = rollout_native_id(&r.native_id);
         Some(r)
     }
