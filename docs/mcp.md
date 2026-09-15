@@ -107,6 +107,7 @@ Everything above happens locally; Wake itself does not change and the other agen
 - Subagent transcripts that live inside a session (Claude Code sidechains, Cursor subagents) are not merged into the main transcript: `wake_get_session` lists their ids at the end and reads one when it is passed as `subagent`. Subagent sessions that Wake tracks as separate sessions (Grok) are folded under their parent in `wake_list_sessions` but can be read by key.
 - Antigravity sessions are metadata only — their transcripts are encrypted on disk, so an agent gets the same preview card Wake shows.
 - Archived Codex sessions appear in search results but not in `wake_list_sessions` or `wake_list_projects`.
+- Codex's own background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents that Codex writes into the same `sessions` directory — are not indexed at all: they never show up in search, lists or project counts, and there is no key to read them by. After upgrading, rows an older Wake had indexed disappear once Wake itself has rescanned (launch it, or press Refresh); `wake-mcp` only reads the index and never rescans.
 
 ## Keeping results fresh
 
