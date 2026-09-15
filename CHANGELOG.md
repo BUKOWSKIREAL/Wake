@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.6.7] — 2026-09-15
+
+- New: Cursor's IDE chats — the Chat / Composer panel — are indexed from Cursor's own database next to the CLI transcripts, so chats Wake never showed before are listed and searchable like any other session; a chat that also has a full transcript keeps being read from the transcript, so it stays under the right project. Older chats that Cursor stored without a workspace show under Unknown project (#32, thanks @junqingyongyuanbusi)
+
 ## [0.6.6] — 2026-09-15
 
 - Fix: Codex's background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — no longer show up as sessions; they were listed as `Untitled` or as a copy of their parent, and reached search, project counts and the MCP tools too. Existing indexes drop them on the next scan
