@@ -704,12 +704,19 @@ fn guarded_write_respects_winner() {
         "rank 靠后的较新副本不得反超"
     );
 
-    // supersedes:库里的行正是刚解析失败的那份副本时它让位,回退副本直接接管
-    //(判定与写入同一事务);库里若已被并发写成另一份副本,照常裁决、不误删
-    //(2026-09-15 Codex review 第三轮)
+    // supersedes:库里的行正是刚解析失败的那份副本(同路径、同枚举 mtime)时
+    // 它让位,回退副本直接接管(判定与写入同一事务);同路径但库里版本更新
+    //(mtime 更大)= watcher 已把修好的文件成功入库,不让位;库里若已被并发写成
+    // 另一份副本,照常裁决、不误删(2026-09-15 Codex review 三、四轮)
+    assert!(
+        !store
+            .write_session_guarded(&ide, 12, &[], &rank_of, Some(("/cli/h.jsonl", 4)))
+            .unwrap(),
+        "同路径但库里版本更新(mtime 更大)不让位"
+    );
     assert!(
         store
-            .write_session_guarded(&ide, 12, &[], &rank_of, Some("/cli/h.jsonl"))
+            .write_session_guarded(&ide, 12, &[], &rank_of, Some(("/cli/h.jsonl", 5)))
             .unwrap(),
         "失效的胜者行让位给回退副本"
     );
@@ -722,13 +729,30 @@ fn guarded_write_respects_winner() {
     third.file_path = "/store2/state.vscdb#h".into();
     assert!(
         !store
-            .write_session_guarded(&third, 3, &[], &rank_of, Some("/cli/h.jsonl"))
+            .write_session_guarded(&third, 3, &[], &rank_of, Some(("/cli/h.jsonl", 5)))
             .unwrap(),
         "库里已是别的副本时 supersedes 不生效,按位次与 mtime 照常裁决"
     );
     assert_eq!(
         store.get_session("cursor:h").unwrap().unwrap().file_path,
         "/store/state.vscdb#h"
+    );
+
+    // quick 阶段为失败的胜者写的占位行(file_mtime=0)同样让位
+    let mut placeholder = meta("cursor:p", "占位");
+    placeholder.file_path = "/cli/p.jsonl".into();
+    store.write_meta_only(&[(placeholder, 0)]).unwrap();
+    let mut p_ide = meta("cursor:p", "IDE 副本");
+    p_ide.file_path = "/store/state.vscdb#p".into();
+    assert!(
+        store
+            .write_session_guarded(&p_ide, 12, &[], &rank_of, Some(("/cli/p.jsonl", 5)))
+            .unwrap(),
+        "占位行让位给回退副本"
+    );
+    assert_eq!(
+        store.get_session("cursor:p").unwrap().unwrap().file_path,
+        "/store/state.vscdb#p"
     );
 }
 

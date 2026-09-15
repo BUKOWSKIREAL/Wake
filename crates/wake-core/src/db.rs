@@ -372,18 +372,20 @@ impl Store {
     /// 先比副本所属实例的 `dedup_rank`(`rank_of` 按 file_path 给出,小者胜),
     /// 同级再比 mtime 新者、平局路径字典序——两条路径尺子不一,会话就会在两份
     /// 副本之间摇摆(2026-09-15 Codex review)。`supersedes` 是刚解析失败的那份
-    /// 副本的路径(scanner 回退分支传入):库里这条 key 的行若正是它(quick 阶段
-    /// 为它写的占位,或早先入库、后来损坏的转录),它已不是竞争者,本次写入直接
-    /// 接管——判定与写入必须同一事务,先查再删再写会让 watcher 并发写入的第三份
-    /// 副本被误删;按 file_mtime=0 推断占位也不行,真实文件同样可能给 0
-    /// (Codex review 第二、三轮)。返回 false = 本次是败方副本,一字未写
+    /// 副本(路径 + 枚举时看到的 mtime,scanner 回退分支传入):库里这条 key 的行
+    /// 若正是它——同路径,且 file_mtime 不晚于枚举时看到的 mtime(quick 阶段占位
+    /// 的 0、早先入库后来损坏的旧版本都算)——它已不是竞争者,本次写入直接接管;
+    /// 期间 watcher 已把修好的同路径文件成功入库(mtime 更新)则不让位,照常裁决。判定与写入必须
+    /// 同一事务,先查再删再写会让并发写入的第三份副本被误删;单凭 file_mtime=0
+    /// 推断占位也不行,真实文件同样可能给 0(Codex review 二、三、四轮)。
+    /// 返回 false = 本次是败方副本,一字未写
     pub fn write_session_guarded(
         &self,
         meta: &SessionMeta,
         file_mtime: i64,
         units: &[IndexUnit],
         rank_of: &dyn Fn(&str) -> u8,
-        supersedes: Option<&str>,
+        supersedes: Option<(&str, i64)>,
     ) -> Result<bool> {
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
@@ -395,7 +397,12 @@ impl Store {
             )
             .optional()?;
         if let Some((cur_path, cur_mtime)) = cur {
-            let yields = supersedes.is_some_and(|failed| failed == cur_path);
+            // 让位只认"库里还是我们解析失败的那个版本或更旧的":同路径且行上的
+            // file_mtime ≤ 枚举时看到的 mtime(quick 占位的 0 自然包含;早先入库、
+            // 后来损坏的转录是"更旧");期间 watcher 已把修好的同路径文件成功入库
+            //(mtime 更新)就不让位,照常裁决(Codex review 第四轮)
+            let yields = supersedes
+                .is_some_and(|(failed, seen_mtime)| failed == cur_path && cur_mtime <= seen_mtime);
             if cur_path != meta.file_path && !yields {
                 let (cur_rank, new_rank) = (rank_of(&cur_path), rank_of(&meta.file_path));
                 let loses = cur_rank < new_rank

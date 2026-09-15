@@ -433,7 +433,7 @@ fn run_scan_inner(
                                 fb.mtime_ms,
                                 &parsed.units,
                                 &rank_of(adapters, meta.agent),
-                                Some(&item.r.file_path),
+                                Some((item.r.file_path.as_str(), item.r.mtime_ms)),
                             ) {
                                 Ok(written) => item_written = written,
                                 Err(e) => eprintln!(
