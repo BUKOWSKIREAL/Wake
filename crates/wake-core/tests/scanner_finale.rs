@@ -756,9 +756,11 @@ fn cursor_transcript_outranks_ide_copy() {
             .get_session(WITH_BODY)
             .unwrap()
             .expect("带正文的会话在库");
+        // 按 Path 比较:Windows 上 read_dir 给的是反斜杠,join 里的字面量是正斜杠,
+        // 按字符串比在 windows-2022 job 上必红(2026-09-15 CI)
         assert_eq!(
-            body.file_path,
-            transcript.to_string_lossy(),
+            Path::new(&body.file_path),
+            transcript.as_path(),
             "ide_first={ide_first}:转录带正文时 CLI 那份胜出,不看 mtime 与 roster 顺序"
         );
         assert_eq!(
