@@ -177,6 +177,10 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.supports_individual_root_removal()
     }
 
+    fn dedup_rank(&self) -> u8 {
+        self.inner.dedup_rank()
+    }
+
     fn excluding_data_roots(&self, roots: &[std::path::PathBuf]) -> Option<Box<dyn AgentAdapter>> {
         let inner = self.inner.excluding_data_roots(roots)?;
         Some(Box::new(Self::new(inner, self.host.clone())))

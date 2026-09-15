@@ -466,12 +466,19 @@ pub fn build_antigravity_db(path: &Path) {
 ///   这条是防回归的主要断言。含 thinking 气泡、工具气泡(rawArgs 形态)、
 ///   **只有 params 没有 rawArgs 的终端气泡**(实测占工具调用的 11%,且
 ///   结果是 `{"output":…}` 对象而非字符串)、空壳流式气泡
-///   (Cursor 每个分片都落一条,绝大多数没有 text),以及一条顺序表里有、
-///   KV 里已被清理的气泡。
+///   (Cursor 每个分片都落一条,绝大多数没有 text),一条顺序表里有、
+///   KV 里已被清理的气泡,以及一条 KV 里 value 为 NULL 的气泡行(Cursor 清理
+///   过的会话常见,真实库里一条就曾让整个会话解析失败)。
 /// - `cide-0002`:`name` 为空且无 lastUpdatedAt,验证标题回退首条用户消息、
 ///   updated_at 回退末条气泡的 ISO createdAt。
 /// - `cide-0003`:零气泡的草稿 composer,不进列表。
 /// - `cide-0004`:子代理会话,composerHeaders 给出 parentComposerId。
+/// - `33333333-…-03`:与 CLI 转录 fixture 同 id 的 IDE 副本——转录带正文,
+///   scanner 按 dedup_rank 让 CLI 那份胜出(scanner_finale 有端到端)。
+/// - `44444444-…-04`:转录只剩 turn_ended 空壳(fixtures/cursor 下同名文件),
+///   CLI 源丢弃、IDE 副本胜出。
+/// - `55555555-…-05`:scanner_finale 在测试里给它写一份截断成 `{"role":` 的
+///   坏转录——过得了空壳判定、解不出消息,必须按解析失败回退到这份 IDE 副本。
 pub fn build_cursor_ide_db(path: &Path) {
     let conn = rusqlite::Connection::open(path).expect("create cursor ide fixture db");
     conn.execute_batch(
@@ -497,6 +504,7 @@ pub fn build_cursor_ide_db(path: &Path) {
                {"bubbleId":"nn-term-1","type":2,"createdAt":"2026-08-09T10:00:09.500Z"},
                {"bubbleId":"bb-empty-1","type":2,"createdAt":"2026-08-09T10:00:10.000Z"},
                {"bubbleId":"cc-gone-1","type":2,"createdAt":"2026-08-09T10:00:11.000Z"},
+               {"bubbleId":"dd-null-1","type":2,"createdAt":"2026-08-09T10:00:11.500Z"},
                {"bubbleId":"kk-final-1","type":2,"createdAt":"2026-08-09T10:00:12.000Z"}]}'),
           ('bubbleId:cide-0001:zz-user-1',
            '{"_v":3,"type":1,"bubbleId":"zz-user-1","createdAt":"2026-08-09T10:00:05.000Z",
@@ -516,7 +524,9 @@ pub fn build_cursor_ide_db(path: &Path) {
                "params":{"command":"cargo test -p wakefx","cwd":""},
                "result":{"output":"test result: ok. 3 passed","rejected":false}}}'),
           ('bubbleId:cide-0001:bb-empty-1',
-           '{"_v":3,"type":2,"bubbleId":"bb-empty-1","createdAt":"2026-08-09T10:00:10.000Z","text":""}'),          ('bubbleId:cide-0001:kk-final-1',
+           '{"_v":3,"type":2,"bubbleId":"bb-empty-1","createdAt":"2026-08-09T10:00:10.000Z","text":""}'),
+          ('bubbleId:cide-0001:dd-null-1', NULL),
+          ('bubbleId:cide-0001:kk-final-1',
            '{"_v":3,"type":2,"bubbleId":"kk-final-1","createdAt":"2026-08-09T10:00:12.000Z",
              "text":"找到泄漏点,已在清理回调里停止扫描。"}'),
 
@@ -542,7 +552,28 @@ pub fn build_cursor_ide_db(path: &Path) {
              "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
              "fullConversationHeadersOnly":[{"bubbleId":"s1","type":1}]}'),
           ('bubbleId:cide-0004:s1',
-           '{"_v":3,"type":1,"bubbleId":"s1","createdAt":"2026-08-09T12:00:00.000Z","text":"child task"}');
+           '{"_v":3,"type":1,"bubbleId":"s1","createdAt":"2026-08-09T12:00:00.000Z","text":"child task"}'),
+
+          ('composerData:33333333-aaaa-bbbb-cccc-000000000003',
+           '{"_v":18,"composerId":"33333333-aaaa-bbbb-cccc-000000000003","name":"CLI twin",
+             "createdAt":1786340000000,"lastUpdatedAt":1786340100000,
+             "fullConversationHeadersOnly":[{"bubbleId":"t1","type":1}]}'),
+          ('bubbleId:33333333-aaaa-bbbb-cccc-000000000003:t1',
+           '{"_v":3,"type":1,"bubbleId":"t1","createdAt":"2026-08-09T13:00:00.000Z","text":"IDE 库里的同一会话"}'),
+
+          ('composerData:44444444-aaaa-bbbb-cccc-000000000004',
+           '{"_v":18,"composerId":"44444444-aaaa-bbbb-cccc-000000000004","name":"Stub twin",
+             "createdAt":1786350000000,"lastUpdatedAt":1786350100000,
+             "fullConversationHeadersOnly":[{"bubbleId":"u1","type":1}]}'),
+          ('bubbleId:44444444-aaaa-bbbb-cccc-000000000004:u1',
+           '{"_v":3,"type":1,"bubbleId":"u1","createdAt":"2026-08-09T14:00:00.000Z","text":"只有空壳转录的会话"}'),
+
+          ('composerData:55555555-aaaa-bbbb-cccc-000000000005',
+           '{"_v":18,"composerId":"55555555-aaaa-bbbb-cccc-000000000005","name":"Corrupt twin",
+             "createdAt":1786360000000,"lastUpdatedAt":1786360100000,
+             "fullConversationHeadersOnly":[{"bubbleId":"v1","type":1}]}'),
+          ('bubbleId:55555555-aaaa-bbbb-cccc-000000000005:v1',
+           '{"_v":3,"type":1,"bubbleId":"v1","createdAt":"2026-08-09T15:00:00.000Z","text":"转录已损坏的会话"}');
 
         INSERT INTO composerHeaders
             (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value, subagentTypeName)

@@ -12,8 +12,11 @@ use std::path::PathBuf;
 /// **与 cursor.rs 是同一家的两个数据源**:CLI(`cursor-agent`)把完整对话写
 /// `~/.cursor/.../agent-transcripts/*.jsonl`,IDE 面板只把回合标记
 /// (`{"type":"turn_ended"}`)写进那里、正文全留在本库——所以 IDE 会话在只读
-/// JSONL 的旧实现里是空壳。两源同 native_id 的重叠由 scanner 按 mtime/size
-/// 裁决(不变量 8⑦),这里不做二选一。
+/// JSONL 的旧实现里是空壳。两源同 native_id 的重叠交 scanner 的副本裁决,
+/// 本源以 `dedup_rank` 排在 CLI 源之后:转录带正文时 CLI 那份胜出(它有 slug
+/// 可反推项目,本库多数会话没有工作区路径),本源那份留作解析失败的回退;
+/// 只有转录缺失或只剩空壳的会话才由本源胜出。不按 mtime 定胜负——两边写盘
+/// 先后不固定,同一会话会在项目之间跳(2026-09-15 实测)。
 ///
 /// 库结构(VS Code 的 KV 表):
 /// - `cursorDiskKV`:`composerData:<composerId>` 是会话元数据 + 气泡顺序
@@ -195,7 +198,12 @@ impl CursorIdeAdapter {
             let mut found = stmt.query(rusqlite::params![&prefix, cut, &upper])?;
             while let Some(row) = found.next()? {
                 let id: String = row.get(0)?;
-                let body: String = row.get(1)?;
+                // Cursor 清理过的气泡会留下 value 为 NULL 的行(本机 2.5 GB 库里
+                // 983 行、波及 107 个会话),按"已被清理"跳过——当成错误会让
+                // 整个会话解析失败
+                let Some(body) = row.get::<_, Option<String>>(1)? else {
+                    continue;
+                };
                 if let Ok(v) = serde_json::from_str::<Value>(&body) {
                     bubbles.insert(id, v);
                 }
@@ -435,6 +443,11 @@ impl IdeRow {
 impl AgentAdapter for CursorIdeAdapter {
     fn agent(&self) -> AgentId {
         AgentId::Cursor
+    }
+
+    /// 与 cursor.rs 同 key 的副本:CLI 源先、本源后(见文件头)
+    fn dedup_rank(&self) -> u8 {
+        1
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {

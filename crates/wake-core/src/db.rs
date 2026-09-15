@@ -368,12 +368,16 @@ impl Store {
 
     /// 增量写入的并发安全版:胜者比较与写入**同一事务**——先查后写分开时,
     /// 败方副本的事件能与全量扫描交错、后发落库,让 file_path 违背 mtime 裁决
-    /// (2026-08-24 Codex review)。返回 false = 本次是败方副本,一字未写
+    /// (2026-08-24 Codex review)。裁决与 scanner 枚举时的候选排序是同一把尺子:
+    /// 先比副本所属实例的 `dedup_rank`(`rank_of` 按 file_path 给出,小者胜),
+    /// 同级再比 mtime 新者、平局路径字典序——两条路径尺子不一,会话就会在两份
+    /// 副本之间摇摆(2026-09-15 Codex review)。返回 false = 本次是败方副本,一字未写
     pub fn write_session_guarded(
         &self,
         meta: &SessionMeta,
         file_mtime: i64,
         units: &[IndexUnit],
+        rank_of: &dyn Fn(&str) -> u8,
     ) -> Result<bool> {
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
@@ -385,11 +389,19 @@ impl Store {
             )
             .optional()?;
         if let Some((cur_path, cur_mtime)) = cur {
-            let loses = cur_path != meta.file_path
-                && (cur_mtime > file_mtime
-                    || (cur_mtime == file_mtime && cur_path.as_str() < meta.file_path.as_str()));
-            if loses {
-                return Ok(false); // 事务未提交即弃
+            // 既有行是 quick 阶段的占位(write_meta_only 写 file_mtime=0,正文尚未
+            // 解析)时不裁决:胜者解析失败后回退副本要能接管它——旧规则里 0 天然
+            // 比不过任何 mtime,位次进来后必须把这一层说明白
+            if cur_path != meta.file_path && cur_mtime != 0 {
+                let (cur_rank, new_rank) = (rank_of(&cur_path), rank_of(&meta.file_path));
+                let loses = cur_rank < new_rank
+                    || (cur_rank == new_rank
+                        && (cur_mtime > file_mtime
+                            || (cur_mtime == file_mtime
+                                && cur_path.as_str() < meta.file_path.as_str())));
+                if loses {
+                    return Ok(false); // 事务未提交即弃
+                }
             }
         }
         write_session_tx(&tx, meta, file_mtime, units)?;

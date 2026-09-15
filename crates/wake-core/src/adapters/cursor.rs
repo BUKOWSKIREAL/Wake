@@ -13,8 +13,11 @@ use std::path::{Path, PathBuf};
 /// 从有损 slug 目录名 DFS 反推真实路径。
 ///
 /// **同一家的另一个源**:IDE 面板(Chat/Composer)的会话正文在
-/// `globalStorage/state.vscdb`,由 cursor_ide.rs 读;它在本源只留
-/// `{"type":"turn_ended"}` 空壳,枚举时按 `is_turn_marker_only` 跳过。
+/// `globalStorage/state.vscdb`,由 cursor_ide.rs 读。某些 Cursor 版本的 IDE
+/// 会话在本源只留 `{"type":"turn_ended"}` 空壳,枚举时按 `is_turn_marker_only`
+/// 跳过;转录带正文时两源各有一份,scanner 的副本裁决按 `dedup_rank` 固定让
+/// 本源胜出——本源有 slug 可反推项目,IDE 库里多数会话没有工作区路径,按写盘
+/// 先后轮流胜出会让同一会话在项目之间跳(2026-09-15 实测,Cursor 3.18)。
 pub struct CursorAdapter {
     root: PathBuf,
 }
@@ -133,10 +136,13 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
     let mut created_at = 0i64;
     let mut updated_at = 0i64;
     let mut unknown_lines = 0u32;
+    // 读不出/不是 JSON 的行(截断、损坏),与"认得出 JSON 但类型未知"分开计
+    let mut malformed_lines = 0u32;
 
     for line in reader.lines() {
         let Ok(line) = line else {
             unknown_lines += 1;
+            malformed_lines += 1;
             continue;
         };
         if line.trim().is_empty() {
@@ -146,6 +152,7 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
             Ok(v) => v,
             Err(_) => {
                 unknown_lines += 1;
+                malformed_lines += 1;
                 continue;
             }
         };
@@ -245,6 +252,13 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
     }
     flush_assistant(&mut pending, &mut messages);
     assign_seq(&mut messages);
+    // 一条消息都没解出来、却有坏行:这是截断/损坏的转录(如只剩 `{"role":`,
+    // 它过得了 is_turn_marker_only 的空壳判定),不是空会话。按失败报出去,
+    // scanner 才会按裁决顺位回退到 IDE 库那份副本;返回 Ok 零消息会让
+    // dedup_rank 靠前的坏转录压过完整副本(2026-09-15 Codex review)
+    if messages.is_empty() && malformed_lines > 0 {
+        anyhow::bail!("no messages parsed, {malformed_lines} unreadable line(s)");
+    }
     Ok(CursorParse {
         messages,
         created_at,
@@ -573,6 +587,28 @@ mod tests {
                 "needle 起点在 {offset} 字节处(跨块)也必须命中"
             );
         }
+    }
+
+    /// 截断成 `{"role":` 的转录过得了空壳判定,却一条消息都解不出:必须按解析
+    /// 失败报出去,scanner 才会回退到 IDE 库副本,而不是让零消息的坏文件胜出
+    #[test]
+    fn truncated_transcript_is_a_parse_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let truncated = write(dir.path(), "truncated.jsonl", "{\"role\":\n");
+        assert!(!is_turn_marker_only(&truncated), "含 role 字样,不是空壳");
+        assert!(
+            parse_cursor_jsonl(&truncated, false).is_err(),
+            "零消息 + 坏行 = 解析失败"
+        );
+        // 有消息就照常成功——尾部一条坏行只计 unknown,不推翻整个会话
+        let intact = write(
+            dir.path(),
+            "intact.jsonl",
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n{\"role\":\n",
+        );
+        let parsed = parse_cursor_jsonl(&intact, false).expect("有正文的转录照常解析");
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.unknown_lines, 1);
     }
 
     /// 读不到的文件不下结论:判为"非空壳"交给解析阶段,

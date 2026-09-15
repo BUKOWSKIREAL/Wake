@@ -657,7 +657,7 @@ fn guarded_write_respects_winner() {
     let mut loser = meta("codex:g", "败方");
     loser.file_path = "/backup/g.jsonl".into();
     assert!(
-        !store.write_session_guarded(&loser, 5, &[]).unwrap(),
+        !store.write_session_guarded(&loser, 5, &[], &|_| 0).unwrap(),
         "败方不该写入"
     );
     assert_eq!(
@@ -666,12 +666,38 @@ fn guarded_write_respects_winner() {
     );
 
     assert!(
-        store.write_session_guarded(&loser, 12, &[]).unwrap(),
+        store
+            .write_session_guarded(&loser, 12, &[], &|_| 0)
+            .unwrap(),
         "反超应接管"
     );
     assert_eq!(
         store.get_session("codex:g").unwrap().unwrap().file_path,
         "/backup/g.jsonl"
+    );
+
+    // 位次压过 mtime(与 scanner 枚举时的候选排序同一把尺子):库里是 rank
+    // 靠后的较新副本(Cursor IDE 库),rank 靠前的较旧副本(转录)到来仍接管;
+    // 反向的较新 IDE 副本不得反超(2026-09-15 Codex review)
+    let rank_of = |path: &str| if path.contains('#') { 1 } else { 0 };
+    let mut ide = meta("cursor:h", "IDE 副本");
+    ide.file_path = "/store/state.vscdb#h".into();
+    store.write_session(&ide, 9, &[]).unwrap();
+    let mut cli = meta("cursor:h", "转录");
+    cli.file_path = "/cli/h.jsonl".into();
+    assert!(
+        store.write_session_guarded(&cli, 5, &[], &rank_of).unwrap(),
+        "rank 靠前的较旧副本应接管"
+    );
+    assert_eq!(
+        store.get_session("cursor:h").unwrap().unwrap().file_path,
+        "/cli/h.jsonl"
+    );
+    assert!(
+        !store
+            .write_session_guarded(&ide, 12, &[], &rank_of)
+            .unwrap(),
+        "rank 靠后的较新副本不得反超"
     );
 }
 

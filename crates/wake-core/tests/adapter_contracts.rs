@@ -710,13 +710,25 @@ fn qoder_explicit_null_active_leaf_is_empty() {
 /// IDE 会话会一起消失(反之亦然)。
 #[test]
 fn cursor_two_sources_remove_independently() {
-    let _env = setup();
+    let env = setup();
     let roster = wake_core::adapters::create_adapters();
     let cursors: Vec<&Box<dyn wake_core::adapters::AgentAdapter>> = roster
         .iter()
         .filter(|a| a.agent() == AgentId::Cursor)
         .collect();
     assert_eq!(cursors.len(), 2, "Cursor 应有 CLI 与 IDE 两个数据源");
+    // 同一会话两源各有一份时,scanner 的副本裁决按 dedup_rank 固定让 CLI 源
+    // 胜出、IDE 副本作回退(端到端见 scanner_finale::cursor_transcript_outranks_ide_copy)
+    let (cli, ide) = (cursors[0], cursors[1]);
+    assert_eq!(
+        ide.data_roots(),
+        vec![env.cursor_ide_db.clone()],
+        "roster 顺序:CLI 在前、IDE 库在后"
+    );
+    assert!(
+        cli.dedup_rank() < ide.dedup_rank(),
+        "CLI 源必须排在 IDE 库副本之前"
+    );
     for a in &cursors {
         assert!(
             a.supports_individual_root_removal(),
@@ -790,7 +802,8 @@ fn cursor_ide_parse_contract() {
     let env = setup();
     let adapter = CursorIdeAdapter::new();
 
-    // 枚举:零气泡的草稿不进列表,有正文的三条都在
+    // 枚举:零气泡的草稿不进列表,有正文的都在——含与 CLI 转录同 id 的
+    // 3333…03(谁胜出由 scanner 按 dedup_rank 定,本源只管如实枚举)
     let mut ids: Vec<String> = adapter
         .list_session_files()
         .expect("cursor ide list")
@@ -798,7 +811,17 @@ fn cursor_ide_parse_contract() {
         .map(|r| r.native_id)
         .collect();
     ids.sort();
-    assert_eq!(ids, vec!["cide-0001", "cide-0002", "cide-0004"]);
+    assert_eq!(
+        ids,
+        vec![
+            "33333333-aaaa-bbbb-cccc-000000000003",
+            "44444444-aaaa-bbbb-cccc-000000000004",
+            "55555555-aaaa-bbbb-cccc-000000000005",
+            "cide-0001",
+            "cide-0002",
+            "cide-0004"
+        ]
+    );
 
     let r = db_ref(AgentId::Cursor, &env.cursor_ide_db, "cide-0001");
     let s = adapter.parse_session(&r).expect("cursor ide parse_session");
@@ -818,7 +841,8 @@ fn cursor_ide_parse_contract() {
     assert!(s.meta.file_path.ends_with("#cide-0001"));
     assert_eq!(s.unknown_line_count, 0);
 
-    // 空壳流式气泡(bb)与已被清理的气泡(cc)都不产出消息
+    // 空壳流式气泡(bb)、已被清理的气泡(cc)与 value 为 NULL 的气泡行(dd)
+    // 都不产出消息,也不让整段解析失败
     assert_eq!(
         roles_kinds(&t.mainline),
         vec![

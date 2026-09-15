@@ -2,6 +2,8 @@
 //! 还是 adapter 出错,都必须发出一次 scanning=false 的终态进度事件——
 //! UI 的模态刷新弹窗只认这个事件收场,收不到就永久锁死。
 
+mod common;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +14,7 @@ use wake_core::adapters::AgentAdapter;
 use wake_core::db::Store;
 use wake_core::mcp::tools::{self, TranscriptCache};
 use wake_core::models::*;
-use wake_core::scanner::{refresh_parent_links, run_scan, ScanEvents, ScanProgress};
+use wake_core::scanner::{refresh_parent_links, run_scan, scan_files, ScanEvents, ScanProgress};
 
 /// 收集全部进度事件与变更通知计数,供断言终态/刷新契约
 struct Recorder(Mutex<Vec<ScanProgress>>, Mutex<usize>);
@@ -438,11 +440,15 @@ struct SeedAdapter {
     quick_key: Option<String>,
     manages_links: bool,
     parent_links: Vec<(String, String)>,
+    rank: u8,
 }
 
 impl AgentAdapter for SeedAdapter {
     fn agent(&self) -> AgentId {
         self.agent
+    }
+    fn dedup_rank(&self) -> u8 {
+        self.rank
     }
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
         Ok(vec![self.r.clone()])
@@ -500,6 +506,7 @@ impl AgentAdapter for SeedAdapter {
             quick_key: self.quick_key.clone(),
             manages_links: self.manages_links,
             parent_links: self.parent_links.clone(),
+            rank: self.rank,
         })
     }
 }
@@ -541,6 +548,7 @@ fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> 
         quick_key: None,
         manages_links: false,
         parent_links: Vec::new(),
+        rank: 0,
     }
 }
 
@@ -587,6 +595,7 @@ fn tombstoned_session_does_not_resurrect_on_rescan() {
         quick_key: None,
         manages_links: false,
         parent_links: Vec::new(),
+        rank: 0,
     })];
     let rec = Recorder::new();
 
@@ -629,6 +638,150 @@ fn duplicate_session_across_roots_resolves_to_newest() {
             s.file_path, "/live/dup.jsonl",
             "第 {round} 轮后 file_path 未稳定在 mtime 新者上"
         );
+    }
+}
+
+/// 副本裁决先看实例的 dedup_rank、同级才比 mtime:一家的多个数据源可以固定
+/// 偏好某一源,而不随两边写盘先后翻转;败方仍是解析失败的回退顺位
+#[test]
+fn lower_dedup_rank_beats_newer_mtime_and_still_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(secondary), Box::new(primary)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("cursor:dup")
+        .unwrap()
+        .expect("会话应在库");
+    assert_eq!(
+        s.file_path, "/cli/dup.jsonl",
+        "rank 小者胜出,即使 mtime 更旧、roster 里排在后面"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let mut broken_primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    broken_primary.fail_parse = true;
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(broken_primary), Box::new(secondary)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("cursor:dup")
+        .unwrap()
+        .expect("胜者损坏后会话不该消失");
+    assert_eq!(s.file_path, "/ide/db#dup", "rank 靠后的副本仍是回退顺位");
+
+    // 增量路径同一把尺子:库里已是 rank 靠后的较新副本(转录曾缺失或只剩空壳,
+    // IDE 副本胜出过),rank 靠前的较旧副本经 scan_files(watcher 路径)到来
+    // 仍要接管,不被 write_session_guarded 的 mtime 比较挡住(2026-09-15 Codex review)
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let mut ide_only = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    ide_only.rank = 1;
+    let only_ide: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ide_only)];
+    run_scan(&only_ide, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.get_session("cursor:dup").unwrap().unwrap().file_path,
+        "/ide/db#dup"
+    );
+    let mut secondary = seed(AgentId::Cursor, "/ide", "/ide/db#dup", "dup", 9);
+    secondary.rank = 1;
+    let primary = seed(AgentId::Cursor, "/cli", "/cli/dup.jsonl", "dup", 5);
+    let incoming = primary.r.clone();
+    let both: Vec<Box<dyn AgentAdapter>> = vec![Box::new(secondary), Box::new(primary)];
+    scan_files(&both, &store, &Recorder::new(), vec![incoming]);
+    assert_eq!(
+        store.get_session("cursor:dup").unwrap().unwrap().file_path,
+        "/cli/dup.jsonl",
+        "增量写入也按 rank 接管,不被库里较新的 IDE 副本挡住"
+    );
+}
+
+/// Cursor 两源端到端:转录带正文的会话固定由 CLI 源胜出(它有 slug 可反推
+/// 项目),哪怕 IDE 库里那份 lastUpdatedAt 更新、roster 里 IDE 实例排在前面;
+/// 转录只剩 turn_ended 空壳的会话由 IDE 库副本胜出。按 mtime 裁决的话胜负随
+/// 两边写盘先后翻转,IDE 副本没有工作区路径,一翻就从项目里掉进 Unknown project
+/// (2026-09-15 实测,Cursor 3.18)
+#[test]
+fn cursor_transcript_outranks_ide_copy() {
+    use wake_core::adapters::cursor::CursorAdapter;
+    use wake_core::adapters::cursor_ide::CursorIdeAdapter;
+    const WITH_BODY: &str = "cursor:33333333-aaaa-bbbb-cccc-000000000003";
+    const STUB_ONLY: &str = "cursor:44444444-aaaa-bbbb-cccc-000000000004";
+    const CORRUPT: &str = "cursor:55555555-aaaa-bbbb-cccc-000000000005";
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    common::copy_tree(&common::fixture("cursor/projects"), &projects);
+    let ide_db = dir.path().join("state.vscdb");
+    common::build_cursor_ide_db(&ide_db);
+    // 转录的 mtime 压到 IDE 库里 lastUpdatedAt(1786340100000)之前,
+    // 让 mtime 裁决与 rank 裁决给出相反答案
+    let transcript = projects.join(
+        "wakefx-cursor-proj/agent-transcripts/33333333-aaaa-bbbb-cccc-000000000003/33333333-aaaa-bbbb-cccc-000000000003.jsonl",
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1786000000000))
+        .unwrap();
+    // 截断成 `{"role":` 的坏转录:过得了空壳判定、解不出一条消息——不能靠
+    // rank 压过完整的 IDE 副本,要按解析失败回退过去(2026-09-15 Codex review)
+    let corrupt_dir =
+        projects.join("wakefx-cursor-proj/agent-transcripts/55555555-aaaa-bbbb-cccc-000000000005");
+    std::fs::create_dir_all(&corrupt_dir).unwrap();
+    std::fs::write(
+        corrupt_dir.join("55555555-aaaa-bbbb-cccc-000000000005.jsonl"),
+        "{\"role\":\n",
+    )
+    .unwrap();
+
+    for ide_first in [true, false] {
+        let cli: Box<dyn AgentAdapter> = CursorAdapter::new().with_custom_root(projects.clone());
+        let ide: Box<dyn AgentAdapter> = CursorIdeAdapter::new().with_custom_root(ide_db.clone());
+        let adapters: Vec<Box<dyn AgentAdapter>> = if ide_first {
+            vec![ide, cli]
+        } else {
+            vec![cli, ide]
+        };
+        let store = temp_store(&dir.path().join(format!("store-{ide_first}")));
+        run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+        let body = store
+            .get_session(WITH_BODY)
+            .unwrap()
+            .expect("带正文的会话在库");
+        assert_eq!(
+            body.file_path,
+            transcript.to_string_lossy(),
+            "ide_first={ide_first}:转录带正文时 CLI 那份胜出,不看 mtime 与 roster 顺序"
+        );
+        assert_eq!(
+            body.project_path, "/wakefx/cursor/proj",
+            "项目来自转录的 slug"
+        );
+        let stub = store
+            .get_session(STUB_ONLY)
+            .unwrap()
+            .expect("空壳转录的会话在库");
+        assert!(
+            stub.file_path.contains("state.vscdb#"),
+            "ide_first={ide_first}:转录只剩空壳时由 IDE 库副本胜出"
+        );
+        let corrupt = store
+            .get_session(CORRUPT)
+            .unwrap()
+            .expect("坏转录的会话不该消失");
+        assert!(
+            corrupt.file_path.contains("state.vscdb#"),
+            "ide_first={ide_first}:坏转录按解析失败回退到 IDE 库副本"
+        );
+        assert_eq!(corrupt.title, "Corrupt twin");
     }
 }
 

@@ -144,6 +144,13 @@ pub trait AgentAdapter: Send + Sync {
     fn excluding_data_roots(&self, _roots: &[std::path::PathBuf]) -> Option<Box<dyn AgentAdapter>> {
         None
     }
+    /// 同家同 native_id 多副本裁决时本实例的位次:scanner 先按它升序、同级再按
+    /// mtime 新者(不变量 8⑦)。默认 0。一家有多个数据源且要固定偏好某一源时
+    /// 覆写——Cursor 的 IDE 库实例返回 1,转录带正文时永远是 CLI 那份胜出;
+    /// 败方仍留作解析失败的回退顺位。远程装饰器必须转发
+    fn dedup_rank(&self) -> u8 {
+        0
+    }
 }
 
 /// 入库前的自定义根归一化:把用户选中的目录整形成本家"该存哪一层"的形态。

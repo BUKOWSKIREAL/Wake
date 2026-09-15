@@ -35,7 +35,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 | Codex CLI | `~/.codex/sessions` + `state_5.sqlite` (read-only) | ✅ | ✅ |
 | Qoder CLI | `~/.qoder/projects/*/*.jsonl` (`QODER_CONFIG_DIR` is respected) | ✅ | — |
 | Copilot CLI | `~/.copilot/session-store.db` | — | — |
-| Cursor (CLI transcripts) | `~/.cursor/projects/**/agent-transcripts` | — | — |
+| Cursor | `~/.cursor/projects/**/agent-transcripts` (agent transcripts) + `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (IDE Chat/Composer history, read-only) | — | — |
 | OpenCode | `~/.local/share/opencode/opencode.db` | ✅ | — |
 | OpenCode 2 (`opencode2`) | `~/.local/share/opencode/{opencode.db,opencode-next.db}` (`session_v2` or `session` + `session_message`); both paths are scanned | ✅ | — |
 | Kiro | `~/.kiro/sessions/cli` | ✅ | — |
@@ -55,7 +55,9 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 
 Codex writes its background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — into the same `sessions` directory as your conversations. Wake recognises them from the metadata on their first line and skips them; a file it cannot identify stays visible rather than risk hiding a real conversation.
 
-Cursor IDE chats, Windsurf, and Trae encrypt their local data; Amp, Factory (Droid), and Warp keep sessions in the cloud — none of those are supported. Reasonix stores sessions locally but hasn't been mapped yet.
+Cursor keeps two stores. A chat that has a full transcript under `~/.cursor/projects` is read from there (the transcript knows the project folder); chats that only live in Cursor's own database — older ones, or Cursor versions that leave nothing but a `turn_ended` marker in the transcript — are read from `state.vscdb`. Older IDE chats that Cursor stored without a workspace show up under *Unknown project*.
+
+Windsurf and Trae encrypt their local data; Amp, Factory (Droid), and Warp keep sessions in the cloud — none of those are supported. Reasonix stores sessions locally but hasn't been mapped yet.
 
 ## Remote hosts
 
