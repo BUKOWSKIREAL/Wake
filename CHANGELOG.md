@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.6.6] — 2026-09-15
 
 - Fix: Codex's background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — no longer show up as sessions; they were listed as `Untitled` or as a copy of their parent, and reached search, project counts and the MCP tools too. Existing indexes drop them on the next scan
 
