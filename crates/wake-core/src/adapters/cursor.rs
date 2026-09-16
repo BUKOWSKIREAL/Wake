@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::{units_from_messages, AgentAdapter};
+use super::{cursor_ide, units_from_messages, AgentAdapter};
 use crate::models::*;
 use anyhow::Result;
 use serde_json::Value;
@@ -10,16 +10,16 @@ use std::path::{Path, PathBuf};
 /// Cursor CLI:`~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl` 明文。
 /// 行结构 {role, message:{content:[{type:text|tool_use}]}} + {type:"turn_ended"}。
 /// user 正文包在 <timestamp>/<user_query> 壳里;transcript 不含 cwd,
-/// 从有损 slug 目录名 DFS 反推真实路径。
+/// 优先从同一会话的 IDE 元数据读取路径,缺失时从 slug 目录名还原。
 ///
 /// **同一家的另一个源**:IDE 面板(Chat/Composer)的会话正文在
 /// `globalStorage/state.vscdb`,由 cursor_ide.rs 读。某些 Cursor 版本的 IDE
 /// 会话在本源只留 `{"type":"turn_ended"}` 空壳,枚举时按 `is_turn_marker_only`
 /// 跳过;转录带正文时两源各有一份,scanner 的副本裁决按 `dedup_rank` 固定让
-/// 本源胜出——本源有 slug 可反推项目,IDE 库里多数会话没有工作区路径,按写盘
-/// 先后轮流胜出会让同一会话在项目之间跳(2026-09-15 实测,Cursor 3.18)。
+/// 本源胜出,正文仍从转录读取。
 pub struct CursorAdapter {
     root: PathBuf,
+    metadata_db: Option<PathBuf>,
 }
 
 impl CursorAdapter {
@@ -29,15 +29,21 @@ impl CursorAdapter {
                 .unwrap_or_default()
                 .join(".cursor")
                 .join("projects"),
+            metadata_db: Some(cursor_ide::default_db_path()),
         }
+    }
+
+    fn project_path(&self, r: &SessionFileRef) -> String {
+        let metadata = self
+            .metadata_db
+            .as_deref()
+            .and_then(|db| cursor_ide::project_metadata(db, std::iter::once(r.native_id.as_str())));
+        resolve_project_path(r, metadata.as_ref().and_then(|m| m.get(&r.native_id)))
     }
 }
 
-/// "Users-corey-Github-image-translate" → "/Users/corey/Github/image-translate"。
-/// '-' 既可能是路径分隔也可能是目录名字符,按磁盘真实存在的目录 DFS(优先短段);
-/// 项目目录已删时回退直译。
-fn decode_slug(slug: &str) -> String {
-    let parts: Vec<&str> = slug.split('-').collect();
+/// Cursor 用 `-` 表示分隔符、连字符和空格；优先保留原有路径匹配。
+fn decode_existing_slug(base: PathBuf, slug: &str) -> Option<PathBuf> {
     fn dfs(base: PathBuf, parts: &[&str]) -> Option<PathBuf> {
         if parts.is_empty() {
             return Some(base);
@@ -48,16 +54,57 @@ fn decode_slug(slug: &str) -> String {
                 seg.push('-');
             }
             seg.push_str(parts[i]);
-            let cand = base.join(&seg);
-            if cand.is_dir() {
-                if let Some(hit) = dfs(cand, &parts[i + 1..]) {
+            let path = base.join(&seg);
+            if path.is_dir() {
+                if let Some(hit) = dfs(path, &parts[i + 1..]) {
                     return Some(hit);
                 }
             }
         }
         None
     }
-    dfs(PathBuf::from("/"), &parts)
+
+    if slug.is_empty() {
+        return Some(base);
+    }
+    let parts: Vec<&str> = slug.split('-').collect();
+    if let Some(path) = dfs(base.clone(), &parts) {
+        return Some(path);
+    }
+
+    let entries = fs::read_dir(&base).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let raw = entry.file_name().to_string_lossy().to_string();
+        let encoded = raw.replace(' ', "-");
+        let rest = if slug == encoded {
+            Some("")
+        } else {
+            slug.strip_prefix(&encoded)
+                .and_then(|s| s.strip_prefix('-'))
+        };
+        if let Some(rest) = rest {
+            let path = entry.path();
+            if path.is_dir() {
+                candidates.push((encoded.len(), raw.contains(' '), raw, path, rest));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    for (_, _, _, path, rest) in candidates {
+        if let Some(hit) = decode_existing_slug(path, rest) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn decode_slug(slug: &str) -> String {
+    decode_existing_slug(PathBuf::from("/"), slug)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| format!("/{}", slug.replace('-', "/")))
 }
@@ -274,14 +321,37 @@ fn subagents_dir(r: &SessionFileRef) -> PathBuf {
         .join("subagents")
 }
 
-fn build_meta(r: &SessionFileRef, p: &CursorParse) -> SessionMeta {
+fn resolve_project_path(
+    r: &SessionFileRef,
+    metadata: Option<&cursor_ide::ProjectMetadata>,
+) -> String {
+    if let Some(workspace) = metadata.and_then(|m| m.workspace.as_ref()) {
+        return workspace.clone();
+    }
     // …/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl → slug
-    let cwd = Path::new(&r.file_path)
+    let Some(slug) = Path::new(&r.file_path)
         .ancestors()
         .nth(3)
         .and_then(|d| d.file_name())
-        .map(|s| decode_slug(&s.to_string_lossy()))
-        .unwrap_or_default();
+    else {
+        return String::new();
+    };
+    let slug = slug.to_string_lossy();
+    // A Git root is not necessarily the workspace. Only let it disambiguate
+    // spaces/hyphens when the entire path encodes to this transcript's slug.
+    if let Some(repo) = metadata.and_then(|m| {
+        m.repositories.iter().find(|path| {
+            path.trim_start_matches(['/', '\\'])
+                .replace(['/', '\\', ' '], "-")
+                == slug
+        })
+    }) {
+        return repo.clone();
+    }
+    decode_slug(&slug)
+}
+
+fn build_meta(r: &SessionFileRef, p: &CursorParse, cwd: String) -> SessionMeta {
     let title = title_from_messages(&p.messages).unwrap_or_else(|| UNTITLED.to_string());
     SessionMeta {
         key: format!("cursor:{}", r.native_id),
@@ -437,7 +507,7 @@ impl AgentAdapter for CursorAdapter {
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let parsed = parse_cursor_jsonl(Path::new(&r.file_path), false)?;
-        let meta = build_meta(r, &parsed);
+        let meta = build_meta(r, &parsed, self.project_path(r));
         let units = units_from_messages(&parsed.messages);
         Ok(ParsedSession {
             meta,
@@ -466,7 +536,7 @@ impl AgentAdapter for CursorAdapter {
             }
         }
         Ok(ParsedTranscript {
-            meta: build_meta(r, &parsed),
+            meta: build_meta(r, &parsed, self.project_path(r)),
             mainline: parsed.messages,
             sidechains,
             unknown_line_count: parsed.unknown_lines,
@@ -496,7 +566,11 @@ impl AgentAdapter for CursorAdapter {
         } else {
             dir
         };
-        Box::new(Self { root })
+        Box::new(Self {
+            root,
+            // 自定义目录也用于远程缓存,不能混用本机 IDE 元数据。
+            metadata_db: None,
+        })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
@@ -506,6 +580,27 @@ impl AgentAdapter for CursorAdapter {
         } else {
             vec![self.root.clone()]
         }
+    }
+
+    fn project_path_updates(
+        &self,
+        refs: &[SessionFileRef],
+    ) -> std::collections::HashMap<String, String> {
+        if refs.is_empty() {
+            return Default::default();
+        }
+        let metadata = self.metadata_db.as_deref().and_then(|db| {
+            cursor_ide::project_metadata(db, refs.iter().map(|r| r.native_id.as_str()))
+        });
+        let Some(metadata) = metadata else {
+            return Default::default();
+        };
+        refs.iter()
+            .filter_map(|r| {
+                let project = metadata.get(&r.native_id)?;
+                Some((r.file_path.clone(), resolve_project_path(r, Some(project))))
+            })
+            .collect()
     }
 
     /// Cursor 一家两源(本实例的 agent-transcripts 与 cursor_ide 的 state.vscdb),
@@ -521,6 +616,7 @@ impl AgentAdapter for CursorAdapter {
         if roots.contains(&self.root) {
             Some(Box::new(Self {
                 root: PathBuf::new(),
+                metadata_db: None,
             }))
         } else {
             None
@@ -538,6 +634,422 @@ mod tests {
         let mut f = fs::File::create(&p).expect("write fixture");
         f.write_all(body.as_bytes()).expect("write body");
         p
+    }
+
+    fn metadata_fixture(data: &str) -> (tempfile::TempDir, CursorAdapter, SessionFileRef) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        let session_dir = root.join("wakefx-My-Project/agent-transcripts/session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let file = write(
+            &session_dir,
+            "session.jsonl",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"Transcript body"}]}}"#,
+        );
+        let db = dir.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES ('composerData:session', ?1)",
+            [data],
+        )
+        .unwrap();
+        let adapter = CursorAdapter {
+            root,
+            metadata_db: Some(db),
+        };
+        let r = adapter.file_ref(&file).unwrap();
+        (dir, adapter, r)
+    }
+
+    #[test]
+    fn transcript_prefers_matching_metadata_and_keeps_its_body() {
+        for data in [
+            r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wakefx/My Project"}},"trackedGitRepos":[{"repoPath":"/wrong/repo"}]}"#,
+            r#"{"workspaceIdentifier":{"uri":{"fsPath":""}},"trackedGitRepos":[{"repoPath":"/wakefx/My Project"}]}"#,
+            r#"{"trackedGitRepos":[{"repoPath":"/wakefx/My Project"}]}"#,
+            r#"{"trackedGitRepos":[{"repoPath":"/other/repo"},{"repoPath":"/wakefx/My Project"}]}"#,
+        ] {
+            let (_dir, adapter, r) = metadata_fixture(data);
+            let session = adapter.parse_session(&r).unwrap();
+            let transcript = adapter.parse_transcript(&r).unwrap();
+            for meta in [&session.meta, &transcript.meta] {
+                assert_eq!(meta.project_path, "/wakefx/My Project");
+                assert_eq!(meta.project_name, "My Project");
+                assert_eq!(meta.file_path, r.file_path);
+                assert_eq!(meta.title, "Transcript body");
+            }
+            assert_eq!(session.units.len(), 1);
+            assert_eq!(transcript.mainline.len(), 1);
+            assert_eq!(transcript.mainline[0].text, "Transcript body");
+        }
+    }
+
+    #[test]
+    fn transcript_falls_back_when_metadata_is_unavailable() {
+        for data in [
+            "{}",
+            r#"{"workspaceIdentifier":{"uri":{"fsPath":""}}}"#,
+            r#"{"trackedGitRepos":[{"repoPath":"/wakefx"}]}"#,
+            "{broken",
+        ] {
+            let (_dir, adapter, r) = metadata_fixture(data);
+            assert_eq!(
+                adapter.parse_session(&r).unwrap().meta.project_path,
+                "/wakefx/My/Project"
+            );
+        }
+
+        let (dir, mut adapter, mut r) =
+            metadata_fixture(r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wrong/session"}}}"#);
+        r.native_id = "unmapped".into();
+        assert_eq!(
+            adapter.parse_session(&r).unwrap().meta.project_path,
+            "/wakefx/My/Project"
+        );
+        r.native_id = "session".into();
+        adapter.metadata_db = Some(dir.path().join("missing.vscdb"));
+        assert_eq!(
+            adapter.parse_transcript(&r).unwrap().meta.project_path,
+            "/wakefx/My/Project"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_root_does_not_replace_existing_subdirectory_workspace() {
+        let (dir, adapter, mut r) = metadata_fixture("{}");
+        let repo = dir.path().join("repo");
+        let project = repo.join("apps/client");
+        fs::create_dir_all(&project).unwrap();
+        let slug = project
+            .to_str()
+            .unwrap()
+            .trim_start_matches('/')
+            .replace('/', "-");
+        let session_dir = adapter.root.join(slug).join("agent-transcripts/session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let file = session_dir.join("session.jsonl");
+        fs::rename(&r.file_path, &file).unwrap();
+        r = adapter.file_ref(&file).unwrap();
+        let conn = rusqlite::Connection::open(adapter.metadata_db.as_ref().unwrap()).unwrap();
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:session'",
+            [serde_json::json!({"trackedGitRepos": [{"repoPath": repo}]}).to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter.parse_session(&r).unwrap().meta.project_path,
+            project.to_str().unwrap()
+        );
+        assert_eq!(
+            adapter.parse_transcript(&r).unwrap().meta.project_path,
+            project.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_updates_refresh_index_without_reparsing_transcript() {
+        use crate::db::Store;
+        use crate::mcp::tools::{self, TranscriptCache};
+        use crate::scanner::{run_scan, NullEvents, ScanEvents, ScanProgress};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Events(Mutex<usize>, Mutex<usize>);
+        impl ScanEvents for Events {
+            fn on_progress(&self, progress: &ScanProgress) {
+                *self.0.lock().unwrap() = progress.total;
+            }
+            fn on_sessions_changed(&self) {
+                *self.1.lock().unwrap() += 1;
+            }
+        }
+
+        let (dir, adapter, r) = metadata_fixture("{}");
+        let metadata_db = adapter.metadata_db.clone().unwrap();
+        let root = adapter.root.clone();
+        let index = dir.path().join("wake.db");
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(adapter)];
+        let store = Arc::new(Store::open(&index).unwrap());
+        run_scan(&adapters, &store, &NullEvents, false).unwrap();
+        let before = store.get_session("cursor:session").unwrap().unwrap();
+        assert_eq!(before.project_path, "/wakefx/My/Project");
+        let known = store.known_files().unwrap();
+        let cache = TranscriptCache::default();
+        let args = serde_json::json!({"key": "cursor:session"});
+        assert!(
+            tools::invoke(&store, &adapters, &cache, tools::GET_SESSION, &args)
+                .unwrap()
+                .contains("/wakefx/My/Project")
+        );
+
+        // Keep the writer open: the new metadata exists only in WAL, while the
+        // transcript and the main database's modification time stay unchanged.
+        let writer = rusqlite::Connection::open(&metadata_db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let db_mtime = fs::metadata(&metadata_db).unwrap().modified().unwrap();
+        writer
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:session'",
+                [r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wakefx/My Project"}}}"#],
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&metadata_db).unwrap().modified().unwrap(),
+            db_mtime
+        );
+        assert_eq!(
+            adapters[0]
+                .file_ref(Path::new(&r.file_path))
+                .unwrap()
+                .mtime_ms,
+            r.mtime_ms
+        );
+        let events = Events::default();
+        run_scan(&adapters, &store, &events, false).unwrap();
+        let after = store.get_session("cursor:session").unwrap().unwrap();
+        assert_eq!(after.project_path, "/wakefx/My Project");
+        assert_eq!(after.project_name, "My Project");
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.message_count, before.message_count);
+        assert_eq!(after.file_path, before.file_path);
+        assert_eq!(store.known_files().unwrap(), known);
+        let shown = tools::invoke(&store, &adapters, &cache, tools::GET_SESSION, &args).unwrap();
+        assert!(
+            shown.contains("/wakefx/My Project"),
+            "cached query still has old project: {shown}"
+        );
+        assert!(!shown.contains("/wakefx/My/Project"));
+        assert_eq!(*events.0.lock().unwrap(), 0, "no transcript reparsing");
+        assert_eq!(
+            *events.1.lock().unwrap(),
+            1,
+            "notify the UI of the new project"
+        );
+        let conn = rusqlite::Connection::open(&index).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT text FROM messages_fts WHERE messages_fts MATCH 'Transcript'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Transcript body"
+        );
+
+        let unchanged = Events::default();
+        run_scan(&adapters, &store, &unchanged, false).unwrap();
+        assert_eq!(
+            *unchanged.1.lock().unwrap(),
+            0,
+            "unchanged metadata is a no-op"
+        );
+        drop(store);
+
+        // A new process/adapter must also notice later metadata changes.
+        writer
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:session'",
+                [r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wakefx/Relocated Project"}}}"#],
+            )
+            .unwrap();
+        let store = Arc::new(Store::open(&index).unwrap());
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(CursorAdapter {
+            root,
+            metadata_db: Some(metadata_db),
+        })];
+        let events = Events::default();
+        run_scan(&adapters, &store, &events, false).unwrap();
+        assert_eq!(
+            store
+                .get_session("cursor:session")
+                .unwrap()
+                .unwrap()
+                .project_path,
+            "/wakefx/Relocated Project"
+        );
+        assert_eq!(*events.0.lock().unwrap(), 0);
+        // A temporary read/JSON failure must not erase a known project path.
+        writer
+            .execute("UPDATE cursorDiskKV SET value = '{broken'", [])
+            .unwrap();
+        run_scan(&adapters, &store, &NullEvents, false).unwrap();
+        assert_eq!(
+            store
+                .get_session("cursor:session")
+                .unwrap()
+                .unwrap()
+                .project_path,
+            "/wakefx/Relocated Project"
+        );
+    }
+
+    #[test]
+    fn upgrade_refreshes_existing_cursor_project_without_source_changes() {
+        use crate::db::Store;
+        use crate::scanner::{run_scan, NullEvents};
+        use std::sync::Arc;
+
+        let (dir, adapter, r) =
+            metadata_fixture(r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wakefx/My Project"}}}"#);
+        let index = dir.path().join("upgrade.db");
+        let mut old = adapter.parse_session(&r).unwrap();
+        old.meta.project_path = "/wakefx/My/Project".into();
+        old.meta.project_name = "Project".into();
+        {
+            let store = Store::open(&index).unwrap();
+            store
+                .write_session(&old.meta, r.mtime_ms, &old.units)
+                .unwrap();
+        }
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute(
+                "UPDATE schema_meta SET value = '3' WHERE key = 'fts_format'",
+                [],
+            )
+            .unwrap();
+        let store = Arc::new(Store::open(&index).unwrap());
+        assert!(store.needs_fts_reindex());
+        run_scan(&[Box::new(adapter)], &store, &NullEvents, false).unwrap();
+        assert_eq!(
+            store
+                .get_session("cursor:session")
+                .unwrap()
+                .unwrap()
+                .project_path,
+            "/wakefx/My Project"
+        );
+        assert!(!store.needs_fts_reindex());
+    }
+
+    #[test]
+    fn project_refresh_only_updates_the_unchanged_winning_copy() {
+        use crate::db::Store;
+
+        let (dir, adapter, r) =
+            metadata_fixture(r#"{"workspaceIdentifier":{"uri":{"fsPath":"/wakefx/My Project"}}}"#);
+        let parsed = adapter.parse_session(&r).unwrap();
+        let updates = adapter.project_path_updates(std::slice::from_ref(&r));
+        for case in ["unchanged", "newer", "resized", "other-copy", "child"] {
+            let index = dir.path().join(format!("{case}.db"));
+            let store = Store::open(&index).unwrap();
+            let mut saved = parsed.meta.clone();
+            saved.project_path = "/saved/project".into();
+            saved.project_name = "project".into();
+            let mtime = if case == "newer" {
+                r.mtime_ms + 1
+            } else {
+                r.mtime_ms
+            };
+            if case == "resized" {
+                saved.size_bytes += 1;
+            }
+            if case == "other-copy" {
+                saved.file_path.push_str(".copy");
+            }
+            store.write_session(&saved, mtime, &parsed.units).unwrap();
+            if case == "child" {
+                rusqlite::Connection::open(&index)
+                    .unwrap()
+                    .execute("UPDATE sessions SET parent_key = 'cursor:parent'", [])
+                    .unwrap();
+            }
+            let changed = store
+                .update_project_paths(std::slice::from_ref(&r), &updates)
+                .unwrap();
+            assert_eq!(changed, case == "unchanged", "{case}");
+            let after = store.get_session(&saved.key).unwrap().unwrap();
+            assert_eq!(
+                after.project_path,
+                if changed {
+                    "/wakefx/My Project"
+                } else {
+                    "/saved/project"
+                },
+                "{case}"
+            );
+            assert_eq!(after.file_path, saved.file_path);
+        }
+    }
+
+    #[test]
+    fn custom_root_does_not_use_default_project_metadata() {
+        let (_dir, adapter, r) =
+            metadata_fixture(r#"{"workspaceIdentifier":{"uri":{"fsPath":"/local/My Project"}}}"#);
+        let custom = adapter.with_custom_root(adapter.root.clone());
+        assert_eq!(
+            custom.parse_session(&r).unwrap().meta.project_path,
+            "/wakefx/My/Project"
+        );
+        assert_eq!(
+            custom.parse_transcript(&r).unwrap().meta.project_path,
+            "/wakefx/My/Project"
+        );
+        assert!(custom
+            .project_path_updates(std::slice::from_ref(&r))
+            .is_empty());
+    }
+
+    #[test]
+    fn slug_decoder_recovers_existing_directory_with_spaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, slug) in [
+            ("My Project", "My-Project"),
+            ("My Project/source-code", "My-Project-source-code"),
+        ] {
+            let project = dir.path().join(name);
+            fs::create_dir_all(&project).unwrap();
+            assert_eq!(
+                decode_existing_slug(dir.path().to_path_buf(), slug),
+                Some(project)
+            );
+        }
+    }
+
+    #[test]
+    fn slug_decoder_prefers_literal_hyphen_when_ambiguous() {
+        for (slug, alternative) in [
+            ("image-translate", "image translate"),
+            ("image-translate-src", "image translate/src"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let literal = dir.path().join(slug);
+            fs::create_dir(&literal).unwrap();
+            fs::create_dir_all(dir.path().join(alternative)).unwrap();
+            assert_eq!(
+                decode_existing_slug(dir.path().to_path_buf(), slug),
+                Some(literal)
+            );
+        }
+    }
+
+    #[test]
+    fn slug_decoder_respects_filesystem_case_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Mixed-Case")).unwrap();
+        let path = dir.path().join("mixed-case");
+        assert_eq!(
+            decode_existing_slug(dir.path().to_path_buf(), "mixed-case"),
+            path.is_dir().then_some(path)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slug_decoder_does_not_require_parent_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-project");
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o111)).unwrap();
+        let decoded = decode_existing_slug(dir.path().to_path_buf(), "my-project");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(decoded, Some(project));
     }
 
     /// 判据必须与文件大小无关。曾经的实现对 >64KB 的文件直接判"有正文"

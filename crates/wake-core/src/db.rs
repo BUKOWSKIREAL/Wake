@@ -133,8 +133,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
 /// 会话元数据和 FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
 /// 规则就换个值:旧库首开时挂 fts_reindex 旗子,下一轮扫描强制重解析全部文件。
 /// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声,
-/// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token。
-pub const FTS_FORMAT: &str = "3";
+/// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token,
+/// "4" = Cursor 项目路径优先读取工作区元数据,并恢复 slug 中的空格。
+pub const FTS_FORMAT: &str = "4";
 
 fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -429,6 +430,36 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Sidecar-only updates must not replace transcript contents or steal a
+    /// session from another copy. Changed files go through normal parsing;
+    /// children inherit their project through replace_parent_links instead.
+    pub(crate) fn update_project_paths(
+        &self,
+        refs: &[SessionFileRef],
+        paths: &HashMap<String, String>,
+    ) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut changed = false;
+        for r in refs {
+            let Some(project) = paths.get(&r.file_path).filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let name = crate::adapters::parse_utils::project_name_of(project);
+            changed |= tx.execute(
+                "UPDATE sessions SET project_path = ?1, project_name = ?2
+                 WHERE file_path = ?3 AND file_mtime = ?4 AND file_size = ?5
+                   AND parent_key = '' AND (project_path <> ?1 OR project_name <> ?2)",
+                params![project, name, r.file_path, r.mtime_ms, r.size],
+            )? > 0;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// schema_meta 里的一次性旗子(升级后要补做的事),做完由 scanner 清掉

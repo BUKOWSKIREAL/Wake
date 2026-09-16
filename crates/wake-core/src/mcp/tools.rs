@@ -25,10 +25,18 @@ struct ToolContext<'a> {
 }
 
 /// 单槽转录缓存:分页读同一会话时不必每页整文件重解析(默认 20k 字符一页,
-/// 大会话几十页)。键是 scanner 同款的脏判据 (file_path, mtime, size),文件一
-/// 变即失效;server 进程随客户端会话长驻,连续翻页总是同一文件
+/// 大会话几十页)。源文件或索引中的项目归属变化即失效;server 进程随客户端
+/// 会话长驻,连续翻页总是同一文件。项目归属可由边车更新,不必修改正文。
 #[derive(Default)]
-pub struct TranscriptCache(Mutex<Option<(String, i64, i64, Arc<ParsedTranscript>)>>);
+pub struct TranscriptCache(Mutex<Option<CachedTranscript>>);
+
+struct CachedTranscript {
+    path: String,
+    mtime: i64,
+    size: i64,
+    indexed_project: String,
+    transcript: Arc<ParsedTranscript>,
+}
 
 impl TranscriptCache {
     fn get_or_parse(
@@ -46,13 +54,23 @@ impl TranscriptCache {
             let db = crate::adapters::sqlite_ro::strip_virtual_path(&r.file_path);
             crate::adapters::sqlite_ro::db_cache_stamp(std::path::Path::new(db))
         };
-        if let Some((path, mtime, size, t)) = self.0.lock().unwrap().as_ref() {
-            if *path == r.file_path && *mtime == stamp && *size == r.size {
-                return Ok(t.clone());
+        if let Some(cached) = self.0.lock().unwrap().as_ref() {
+            if cached.path == r.file_path
+                && cached.mtime == stamp
+                && cached.size == r.size
+                && cached.indexed_project == meta.project_path
+            {
+                return Ok(cached.transcript.clone());
             }
         }
         let t = Arc::new(adapter.parse_transcript(&r)?);
-        *self.0.lock().unwrap() = Some((r.file_path.clone(), stamp, r.size, t.clone()));
+        *self.0.lock().unwrap() = Some(CachedTranscript {
+            path: r.file_path,
+            mtime: stamp,
+            size: r.size,
+            indexed_project: meta.project_path.clone(),
+            transcript: t.clone(),
+        });
         Ok(t)
     }
 }

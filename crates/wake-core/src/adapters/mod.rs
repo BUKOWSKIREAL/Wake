@@ -64,6 +64,15 @@ pub trait AgentAdapter: Send + Sync {
     ) -> Option<std::collections::HashMap<String, SessionMeta>> {
         None
     }
+    /// Refresh project metadata from sidecars even when the transcript did not
+    /// change. Keys are source file paths; only existing, unchanged winning
+    /// copies are updated, without replacing their body or source timestamps.
+    fn project_path_updates(
+        &self,
+        _refs: &[SessionFileRef],
+    ) -> std::collections::HashMap<String, String> {
+        Default::default()
+    }
     /// quick 与 parsed 的合并策略:默认 parsed 为准、quick 补缺。
     /// Codex 覆写(state DB 的 title 是用户手动命名,优先级更高)。
     fn merge_quick_meta(&self, mut parsed: SessionMeta, quick: &SessionMeta) -> SessionMeta {

@@ -297,6 +297,12 @@ fn run_scan_inner(
             seen_paths.insert(r.file_path.clone());
         }
 
+        // Sidecar metadata can arrive after the transcript's final write.
+        // Refresh it independently of the mtime/size gate and notify the UI.
+        if store.update_project_paths(&refs, &adapter.project_path_updates(&refs))? {
+            events.on_sessions_changed();
+        }
+
         // 快路径:新/变化的先写 meta 让列表立即可见
         let quick_map = adapter.quick_meta(&refs);
         if let Some(map) = &quick_map {

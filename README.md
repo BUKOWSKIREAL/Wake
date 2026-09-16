@@ -55,7 +55,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 
 Codex writes its background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — into the same `sessions` directory as your conversations. Wake recognises them from the metadata on their first line and skips them; a file it cannot identify stays visible rather than risk hiding a real conversation.
 
-Cursor keeps two stores. A chat that has a full transcript under `~/.cursor/projects` is read from there (the transcript knows the project folder); chats that only live in Cursor's own database — older ones, or Cursor versions that leave nothing but a `turn_ended` marker in the transcript — are read from `state.vscdb`. Older IDE chats that Cursor stored without a workspace show up under *Unknown project*.
+Cursor keeps two stores. A chat that has a full transcript under `~/.cursor/projects` is read from there; local workspace metadata and filesystem matching restore its project path, including spaces. Project metadata is refreshed on each scan even if the transcript is unchanged. Chats that only live in Cursor's own database — older ones, or Cursor versions that leave nothing but a `turn_ended` marker in the transcript — are read from `state.vscdb`. Older IDE chats that Cursor stored without a workspace show up under *Unknown project*.
 
 Token statistics depend on the usage recorded by each agent. Qoder CLI transcripts that contain only zero token counts leave token usage unknown in Wake, even when they include Credits or a context usage ratio. Those values measure different things and are not converted into tokens; the sessions remain visible in the Sessions and Prompts views of Insights.
 
