@@ -3,6 +3,7 @@
 ## [0.7.0] — Unreleased
 
 - New: session cleanup from the sidebar — filter by date, agent or project, sort by size, and preview before moving session files to the system trash. Includes cleanup history.
+- New: Copy Session Path in the session detail toolbar copies the source file path directly, with inline confirmation. Database-backed sessions copy the shared database path; remote sessions copy the local mirror path, as indicated in the tooltip (#33, thanks @ItsRyanWu)
 
 ## [0.6.7] — 2026-09-15
 

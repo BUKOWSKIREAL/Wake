@@ -40,12 +40,13 @@ use gpui_component::scroll::{AutoScroll, ScrollableElement as _};
 use gpui_component::spinner::Spinner;
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme as _, Icon, IndexPath, Root, Sizable as _, StyledExt as _,
-    TitleBar, WindowExt as _,
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IndexPath, Root, Sizable as _,
+    StyledExt as _, TitleBar, WindowExt as _,
 };
 
 use wake_core::adapters::{
-    adapter_for, create_adapter_roster_for, path_owns, AdapterLocation, AgentAdapter,
+    adapter_for, create_adapter_roster_for, path_owns, session_source_path, AdapterLocation,
+    AgentAdapter,
 };
 use wake_core::db::Store;
 use wake_core::models::Role as MessageRole;
@@ -1611,6 +1612,10 @@ fn toggle_expanded_row(rows: &mut HashSet<usize>, ix: usize) {
 struct DetailState {
     load_id: u64,
     meta: SessionMeta,
+    /// Resolved in the background independently of the transcript; None while pending.
+    source_path: Option<String>,
+    /// Its lifetime is also the inline copy feedback; copying again resets the timer.
+    copy_path_reset: Option<Task<()>>,
     /// 过滤后的可见消息。Rc 让行渲染以引用计数克隆代替整条消息深拷贝
     transcript: Rc<Vec<TranscriptMessage>>,
     loading: bool,
@@ -1638,6 +1643,8 @@ impl DetailState {
         static NEXT_LOAD: AtomicU64 = AtomicU64::new(0);
         Self {
             load_id: NEXT_LOAD.fetch_add(1, Ordering::Relaxed),
+            source_path: None,
+            copy_path_reset: None,
             meta,
             transcript: Rc::new(Vec::new()),
             loading: true,
@@ -4267,6 +4274,36 @@ impl Workbench {
 
     // ---------- 详情 ----------
 
+    fn copy_session_path(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = &mut self.detail else {
+            return;
+        };
+        let Some(path) = detail.source_path.as_ref().filter(|path| !path.is_empty()) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        let key = detail.meta.key.clone();
+        let load_id = detail.load_id;
+        detail.copy_path_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1_600))
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(detail) = detail_for_load(
+                    &mut this.detail,
+                    &mut this.cleanup.saved_detail,
+                    &key,
+                    load_id,
+                ) {
+                    detail.copy_path_reset = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn open_detail(
         &mut self,
         key: &str,
@@ -4289,6 +4326,29 @@ impl Workbench {
             self.sync_list_selection(key, window, cx);
         }
         cx.notify();
+
+        // Resolving a virtual path can stat a slow/unavailable custom location.
+        // Keep that off the UI thread, without waiting for transcript parsing.
+        let source_key = meta.key.clone();
+        let file_path = meta.file_path.clone();
+        let source_task =
+            cx.background_spawn(async move { session_source_path(&file_path).to_string() });
+        cx.spawn(async move |this, cx| {
+            let source_path = source_task.await;
+            this.update(cx, |this, cx| {
+                if let Some(detail) = detail_for_load(
+                    &mut this.detail,
+                    &mut this.cleanup.saved_detail,
+                    &source_key,
+                    load_id,
+                ) {
+                    detail.source_path = Some(source_path);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
 
         let adapters = self.adapters.clone();
         let task = cx.background_spawn(async move {
@@ -6220,6 +6280,37 @@ impl Workbench {
                 .into_any_element();
         };
         let meta = &detail.meta;
+        let path_copied = detail.copy_path_reset.is_some();
+        let copy_path_hint = match (
+            !meta.host.is_empty(),
+            detail
+                .source_path
+                .as_ref()
+                .is_some_and(|path| path != &meta.file_path),
+        ) {
+            (false, false) => t("Copy Session Path"),
+            (false, true) => t("Copy Session Path (shared database)"),
+            (true, false) => t("Copy Session Path (local copy)"),
+            (true, true) => t("Copy Session Path (local copy of shared database)"),
+        };
+        let copy_path = Button::new("copy-session-path")
+            .ghost()
+            .rounded(RADIUS_BUTTON)
+            .icon(
+                icon(if path_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                })
+                .with_size(px(16.)),
+            )
+            .tooltip(if path_copied {
+                t("Copied")
+            } else {
+                copy_path_hint
+            })
+            .disabled(detail.source_path.as_deref().is_none_or(str::is_empty))
+            .on_click(cx.listener(|this, _, _, cx| this.copy_session_path(cx)));
         let detail_title_tooltip: SharedString = meta.title.clone().into();
         let session_id = meta.id.clone();
         let export_entity = cx.entity();
@@ -6599,6 +6690,7 @@ impl Workbench {
                                             this.toggle_pinned(window, cx)
                                         }),
                                     ))
+                                    .child(copy_path)
                                     .child(more_menu),
                             ),
                     )

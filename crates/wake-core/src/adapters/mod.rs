@@ -23,6 +23,10 @@ pub(crate) mod parse_utils;
 pub(crate) mod pi_format;
 pub(crate) mod sqlite_ro;
 
+/// The local source file for a session, including mirrored remote sessions.
+/// Database-backed sessions resolve to their shared database, without `#<id>`.
+pub use sqlite_ro::strip_virtual_path as session_source_path;
+
 use crate::models::*;
 use anyhow::Result;
 use std::path::Path;
