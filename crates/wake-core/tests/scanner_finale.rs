@@ -361,6 +361,48 @@ fn fts_reindex_flag_reprocesses_unchanged_rows_once() {
 }
 
 #[test]
+fn format_two_backfills_pi_tokens_without_source_changes() {
+    use wake_core::adapters::pi::PiAdapter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("tokens.db");
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![PiAdapter::new().with_custom_root(common::fixture("pi/agent/sessions"))];
+    let r = adapters[0].list_session_files().unwrap().remove(0);
+    let mut old = adapters[0].parse_session(&r).unwrap();
+    old.meta.tokens_used = Some(4300); // Last call, as stored by format 2.
+    {
+        let store = Store::open(&db_path).unwrap();
+        store
+            .write_session(&old.meta, r.mtime_ms, &old.units)
+            .unwrap();
+    }
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_meta SET value = '2' WHERE key = 'fts_format'",
+            [],
+        )
+        .unwrap();
+
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(store.needs_fts_reindex());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let updated = store.get_session(&old.meta.key).unwrap().unwrap();
+    assert_eq!(updated.tokens_used, Some(4242 + 4300));
+    assert_eq!(updated.message_count, old.meta.message_count);
+    assert!(!store.needs_fts_reindex());
+    drop(store);
+
+    // The version is persisted: neither reopening nor a second scan repeats it.
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    assert!(!store.needs_fts_reindex());
+    let rec = Recorder::new();
+    run_scan(&adapters, &store, &rec, false).unwrap();
+    assert_eq!(rec.changed(), 0);
+}
+
+#[test]
 fn migration_backfill_retries_after_parse_failure() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("retry.db");

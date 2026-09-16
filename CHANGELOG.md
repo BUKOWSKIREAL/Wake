@@ -4,6 +4,7 @@
 
 - New: session cleanup from the sidebar — filter by date, agent or project, sort by size, and preview before moving session files to the system trash. Includes cleanup history.
 - New: Copy Session Path in the session detail toolbar copies the source file path directly, with inline confirmation. Database-backed sessions copy the shared database path; remote sessions copy the local mirror path, as indicated in the tooltip (#33, thanks @ItsRyanWu)
+- Fix: Pi and Oh My Pi token usage now adds up each assistant call instead of keeping only the last one, including calls with no visible reply. The shared OpenClaw reader also adds up the calls in its active transcript. Existing indexes are recalculated once after upgrading (#34, thanks @AwadYoo for the report and proposed fix in #35)
 
 ## [0.6.7] — 2026-09-15
 

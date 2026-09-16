@@ -130,10 +130,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
 );
 "#;
 
-/// FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
+/// 会话元数据和 FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
 /// 规则就换个值:旧库首开时挂 fts_reindex 旗子,下一轮扫描强制重解析全部文件。
-/// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声
-pub const FTS_FORMAT: &str = "2";
+/// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声,
+/// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token。
+pub const FTS_FORMAT: &str = "3";
 
 fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {

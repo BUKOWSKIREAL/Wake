@@ -89,6 +89,17 @@ impl PiRender {
     }
 
     fn push_assistant(&mut self, msg: &Value, content: &Value, ts: i64) {
+        // Each assistant entry reports one API call, including cache tokens.
+        // Account before display filtering: empty/thinking-only calls can still
+        // consume tokens even when they produce no visible transcript message.
+        if let Some(tokens) = msg
+            .get("usage")
+            .and_then(|u| u.get("totalTokens"))
+            .and_then(Value::as_i64)
+            .filter(|tokens| *tokens >= 0)
+        {
+            self.tokens_used = Some(self.tokens_used.unwrap_or(0).saturating_add(tokens));
+        }
         let parsed = content_parts(content, self.decode_images);
         let mut tools: Vec<ToolCallView> = Vec::new();
         let mut thinking = String::new();
@@ -125,13 +136,6 @@ impl PiRender {
         if model.is_some() {
             self.model = model.clone();
         }
-        if let Some(t) = msg
-            .get("usage")
-            .and_then(|u| u.get("totalTokens"))
-            .and_then(Value::as_i64)
-        {
-            self.tokens_used = Some(t);
-        }
         // 连续 assistant(中间只隔 toolResult)合并成一条,详情页每个回合一条助手消息
         if !matches!(self.messages.last(), Some(m) if m.role == Role::Assistant) {
             self.messages.push(text_msg(Role::Assistant, "", ts));
@@ -167,5 +171,67 @@ impl PiRender {
                 .insert(tc.id.clone(), (base, last.tool_calls.len()));
             last.tool_calls.push(tc);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tokens_include_hidden_calls_without_adding_transcript_rows() {
+        let mut render = PiRender::new(PiRenderOptions::default(), false);
+        for (content, tokens) in [
+            (json!([{"type": "text", "text": "First reply"}]), 100),
+            (json!([]), 20),
+            (json!([{"type": "thinking", "thinking": "Hidden"}]), 30),
+            (json!([{"type": "text", "text": "Final reply"}]), 200),
+        ] {
+            render.push(
+                &json!({"role": "assistant", "content": content,
+                    "usage": {"totalTokens": tokens}}),
+                1,
+            );
+        }
+        assert_eq!(render.tokens_used, Some(350));
+        assert_eq!(render.messages.len(), 1);
+        assert_eq!(render.messages[0].text, "First reply\n\nFinal reply");
+    }
+
+    #[test]
+    fn missing_invalid_and_zero_usage_preserve_reported_totals() {
+        let mut render = PiRender::new(PiRenderOptions::default(), false);
+        for usage in [json!(null), json!({}), json!({"totalTokens": -1})] {
+            render.push(&json!({"role": "assistant", "usage": usage}), 1);
+        }
+        assert_eq!(render.tokens_used, None);
+
+        render.push(
+            &json!({"role": "assistant", "usage": {"totalTokens": 0}}),
+            1,
+        );
+        assert_eq!(render.tokens_used, Some(0));
+        for usage in [
+            json!({"totalTokens": 42}),
+            json!(null),
+            json!({"totalTokens": -1}),
+            json!({"totalTokens": 0}),
+        ] {
+            render.push(&json!({"role": "assistant", "usage": usage}), 1);
+        }
+        assert_eq!(render.tokens_used, Some(42));
+    }
+
+    #[test]
+    fn token_sum_saturates_instead_of_overflowing_on_malformed_usage() {
+        let mut render = PiRender::new(PiRenderOptions::default(), false);
+        for tokens in [i64::MAX, 1] {
+            render.push(
+                &json!({"role": "assistant", "usage": {"totalTokens": tokens}}),
+                1,
+            );
+        }
+        assert_eq!(render.tokens_used, Some(i64::MAX));
     }
 }

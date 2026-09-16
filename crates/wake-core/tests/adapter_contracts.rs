@@ -750,6 +750,46 @@ fn qoder_parse_contract() {
 }
 
 #[test]
+fn qoder_credits_are_not_reported_as_tokens() {
+    setup();
+    let adapter = QoderAdapter::new();
+    let original = qoder_ref();
+    let source = fs::read_to_string(&original.file_path).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credits-only.jsonl");
+
+    for (has_real_tokens, expected) in [(false, None), (true, Some(40))] {
+        let rows: Vec<String> = source
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["type"] == "assistant" {
+                    let reported = has_real_tokens && row["uuid"] == "q-assistant-2";
+                    row["message"]["usage"] = serde_json::json!({
+                        "input_tokens": if reported { 30 } else { 0 },
+                        "output_tokens": if reported { 10 } else { 0 },
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "credits": 1.5362908,
+                        "context_usage_ratio": 0.1379833
+                    });
+                }
+                serde_json::to_string(&row).unwrap()
+            })
+            .collect();
+        fs::write(&path, rows.join("\n")).unwrap();
+        let r = fs_ref(AgentId::Qoder, &path, &original.native_id);
+        let parsed = adapter.parse_session(&r).unwrap();
+        assert_eq!(parsed.meta.tokens_used, expected);
+        assert_eq!(parsed.meta.message_count, 4);
+        assert_eq!(
+            adapter.parse_transcript(&r).unwrap().meta.tokens_used,
+            expected
+        );
+    }
+}
+
+#[test]
 fn qoder_explicit_null_active_leaf_is_empty() {
     setup();
     let adapter = QoderAdapter::new();
@@ -1408,7 +1448,8 @@ fn pi_parse_contract() {
     // cwd 来自 session 首行,不反推有损编码目录名
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s.meta.model.as_deref(), Some("gpt-5.5"));
-    assert_eq!(s.meta.tokens_used, Some(4300)); // 最后一条 assistant 的 totalTokens
+    assert_eq!(s.meta.tokens_used, Some(4242 + 4300)); // 两次调用,含合并前的工具调用
+    assert_eq!(t.meta.tokens_used, s.meta.tokens_used);
     assert_eq!(s.meta.message_count, 2);
     assert_eq!(s.meta.created_at, ms("2026-08-06T10:00:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-06T10:00:12Z"));
@@ -1447,6 +1488,14 @@ fn pi_parse_contract() {
     assert_eq!(s2.meta.agent, AgentId::Omp);
     assert_eq!(s2.meta.key, "omp:66666666-aaaa-bbbb-cccc-000000000006");
     assert_eq!(s2.meta.title, "Pi 查一下二维码组件的 useEffect() 清理");
+    assert_eq!(s2.meta.tokens_used, Some(4242 + 4300));
+    assert_eq!(
+        omp.parse_transcript(&pi_ref(AgentId::Omp))
+            .unwrap()
+            .meta
+            .tokens_used,
+        s2.meta.tokens_used
+    );
 }
 
 #[test]
@@ -2099,7 +2148,8 @@ fn openclaw_parse_contract() {
     assert_eq!(s.meta.title, "Node label"); // 无 session_info 时取 node label
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx"); // header cwd
     assert_eq!(s.meta.model.as_deref(), Some("claude-opus-5"));
-    assert_eq!(s.meta.tokens_used, Some(7300));
+    assert_eq!(s.meta.tokens_used, Some(7100 + 7300)); // 活跃分支两次调用之和
+    assert_eq!(t.meta.tokens_used, s.meta.tokens_used);
     assert_eq!(s.meta.source.as_deref(), Some("telegram"));
     assert_eq!(s.meta.created_at, ms("2026-08-08T09:00:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-08T09:00:30Z"));
@@ -2157,7 +2207,8 @@ fn openclaw_parse_contract() {
     assert_eq!(s.meta.title, "OpenClaw QR cleanup"); // session_info 压过 sessions.json 的 label
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s.meta.model.as_deref(), Some("claude-opus-5"));
-    assert_eq!(s.meta.tokens_used, Some(5200));
+    assert_eq!(s.meta.tokens_used, Some(5100 + 5200));
+    assert_eq!(t.meta.tokens_used, s.meta.tokens_used);
     assert_eq!(s.meta.created_at, ms("2026-08-07T09:00:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-07T09:00:30Z"));
     // wibble-entry 是叶:回溯经 u3→c1→a2→r1→a1→u2→u1→i1→m1,死分支 a2-dead 不在链上;

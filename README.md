@@ -57,6 +57,8 @@ Codex writes its background threads — the guardian auto-review, `/review`, com
 
 Cursor keeps two stores. A chat that has a full transcript under `~/.cursor/projects` is read from there (the transcript knows the project folder); chats that only live in Cursor's own database — older ones, or Cursor versions that leave nothing but a `turn_ended` marker in the transcript — are read from `state.vscdb`. Older IDE chats that Cursor stored without a workspace show up under *Unknown project*.
 
+Token statistics depend on the usage recorded by each agent. Qoder CLI transcripts that contain only zero token counts leave token usage unknown in Wake, even when they include Credits or a context usage ratio. Those values measure different things and are not converted into tokens; the sessions remain visible in the Sessions and Prompts views of Insights.
+
 Windsurf and Trae encrypt their local data; Amp, Factory (Droid), and Warp keep sessions in the cloud — none of those are supported. Reasonix stores sessions locally but hasn't been mapped yet.
 
 ## Remote hosts
