@@ -1,6 +1,6 @@
 use super::parse_utils::*;
 use super::sqlite_ro::{open_sqlite_ro, virtual_path};
-use super::{units_from_messages, AgentAdapter};
+use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -228,12 +228,7 @@ impl AgentAdapter for CopilotAdapter {
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let (meta, messages) = self.parse(r)?;
-        let units = units_from_messages(&messages);
-        Ok(ParsedSession {
-            meta,
-            units,
-            unknown_line_count: 0,
-        })
+        Ok(ParsedSession::derive(meta, &messages, 0))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

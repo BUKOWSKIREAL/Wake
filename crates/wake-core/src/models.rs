@@ -392,6 +392,10 @@ pub struct ParsedSession {
     pub meta: SessionMeta,
     pub units: Vec<IndexUnit>,
     pub unknown_line_count: u32,
+    /// agent 在这个会话里查 Wake 的每一次调用(MCP 的 wake_* 工具、shell 里的
+    /// wake-cli / wake-mcp),落 wake_lookups 表。与 units 同一处派生
+    /// (`ParsedSession::derive`):自指回声过滤把这些调用从索引里跳过了,不记就没有仪表
+    pub wake_lookups: Vec<WakeLookup>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -502,6 +506,10 @@ pub struct InsightsData {
     /// 逐条 model,会话级 `model` 是末态,按它归因会把整段历史改写成最后
     /// 用的那个模型(同一 review)
     pub trend_agents: Vec<TrendSeries>,
+    /// 近 7 天各家 agent 查 Wake 的次数,按接入渠道分列(总数降序,只含 >0 的家)。
+    /// 窗与 Last 7 days 同(as_of 收尾的 7 天),按每次调用所在消息的时刻归窗,
+    /// 缺时间戳的退回会话 updated_at
+    pub wake_lookups_7d: Vec<LookupTally>,
 }
 
 /// 时间窗内的度量(Last 7 days 与其前 7 天各一份)
@@ -542,7 +550,7 @@ impl InsightsData {
     /// 消息日;active_days 数的是有 prompt 的日子(与热力图同口径)。两个日序列
     /// 都升序,二分定位后只读窗内的行(每帧调用,别线性扫全史)
     pub fn week_ending(&self, ending: chrono::NaiveDate) -> WindowStats {
-        let start = ending - chrono::Days::new(6);
+        let start = week_window_start(ending);
         let mut w = WindowStats::default();
         let from = self.daily.partition_point(|(d, _)| *d < start);
         for (_, n) in self.daily[from..].iter().take_while(|(d, _)| *d <= ending) {
@@ -580,6 +588,30 @@ pub fn week_start(day: chrono::NaiveDate) -> chrono::NaiveDate {
     day - chrono::Days::new(day.weekday().num_days_from_monday() as u64)
 }
 
+/// Last 7 days 窗的首日(`ending` 收尾的 7 天闭区间)。按日比较的 `week_ending` 与
+/// 按时刻比较的 `week_window_start_ms` 同一个定义,窗口只在这里定一次
+pub fn week_window_start(ending: chrono::NaiveDate) -> chrono::NaiveDate {
+    ending - chrono::Days::new(6)
+}
+
+/// 同一窗的起点换成 epoch ms(本地零点):按调用时刻归窗的 SQL 用
+pub fn week_window_start_ms(ending: chrono::NaiveDate) -> i64 {
+    week_window_start(ending)
+        .and_hms_opt(0, 0, 0)
+        .and_then(local_ms)
+        .unwrap_or(0)
+}
+
+/// 本地时间 → epoch ms;夏令时空档里不存在的时刻取最早的解释,None = 无解。
+/// since 解析(services/context)与 Insights 的窗起点共用
+pub fn local_ms(ndt: chrono::NaiveDateTime) -> Option<i64> {
+    use chrono::TimeZone as _;
+    chrono::Local
+        .from_local_datetime(&ndt)
+        .earliest()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// 日 → 趋势窗口内的周下标(末项 = as_of 所在周);窗外/未来为 None。
 /// 与 `InsightsData::trend_start` 是一对互逆:`trend_start + ix×7 天` 回到该周周一
 pub fn trend_week_index(as_of: chrono::NaiveDate, day: chrono::NaiveDate) -> Option<usize> {
@@ -597,6 +629,51 @@ pub struct UsageTally {
     pub sessions: i64,
     pub prompts: i64,
     pub tokens: i64,
+}
+
+/// agent 查 Wake 的一次调用(解析时从工具调用里认出,落 wake_lookups 表)。
+/// `timestamp` 是所在消息的时间,缺则 None——归窗时退回会话的 updated_at
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeLookup {
+    pub seq: i64,
+    pub timestamp: Option<i64>,
+    pub channel: LookupChannel,
+    /// MCP 工具名(wake_search 等)或命令行二进制名(wake-cli / wake-mcp);两边都
+    /// 出自常量表,所以是 &'static
+    pub tool: &'static str,
+}
+
+/// 调用走的是哪条接入:MCP 的 wake_* 工具,还是 shell 里的 wake-cli / wake-mcp。
+/// MCP 那一路按工具名认、天然精确;CLI 那一路按命令文本认,开发 Wake 自己的机器上
+/// 会混进写源码、构建这类命令(2026-09-17 实测),两路分开列才看得清
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupChannel {
+    Mcp,
+    Cli,
+}
+
+impl LookupChannel {
+    /// 落库/传输用的小写名
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+/// Insights "Agents asking Wake" 的一行:近 7 天该家 agent 经两条接入各查了几次
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupTally {
+    pub name: String,
+    pub mcp: i64,
+    pub cli: i64,
+}
+
+impl LookupTally {
+    pub fn total(&self) -> i64 {
+        self.mcp + self.cli
+    }
 }
 
 /// 搜索 snippet 高亮哨兵(UI 层替换为高亮样式)

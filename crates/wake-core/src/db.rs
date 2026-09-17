@@ -168,13 +168,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   body,
   tokenize="trigram case_sensitive 0"
 );
+
+-- agent 查 Wake 的每一次调用(解析时从工具调用里认出,2026-09-17)。与 messages
+-- 同一事务写、同 key 删;channel = mcp | cli,tool = MCP 工具名或命令行二进制名,
+-- ts = 所在消息的时间(缺则 NULL,归窗时退回会话 updated_at)。老库首开由
+-- FTS_FORMAT 换代的全量重解析回填
+CREATE TABLE IF NOT EXISTS wake_lookups (
+  session_key TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  ts          INTEGER,
+  channel     TEXT NOT NULL,
+  tool        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wake_lookups_session ON wake_lookups(session_key);
 "#;
 
 /// 会话元数据和 FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
 /// 规则就换个值:旧库首开时挂 fts_reindex 旗子,下一轮扫描强制重解析全部文件。
 /// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声,
 /// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token,
-/// "4" = Cursor 项目路径优先读取工作区元数据,并恢复 slug 中的空格。
+/// "4" = Cursor 项目路径优先读取工作区元数据,并恢复 slug 中的空格,
+/// "5" / "6" = 未发布分支各自用过的中间态(#42 用过 5;meter-handoff 用过 6:同一派生里
+///       记下 agent 查 Wake 的每次调用,落 wake_lookups 表,老库靠这轮重解析回填),
+/// "7" = 三条分支合到 main 时对齐(2026-09-21/22):Codex spawn_agent 子线程折叠、
+///       wake_lookups、记忆层一起回填——开发库可能戳着 5 或 6,换代判据是精确不等,
+///       两个都跳过。
 pub const FTS_FORMAT: &str = "7";
 
 fn open_conn(path: &Path) -> Result<Connection> {
@@ -280,8 +298,10 @@ fn open_conn(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 最近一次迁移加的列——`open_read_only` 用它判断库够不够新。**加新迁移时把
-/// 这里改成新列**,否则只读入口会放行老库、深处查询才报 no such column
+/// 最近一次迁移加的、**只读读者(wake-mcp / wake-cli)会查的**列——`open_read_only`
+/// 用它判断库够不够新。加了只读路径要读的新列就改这里,否则只读入口会放行老库、
+/// 深处查询才报 no such column;只有 GUI 读的表/列(如 wake_lookups)不算,否则
+/// 一次 GUI 侧的加表就让旁路二进制对所有老库拒开
 const NEWEST_COLUMN: (&str, &str) = ("memories", "source");
 /// 最近一次迁移加的、只读读者会查的表(wake_list_memories 读 memories),与
 /// NEWEST_COLUMN 同一用途、同一维护规矩
@@ -416,7 +436,9 @@ impl Store {
     ) -> Result<()> {
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
-        write_session_tx(&tx, meta, file_mtime, units)?;
+        // 不经裁决的直写只有测试在用(生产路径全走 write_session_guarded),
+        // 不带 Wake 调用记录
+        write_session_tx(&tx, meta, file_mtime, units, &[])?;
         tx.commit()?;
         Ok(())
     }
@@ -439,6 +461,7 @@ impl Store {
         meta: &SessionMeta,
         file_mtime: i64,
         units: &[IndexUnit],
+        lookups: &[WakeLookup],
         rank_of: &dyn Fn(&str) -> u8,
         supersedes: Option<(&str, i64)>,
     ) -> Result<bool> {
@@ -470,7 +493,7 @@ impl Store {
                 }
             }
         }
-        write_session_tx(&tx, meta, file_mtime, units)?;
+        write_session_tx(&tx, meta, file_mtime, units, lookups)?;
         tx.commit()?;
         Ok(true)
     }
@@ -684,18 +707,7 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let mut sel =
-                tx.prepare_cached("SELECT id, text FROM messages WHERE session_key = ?1")?;
-            let rows: Vec<(i64, String)> = sel
-                .query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut fts_del = tx.prepare_cached(
-                "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', ?1, ?2)",
-            )?;
-            for (id, text) in rows {
-                fts_del.execute(params![id, text])?;
-            }
-            tx.execute("DELETE FROM messages WHERE session_key = ?1", params![key])?;
+            clear_session_rows(&tx, key)?;
             tx.execute("DELETE FROM titles_fts WHERE key = ?1", params![key])?;
             tx.execute("DELETE FROM sessions WHERE key = ?1", params![key])?;
             if tombstone {
@@ -1180,7 +1192,8 @@ impl Store {
         let conn = self.write.lock().unwrap();
         conn.execute_batch(
             "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM titles_fts;
-             DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM sessions;",
+             DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM wake_lookups;
+             DELETE FROM sessions;",
         )?;
         Ok(())
     }
@@ -1956,7 +1969,7 @@ impl Store {
         // scanner 层有意保留全部副本(不变量 8⑦:各机续跑会分叉),只是统计口径
         // 不能把一份对话数两遍(2026-09-14,0.4.0 遗留)。算一次放临时表——这条
         // 连接是本次调用私有的,只读连接也能建 temp 表;内联成子查询的话下面
-        // 六条语句会各排一遍序
+        // 七条语句会各排一遍序
         conn.execute_batch(
             "CREATE TEMP TABLE canonical_sessions AS
              SELECT key FROM (
@@ -1968,6 +1981,9 @@ impl Store {
         )?;
         let mut data = InsightsData {
             as_of: today,
+            // Agents asking Wake:窗同 Last 7 days,按调用时刻归窗;与其余语句同一
+            // 连接、同一张 canonical_sessions
+            wake_lookups_7d: tally_wake_lookups(&conn, week_window_start_ms(today))?,
             ..Default::default()
         };
 
@@ -2691,19 +2707,39 @@ fn row_to_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     })
 }
 
-/// write_session / write_session_guarded 共用的事务内核
-fn write_session_tx(
-    tx: &rusqlite::Transaction<'_>,
-    meta: &SessionMeta,
-    file_mtime: i64,
-    units: &[IndexUnit],
-) -> Result<()> {
+/// Insights 的 "Agents asking Wake":各家 agent 在 `since_ms` 之后查 Wake 的次数,按接入
+/// 渠道分列,总数降序、只含 >0 的家。按每次调用所在消息的时刻归窗,缺时间戳的退回
+/// 会话 updated_at。跑在 insights 的私有连接上,`canonical_sessions` 是它建的 temp 表
+/// (归档不计、多 host 镜像只算一份)。这是 mcp-roadmap 定的"阶段 A 有没有真实使用"的仪表
+fn tally_wake_lookups(conn: &Connection, since_ms: i64) -> Result<Vec<LookupTally>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.agent_id, SUM(l.channel = 'mcp'), SUM(l.channel = 'cli')
+         FROM wake_lookups l JOIN sessions s ON s.key = l.session_key
+         WHERE s.archived = 0 AND COALESCE(l.ts, s.updated_at) >= ?1
+           AND s.key IN canonical_sessions
+         GROUP BY s.agent_id ORDER BY COUNT(*) DESC, s.agent_id",
+    )?;
+    let rows = stmt
+        .query_map(params![since_ms], |r| {
+            Ok(LookupTally {
+                name: r.get(0)?,
+                mcp: r.get(1)?,
+                cli: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 清掉一条会话在库里的全部派生行:messages 及其 FTS 影子、wake_lookups。写入前
+/// (write_session_tx)与删除时(remove_sessions_recorded)共用;titles_fts 不在这里,
+/// 它随 upsert_session 走(quick 路径也要改标题)。再加一张派生表只改这里和写入侧
+fn clear_session_rows(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<()> {
     // FTS external content 需要显式 delete 旧行
-    let mut sel = tx.prepare_cached("SELECT id, text FROM messages WHERE session_key = ?1")?;
-    let rows: Vec<(i64, String)> = sel
-        .query_map(params![meta.key], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(i64, String)> = tx
+        .prepare_cached("SELECT id, text FROM messages WHERE session_key = ?1")?
+        .query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    drop(sel);
     let mut fts_del = tx.prepare_cached(
         "INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', ?1, ?2)",
     )?;
@@ -2711,11 +2747,22 @@ fn write_session_tx(
         fts_del.execute(params![id, text])?;
     }
     drop(fts_del);
-    tx.execute(
-        "DELETE FROM messages WHERE session_key = ?1",
-        params![meta.key],
-    )?;
+    tx.prepare_cached("DELETE FROM messages WHERE session_key = ?1")?
+        .execute(params![key])?;
+    tx.prepare_cached("DELETE FROM wake_lookups WHERE session_key = ?1")?
+        .execute(params![key])?;
+    Ok(())
+}
 
+/// write_session / write_session_guarded 共用的事务内核
+fn write_session_tx(
+    tx: &rusqlite::Transaction<'_>,
+    meta: &SessionMeta,
+    file_mtime: i64,
+    units: &[IndexUnit],
+    lookups: &[WakeLookup],
+) -> Result<()> {
+    clear_session_rows(tx, &meta.key)?;
     upsert_session(tx, meta, file_mtime)?;
 
     let mut ins_msg = tx.prepare_cached(
@@ -2733,6 +2780,22 @@ fn write_session_tx(
         ])?;
         let rowid = tx.last_insert_rowid();
         ins_fts.execute(params![rowid, u.text])?;
+    }
+    // Wake 调用记录与 messages 同事务、同 key 删插;quick 路径(write_meta_only)
+    // 不经这里,所以不会把记录冲掉。绝大多数会话一次都没有,别为它白取一次语句
+    if !lookups.is_empty() {
+        let mut ins_lookup = tx.prepare_cached(
+            "INSERT INTO wake_lookups(session_key, seq, ts, channel, tool) VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        for l in lookups {
+            ins_lookup.execute(params![
+                meta.key,
+                l.seq,
+                l.timestamp,
+                l.channel.as_str(),
+                l.tool
+            ])?;
+        }
     }
     Ok(())
 }

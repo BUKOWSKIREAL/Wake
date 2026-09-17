@@ -639,6 +639,7 @@ impl AgentAdapter for SeedAdapter {
             meta: self.meta.clone(),
             units: Vec::new(),
             unknown_line_count: 0,
+            wake_lookups: Vec::new(),
         })
     }
     fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {

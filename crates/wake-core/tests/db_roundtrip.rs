@@ -645,6 +645,87 @@ fn disabled_locations_roundtrip() {
     assert!(store.list_disabled_locations().unwrap().is_empty());
 }
 
+/// wake_lookups(agent 查 Wake 的每一次调用):随会话同事务写入、重解析即整体替换、
+/// 删会话时一并删;quick 路径(write_meta_only)不碰这张表。Insights 的 Agents asking
+/// Wake 按调用时刻归到最近 7 天、按渠道分列,缺时间戳的退回会话 updated_at
+#[test]
+fn wake_lookups_follow_the_session_and_reach_insights() {
+    let (_dir, store) = temp_store();
+    let today = chrono::Local::now().date_naive();
+    let now = chrono::Local::now().timestamp_millis();
+    let hour = 3_600_000;
+    let lookup =
+        |seq: i64, ts: Option<i64>, channel: LookupChannel, tool: &'static str| WakeLookup {
+            seq,
+            timestamp: ts,
+            channel,
+            tool,
+        };
+    let write = |m: &SessionMeta, mtime: i64, lookups: &[WakeLookup]| {
+        assert!(store
+            .write_session_guarded(m, mtime, &[], lookups, &|_| 0, None)
+            .unwrap());
+    };
+    let tally = |name: &str, mcp: i64, cli: i64| LookupTally {
+        name: name.to_string(),
+        mcp,
+        cli,
+    };
+    let tallies = || store.insights(today).unwrap().wake_lookups_7d;
+
+    let mut a = meta("claude-code:a", "查过 Wake");
+    a.updated_at = now - hour;
+    write(
+        &a,
+        1,
+        &[
+            lookup(3, Some(now - 2 * hour), LookupChannel::Mcp, "wake_search"),
+            lookup(7, Some(now - hour), LookupChannel::Mcp, "wake_get_session"),
+            // 缺时间戳:退回会话 updated_at,在窗内
+            lookup(9, None, LookupChannel::Cli, "wake-cli"),
+            // 30 天前的那次不算
+            lookup(
+                11,
+                Some(now - 30 * 24 * hour),
+                LookupChannel::Cli,
+                "wake-cli",
+            ),
+        ],
+    );
+    store.write_meta_only(&[(a.clone(), 1)]).unwrap();
+    let mut b = meta("codex:b", "也查过");
+    b.agent = AgentId::Codex;
+    b.updated_at = now - hour;
+    write(
+        &b,
+        1,
+        &[lookup(1, Some(now - hour), LookupChannel::Cli, "wake-mcp")],
+    );
+    let mut none = meta("gemini:n", "没查过");
+    none.agent = AgentId::Gemini;
+    write(&none, 1, &[]);
+
+    assert_eq!(
+        tallies(),
+        vec![tally("claude-code", 2, 1), tally("codex", 0, 1)],
+        "quick 写入不动这张表;窗外那次与零调用的家不出现"
+    );
+    write(
+        &a,
+        2,
+        &[lookup(3, Some(now - hour), LookupChannel::Cli, "wake-cli")],
+    );
+    assert_eq!(
+        tallies()[0],
+        tally("claude-code", 0, 1),
+        "重解析整体替换旧记录"
+    );
+    store
+        .remove_sessions(&["claude-code:a".to_string()], false)
+        .unwrap();
+    assert_eq!(tallies(), vec![tally("codex", 0, 1)], "删会话一并删记录");
+}
+
 /// 增量写入的胜者裁决在写事务内:败方副本(旧 mtime、异路径)一字不写,
 /// 反超后按规则接管(2026-08-24 Codex review)
 #[test]
@@ -658,7 +739,7 @@ fn guarded_write_respects_winner() {
     loser.file_path = "/backup/g.jsonl".into();
     assert!(
         !store
-            .write_session_guarded(&loser, 5, &[], &|_| 0, None)
+            .write_session_guarded(&loser, 5, &[], &[], &|_| 0, None)
             .unwrap(),
         "败方不该写入"
     );
@@ -669,7 +750,7 @@ fn guarded_write_respects_winner() {
 
     assert!(
         store
-            .write_session_guarded(&loser, 12, &[], &|_| 0, None)
+            .write_session_guarded(&loser, 12, &[], &[], &|_| 0, None)
             .unwrap(),
         "反超应接管"
     );
@@ -689,7 +770,7 @@ fn guarded_write_respects_winner() {
     cli.file_path = "/cli/h.jsonl".into();
     assert!(
         store
-            .write_session_guarded(&cli, 5, &[], &rank_of, None)
+            .write_session_guarded(&cli, 5, &[], &[], &rank_of, None)
             .unwrap(),
         "rank 靠前的较旧副本应接管"
     );
@@ -699,7 +780,7 @@ fn guarded_write_respects_winner() {
     );
     assert!(
         !store
-            .write_session_guarded(&ide, 12, &[], &rank_of, None)
+            .write_session_guarded(&ide, 12, &[], &[], &rank_of, None)
             .unwrap(),
         "rank 靠后的较新副本不得反超"
     );
@@ -710,13 +791,13 @@ fn guarded_write_respects_winner() {
     // 另一份副本,照常裁决、不误删(2026-09-15 Codex review 三、四轮)
     assert!(
         !store
-            .write_session_guarded(&ide, 12, &[], &rank_of, Some(("/cli/h.jsonl", 4)))
+            .write_session_guarded(&ide, 12, &[], &[], &rank_of, Some(("/cli/h.jsonl", 4)))
             .unwrap(),
         "同路径但库里版本更新(mtime 更大)不让位"
     );
     assert!(
         store
-            .write_session_guarded(&ide, 12, &[], &rank_of, Some(("/cli/h.jsonl", 5)))
+            .write_session_guarded(&ide, 12, &[], &[], &rank_of, Some(("/cli/h.jsonl", 5)))
             .unwrap(),
         "失效的胜者行让位给回退副本"
     );
@@ -729,7 +810,7 @@ fn guarded_write_respects_winner() {
     third.file_path = "/store2/state.vscdb#h".into();
     assert!(
         !store
-            .write_session_guarded(&third, 3, &[], &rank_of, Some(("/cli/h.jsonl", 5)))
+            .write_session_guarded(&third, 3, &[], &[], &rank_of, Some(("/cli/h.jsonl", 5)))
             .unwrap(),
         "库里已是别的副本时 supersedes 不生效,按位次与 mtime 照常裁决"
     );
@@ -746,7 +827,7 @@ fn guarded_write_respects_winner() {
     p_ide.file_path = "/store/state.vscdb#p".into();
     assert!(
         store
-            .write_session_guarded(&p_ide, 12, &[], &rank_of, Some(("/cli/p.jsonl", 5)))
+            .write_session_guarded(&p_ide, 12, &[], &[], &rank_of, Some(("/cli/p.jsonl", 5)))
             .unwrap(),
         "占位行让位给回退副本"
     );
@@ -1411,7 +1492,7 @@ fn memory_source_overrides_roundtrip() {
     orphan.project_path = String::new();
     for s in [&local, &remote, &orphan] {
         store
-            .write_session_guarded(s, 1, &[], &|_| 0, None)
+            .write_session_guarded(s, 1, &[], &[], &|_| 0, None)
             .unwrap();
     }
     assert_eq!(
@@ -1586,7 +1667,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     s1.project_path = "/work/app".into();
     s1.project_name = "app".into();
     store
-        .write_session_guarded(&s1, 5, &[], &|_| 0, None)
+        .write_session_guarded(&s1, 5, &[], &[], &|_| 0, None)
         .unwrap();
     assert_eq!(project_of(&anchored.key), "/work/app");
     assert_eq!(
@@ -1640,7 +1721,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     s1.project_path = "/work/app-renamed".into();
     s1.project_name = "app-renamed".into();
     store
-        .write_session_guarded(&s1, 6, &[], &|_| 0, None)
+        .write_session_guarded(&s1, 6, &[], &[], &|_| 0, None)
         .unwrap();
     assert_eq!(project_of(&anchored.key), "/work/app-renamed");
 

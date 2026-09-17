@@ -2,8 +2,8 @@
 //! 项目参数的三级匹配与 `since` 解析都在这里,单测卡住语义——工具层只管拼装。
 
 use crate::adapters::path_owns;
-use crate::models::ProjectInfo;
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone as _};
+use crate::models::{local_ms, ProjectInfo};
+use chrono::{NaiveDate, NaiveDateTime};
 
 /// 把 agent 给的 project 参数解析成索引里的项目路径集合(交给
 /// `SessionFilter::project_paths` / `SearchFilter::project_paths`)。
@@ -125,16 +125,10 @@ fn parse_relative(s: &str) -> Option<i64> {
     n.checked_mul(unit_ms)
 }
 
-fn local_ms(ndt: NaiveDateTime) -> Option<i64> {
-    Local
-        .from_local_datetime(&ndt)
-        .earliest()
-        .map(|dt| dt.timestamp_millis())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Local, TimeZone as _};
 
     fn project(path: &str, name: &str) -> ProjectInfo {
         ProjectInfo {

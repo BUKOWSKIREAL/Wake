@@ -1,6 +1,6 @@
 use super::parse_utils::*;
 use super::sqlite_ro::{open_sqlite_ro, virtual_path};
-use super::{units_from_messages, AgentAdapter};
+use super::AgentAdapter;
 use crate::models::*;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -1241,12 +1241,11 @@ impl AgentAdapter for CodexAdapter {
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let parsed = parse_rollout(Path::new(&r.file_path), false)?;
         let meta = build_meta(r, &parsed, &self.archived_dir);
-        let units = units_from_messages(&parsed.messages);
-        Ok(ParsedSession {
+        Ok(ParsedSession::derive(
             meta,
-            units,
-            unknown_line_count: parsed.unknown_lines,
-        })
+            &parsed.messages,
+            parsed.unknown_lines,
+        ))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

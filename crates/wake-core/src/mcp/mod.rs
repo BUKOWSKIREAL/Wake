@@ -246,6 +246,12 @@ pub fn sibling_named(stem: &str) -> Option<PathBuf> {
     Some(exe.parent()?.join(name))
 }
 
+/// sibling_named 的"在才算"版:不存在或不是文件给 None。要显示"它该在哪"(Settings
+/// 的 Not found 提示)用 sibling_named,要拿一个能跑的用这个
+pub fn sibling_file(stem: &str) -> Option<PathBuf> {
+    sibling_named(stem).filter(|p| p.is_file())
+}
+
 /// 一段可复制的接入配置
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupSnippet {

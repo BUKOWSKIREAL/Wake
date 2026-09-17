@@ -140,7 +140,7 @@ impl ScanEvents for TtyProgress {
 fn setup(db: &Option<PathBuf>) -> String {
     let cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wake-cli"));
     // sibling_named 取的就是 current_exe 同级目录,从 wake-cli 调恰好对
-    let mcp_bin = mcp::sibling_named("wake-mcp").filter(|p| p.exists());
+    let mcp_bin = mcp::sibling_file("wake-mcp");
     let path = db_path(db);
     // 只探库,不必为一行提示把十九家 roster 建起来
     let db_error = Store::open_read_only(&path).err().map(|e| format!("{e:#}"));

@@ -1,6 +1,6 @@
 use super::parse_utils::*;
 use super::sqlite_ro::{open_sqlite_ro, strip_virtual_path, virtual_path, SqliteRo};
-use super::{units_from_messages, AgentAdapter};
+use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -762,12 +762,7 @@ impl AgentAdapter for OpencodeAdapter {
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let (meta, messages, unknown) = self.parse(r, false)?;
-        let units = units_from_messages(&messages);
-        Ok(ParsedSession {
-            meta,
-            units,
-            unknown_line_count: unknown,
-        })
+        Ok(ParsedSession::derive(meta, &messages, unknown))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

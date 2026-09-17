@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::{units_from_messages, AgentAdapter};
+use super::AgentAdapter;
 use crate::models::*;
 use anyhow::Result;
 use serde_json::Value;
@@ -175,12 +175,7 @@ impl AgentAdapter for KiroAdapter {
         let (messages, unknown) = parse_kiro_jsonl(Path::new(&r.file_path), false)?;
         let side = read_sidecar(Path::new(&r.file_path));
         let meta = build_meta(r, &side, &messages);
-        let units = units_from_messages(&messages);
-        Ok(ParsedSession {
-            meta,
-            units,
-            unknown_line_count: unknown,
-        })
+        Ok(ParsedSession::derive(meta, &messages, unknown))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

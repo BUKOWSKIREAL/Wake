@@ -95,8 +95,8 @@ pub const LIST_SESSIONS: &str = "wake_list_sessions";
 pub const GET_SESSION: &str = "wake_get_session";
 pub const LIST_PROJECTS: &str = "wake_list_projects";
 pub const LIST_MEMORIES: &str = "wake_list_memories";
-/// 工具名的清单:自指回声过滤(`adapters::is_wake_lookup`)与 definitions 的
-/// 稳定性测试都读它,加一家改这里与 `definitions()` 两处即可
+/// 工具名的清单:自指回声过滤与 wake_lookups 记账(`adapters::wake_lookup_kind`)与
+/// definitions 的稳定性测试都读它,加一家改这里与 `definitions()` 两处即可
 pub const NAMES: [&str; 5] = [
     SEARCH,
     LIST_SESSIONS,

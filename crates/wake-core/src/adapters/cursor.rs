@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::{cursor_ide, units_from_messages, AgentAdapter};
+use super::{cursor_ide, AgentAdapter};
 use crate::models::*;
 use anyhow::Result;
 use serde_json::Value;
@@ -511,12 +511,11 @@ impl AgentAdapter for CursorAdapter {
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let parsed = parse_cursor_jsonl(Path::new(&r.file_path), false)?;
         let meta = build_meta(r, &parsed, self.project_path(r));
-        let units = units_from_messages(&parsed.messages);
-        Ok(ParsedSession {
+        Ok(ParsedSession::derive(
             meta,
-            units,
-            unknown_line_count: parsed.unknown_lines,
-        })
+            &parsed.messages,
+            parsed.unknown_lines,
+        ))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

@@ -416,6 +416,7 @@ fn run_scan_inner(
                     &meta,
                     item.r.mtime_ms,
                     &parsed.units,
+                    &parsed.wake_lookups,
                     &rank_of(adapters, meta.agent),
                     None,
                 ) {
@@ -451,6 +452,7 @@ fn run_scan_inner(
                                 &meta,
                                 fb.mtime_ms,
                                 &parsed.units,
+                                &parsed.wake_lookups,
                                 &rank_of(adapters, meta.agent),
                                 Some((item.r.file_path.as_str(), item.r.mtime_ms)),
                             ) {
@@ -848,6 +850,7 @@ fn reparse_for_parent_change(
         &meta,
         reference.mtime_ms,
         &parsed.units,
+        &parsed.wake_lookups,
         &rank_of(adapters, agent),
         None,
     ) {
@@ -924,6 +927,7 @@ pub fn scan_files(
                             &meta,
                             r.mtime_ms,
                             &parsed.units,
+                            &parsed.wake_lookups,
                             &rank_of(adapters, meta.agent),
                             None,
                         )

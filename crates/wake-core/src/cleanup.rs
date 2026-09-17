@@ -1074,6 +1074,7 @@ mod tests {
                 meta: meta(&self.root, &r.native_id, 100),
                 units: vec![],
                 unknown_line_count: u32::from(text == "BAD"),
+                wake_lookups: Vec::new(),
             })
         }
         fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {

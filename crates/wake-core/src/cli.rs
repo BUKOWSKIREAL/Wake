@@ -788,6 +788,27 @@ pub fn path_command(cli_bin: &Path) -> Option<String> {
     path_hint(cli_bin)
 }
 
+/// 详情页 "Copy handoff" 复制的那段话:粘进另一家 agent 的输入框,它就知道去 Wake 读
+/// 这段会话——装了 MCP 的按 key 调 wake_get_session,只会 shell 的跑 wake-cli(#33 的
+/// 用户在手工拷文件路径给别家 agent 读,精简渲染比原始 JSONL 省得多)。两条路都认
+/// 裸 key,不再多一种 wake:// 形态要解释;`cli_bin` 找不到时退裸名,交对方的 PATH
+pub fn handoff_text(key: &str, title: &str, cli_bin: Option<&Path>) -> String {
+    let title = crate::text::one_line(title, 120);
+    let cli = cli_bin
+        .map(|p| sh_quote(&p.to_string_lossy()))
+        .unwrap_or_else(|| "wake-cli".to_string());
+    let opener = if title.is_empty() {
+        "Continue from an earlier coding-agent session indexed by Wake.".to_string()
+    } else {
+        format!("Continue from an earlier coding-agent session indexed by Wake: \"{title}\"")
+    };
+    format!(
+        "{opener}\nSession key: {key}\n\
+         Read it with the wake_get_session MCP tool (key above), or from a shell:\n\
+         {cli} show {key}\n"
+    )
+}
+
 /// `wake-cli setup` 要说的事实(由 bin 查好传进来,函数本身仍是纯的)
 pub struct SetupFacts<'a> {
     pub cli_bin: &'a Path,
@@ -890,6 +911,39 @@ mod tests {
 
     fn message(a: &[&str]) -> String {
         p(a).expect_err("should not parse").message
+    }
+
+    /// Copy handoff 的文本:key 出现两次(给 MCP 的与给 shell 的),wake-cli 路径按
+    /// POSIX 引号,标题折成一行;没标题就不留空引号,找不到 wake-cli 退裸名
+    #[test]
+    fn handoff_text_names_both_ways_in() {
+        let text = handoff_text(
+            "claude-code:abc",
+            "Fix the\nscanner  again",
+            Some(Path::new(
+                "/Applications/Wake Dev.app/Contents/MacOS/wake-cli",
+            )),
+        );
+        assert!(
+            text.starts_with(
+                "Continue from an earlier coding-agent session indexed by Wake: \"Fix the scanner again\"\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\nSession key: claude-code:abc\n"));
+        assert!(text.contains("wake_get_session"));
+        assert!(
+            text.ends_with(
+                "'/Applications/Wake Dev.app/Contents/MacOS/wake-cli' show claude-code:abc\n"
+            ),
+            "{text}"
+        );
+
+        let bare = handoff_text("codex:1", "", None);
+        assert!(
+            bare.starts_with("Continue from an earlier coding-agent session indexed by Wake.\n")
+        );
+        assert!(bare.ends_with("\nwake-cli show codex:1\n"), "{bare}");
     }
 
     /// 这个文件的看家测试:CLI 的旗标表与 MCP 工具的 inputSchema 必须双射。

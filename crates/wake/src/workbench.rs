@@ -2174,6 +2174,8 @@ pub struct Workbench {
     insights_range: InsightsRange,
     /// 三个榜单各自的度量档,按 UsageBoard 序数索引
     insights_metrics: [InsightsMetric; 3],
+    /// "Agents asking Wake" 当前档位(All / MCP / CLI)
+    insights_lookup_view: LookupView,
     /// 进行中的统计查询;新查询覆盖旧值即取消,扫描风暴下不堆积读锁竞争
     insights_task: Option<Task<()>>,
 
@@ -2259,6 +2261,50 @@ impl InsightsMetric {
         match self {
             Self::Tokens => fmt_tokens(Some(u.tokens)),
             _ => thousands(self.value(u)),
+        }
+    }
+}
+
+/// "Agents asking Wake" 的档位:两条接入合计,或只看其中一条。‹ › 循环,与榜单同形;
+/// MCP 那一路按工具名认、天然精确,CLI 那一路按命令文本认,分开看才知道噪音在哪
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LookupView {
+    All,
+    Mcp,
+    Cli,
+}
+
+impl LookupView {
+    /// 两键中间的档位名;MCP / CLI 是专名,不译
+    fn caption(self) -> &'static str {
+        match self {
+            Self::All => t("All"),
+            Self::Mcp => "MCP",
+            Self::Cli => "CLI",
+        }
+    }
+
+    fn value(self, l: &LookupTally) -> i64 {
+        match self {
+            Self::All => l.total(),
+            Self::Mcp => l.mcp,
+            Self::Cli => l.cli,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Cli,
+            Self::Mcp => Self::All,
+            Self::Cli => Self::Mcp,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Mcp,
+            Self::Mcp => Self::Cli,
+            Self::Cli => Self::All,
         }
     }
 }
@@ -2550,6 +2596,7 @@ impl Workbench {
             insights_loading: false,
             insights_range: InsightsRange::Hour,
             insights_metrics: [InsightsMetric::Sessions; 3],
+            insights_lookup_view: LookupView::All,
             insights_task: None,
             scan_events,
             watcher,
@@ -6513,13 +6560,7 @@ impl Workbench {
         // ---- 三个榜单的行首/名称(闭包只捕获 Copy 的色值) ----
         let dark = theme.mode.is_dark();
         let muted = theme.muted_foreground;
-        let agent_head = move |u: &UsageTally| {
-            (
-                AgentId::from_str(&u.name)
-                    .map(|a| img(a.brand_icon(dark)).size(px(15.)).into_any_element()),
-                agent_label(&u.name),
-            )
-        };
+        let agent_head = move |u: &UsageTally| agent_row_head(&u.name, dark);
         let project_head = move |u: &UsageTally| {
             (
                 Some(
@@ -6582,6 +6623,10 @@ impl Workbench {
                                 model_head,
                                 cx,
                             ))
+                        })
+                        // 末尾单独一块:上面全是"你怎么用 agent",这块是"agent 怎么用 Wake"
+                        .when(!d.wake_lookups_7d.is_empty(), |col| {
+                            col.child(self.render_lookups_section(d, cx))
                         }),
                 ),
             )
@@ -6717,6 +6762,77 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// "Agents asking Wake":Insights 末尾单独一块——前面全是"你怎么用 agent",这块
+    /// 是"agent 怎么用 Wake":近 7 天各家经 wake-mcp / wake-cli 查过往会话的次数,按
+    /// 调用时刻归窗。一条 hairline 隔开,自己的组头与说明;‹ › 在 All / MCP / CLI 间
+    /// 循环,行形制同 Agents 榜单;一次都没有就整组不画(与空榜单同规矩)。这是
+    /// mcp-roadmap 定的"MCP 接入有没有真实使用"的仪表(位置用户 2026-09-17 定)
+    fn render_lookups_section(&self, d: &InsightsData, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let dark = theme.mode.is_dark();
+        let view = self.insights_lookup_view;
+        let arrows = insight_arrows(
+            "lookups-arrow",
+            Some(view.caption().into()),
+            cx.listener(move |this, _, _window, cx| {
+                this.insights_lookup_view = view.prev();
+                cx.notify();
+            }),
+            cx.listener(move |this, _, _window, cx| {
+                this.insights_lookup_view = view.next();
+                cx.notify();
+            }),
+            cx,
+        );
+        let (mcp, cli) = d
+            .wake_lookups_7d
+            .iter()
+            .fold((0, 0), |(m, c), l| (m + l.mcp, c + l.cli));
+        let caption = crate::tp!(
+            "{} lookup in the last 7 days · {} via MCP · {} via CLI",
+            "{} lookups in the last 7 days · {} via MCP · {} via CLI",
+            mcp + cli,
+            mcp,
+            cli
+        );
+        let mut rows: Vec<&LookupTally> = d
+            .wake_lookups_7d
+            .iter()
+            .filter(|l| view.value(l) > 0)
+            .collect();
+        rows.sort_by_key(|l| std::cmp::Reverse(view.value(l)));
+        let max = rows.iter().map(|l| view.value(l)).max().unwrap_or(1);
+        v_flex()
+            .gap(SPACE_MD)
+            // hairline 把它和上面"你的活动"分成两域;到组头的距离补成一个区块间距
+            .child(
+                div()
+                    .w_full()
+                    .h(px(1.))
+                    .bg(theme.border)
+                    .mb(INSIGHTS_SECTION_GAP - SPACE_MD),
+            )
+            .child(switch_section_head(
+                t("Agents asking Wake"),
+                Some(caption.into()),
+                Some(arrows.into_any_element()),
+                cx,
+            ))
+            .children(rows.into_iter().map(|l| {
+                let (lead, label) = agent_row_head(&l.name, dark);
+                usage_bar_row(
+                    lead,
+                    label,
+                    thousands(view.value(l)).into(),
+                    view.value(l),
+                    max,
+                    UsageBoard::Agents.name_w(),
+                    cx,
+                )
+            }))
+            .into_any_element()
+    }
+
     #[allow(deprecated)]
     fn update_detail_selection_auto_scroll(
         &mut self,
@@ -6804,6 +6920,8 @@ impl Workbench {
             .disabled(detail.source_path.as_deref().is_none_or(str::is_empty))
             .on_click(cx.listener(|this, _, _, cx| this.copy_session_path(cx)));
         let session_id = meta.id.clone();
+        let session_key = meta.key.clone();
+        let session_title = meta.title.clone();
         let export_entity = cx.entity();
         let reveal_entity = export_entity.clone();
         let delete_entity = export_entity.clone();
@@ -6846,6 +6964,24 @@ impl Workbench {
                                 let id = session_id.clone();
                                 move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                                }
+                            }),
+                    )
+                    // 交接(#33 的后半):头部已有 Copy Session Path,这里再给一段对方能
+                    // 直接消费的话——key 加两种读法(MCP 的 wake_get_session / shell 的
+                    // wake-cli show),精简渲染比原始 JSONL 省得多。与 Copy Session ID
+                    // 一样不弹通知
+                    .item(
+                        PopupMenuItem::new(t(" Copy Handoff"))
+                            .icon(icon("icons/copy.svg").with_size(px(15.)))
+                            .on_click({
+                                let key = session_key.clone();
+                                let title = session_title.clone();
+                                move |_, _, cx| {
+                                    let cli = wake_core::mcp::sibling_file("wake-cli");
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        wake_core::cli::handoff_text(&key, &title, cli.as_deref()),
+                                    ));
                                 }
                             }),
                     )
@@ -7764,6 +7900,15 @@ fn agent_label(raw: &str) -> SharedString {
     AgentId::from_str(raw)
         .map(|a| a.display_name().into())
         .unwrap_or_else(|| raw.to_string().into())
+}
+
+/// 榜单里一行 agent 的行首与名称:15px 品牌图 + 显示名。Agents 榜与 Agents asking
+/// Wake 共用,"一行 agent 长什么样"只此一处
+fn agent_row_head(name: &str, dark: bool) -> (Option<AnyElement>, SharedString) {
+    (
+        AgentId::from_str(name).map(|a| img(a.brand_icon(dark)).size(px(15.)).into_any_element()),
+        agent_label(name),
+    )
 }
 
 /// 趋势图堆叠的序列数上限:前五个按总量降序各自着 agent 品牌色(见 theme.rs),

@@ -496,14 +496,14 @@ pub fn adapter_for<'a>(
 /// 查询(MCP 的 wake_* 工具、shell 里的 wake-cli / wake-mcp)不进索引:否则搜任何
 /// 词,第一条命中都是"上次搜这个词的那次调用",越用越吵(自指回声)。只跳过工具
 /// 那一段,消息正文照常——用户真写了 "wake-cli" 是内容,不是回声
-pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
+fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
     messages
         .iter()
         .filter(|m| m.kind == MessageKind::Text)
         .filter_map(|m| {
             let mut parts = vec![m.text.clone()];
             for tc in &m.tool_calls {
-                if is_wake_lookup(tc) {
+                if wake_lookup_kind(tc).is_some() {
                     continue;
                 }
                 parts.push(format!("{} {}", tc.name, tc.input_preview));
@@ -522,6 +522,44 @@ pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUn
             }
         })
         .collect()
+}
+
+/// agent 在这些消息里查 Wake 的每一次调用:units_from_messages 把这些调用从索引里
+/// 跳过,这里按同一判据逐次记下来(所在消息的 seq 与时间、走的接入、用的工具)落
+/// wake_lookups 表——mcp-roadmap 定的"MCP 接入有没有真实使用"的信号,过滤掉又不记,
+/// 那扇门就永远没有仪表(2026-09-16)
+fn wake_lookups_from_messages(messages: &[TranscriptMessage]) -> Vec<WakeLookup> {
+    messages
+        .iter()
+        .flat_map(|m| {
+            m.tool_calls.iter().filter_map(move |tc| {
+                let (channel, tool) = wake_lookup_kind(tc)?;
+                Some(WakeLookup {
+                    seq: m.seq,
+                    timestamp: m.timestamp,
+                    channel,
+                    tool,
+                })
+            })
+        })
+        .collect()
+}
+
+impl ParsedSession {
+    /// 十八家 parse_session 的唯一出口:解析层只产 meta + messages,入库派生
+    /// (FTS 单元、Wake 调用记录)全在这里——再加派生字段不用碰任何 adapter
+    pub(crate) fn derive(
+        meta: SessionMeta,
+        messages: &[TranscriptMessage],
+        unknown_line_count: u32,
+    ) -> Self {
+        Self {
+            units: units_from_messages(messages),
+            wake_lookups: wake_lookups_from_messages(messages),
+            meta,
+            unknown_line_count,
+        }
+    }
 }
 
 /// 记忆的一个读取单元:一个目录直属的 `*.<ext>`,或单个文件,带归属元数据。来源
@@ -1078,19 +1116,24 @@ pub fn expand_tilde(p: &str) -> String {
 /// Wake 自己的两个命令行二进制;在 shell 工具的 command 里以整词出现即视为在查 Wake
 const WAKE_BINARIES: [&str; 2] = ["wake-cli", "wake-mcp"];
 
-/// 这次工具调用是不是 agent 在查 Wake:MCP 工具按 `mcp::tools::NAMES` 认(加第五家
-/// 自动覆盖),客户端会给名字加自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,
-/// 别家形态不一),所以只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);
-/// 命令行则要求 wake-cli / wake-mcp 以整词出现在 shell 工具的 **command 字段**里——
-/// Grep 的 pattern、Read 的路径提到 wake-cli 是在读代码,不是查询(Codex review 2026-09-14)
-fn is_wake_lookup(tc: &ToolCallView) -> bool {
-    crate::mcp::tools::NAMES
+/// 这次工具调用是不是 agent 在查 Wake,是的话走的哪条接入、用的哪个工具(MCP 给契约
+/// 工具名,命令行给二进制名;None = 不是)。FTS 过滤只看 is_some,wake_lookups 表记账
+/// 要细分。MCP 工具按 `mcp::tools::NAMES` 认(加第五家自动覆盖),客户端会给名字加
+/// 自己的前缀(Claude Code / Codex 是 `mcp__wake__wake_search`,别家形态不一),所以
+/// 只看结尾、并要求前一个字符不是字母数字(`awake_search` 不算);命令行则要求
+/// wake-cli / wake-mcp 以整词出现在 shell 工具的 **command 字段**里——Grep 的 pattern、
+/// Read 的路径提到 wake-cli 是在读代码,不是查询(Codex review 2026-09-14)
+fn wake_lookup_kind(tc: &ToolCallView) -> Option<(LookupChannel, &'static str)> {
+    if let Some(tool) = crate::mcp::tools::NAMES
         .iter()
-        .any(|t| ends_with_word(&tc.name, t))
-        || (WAKE_BINARIES
-            .iter()
-            .any(|bin| names_binary(&tc.input_preview, bin))
-            && command_names_binary(tc))
+        .find(|t| ends_with_word(&tc.name, t))
+    {
+        return Some((LookupChannel::Mcp, *tool));
+    }
+    let bin = WAKE_BINARIES
+        .iter()
+        .find(|bin| names_binary(&tc.input_preview, bin))?;
+    command_names_binary(tc).then_some((LookupChannel::Cli, *bin))
 }
 
 /// 预览(对 shell 工具就是命令的前 200 字)提到了二进制名之后再看结构:只有输入对象的
@@ -1204,10 +1247,42 @@ mod tests {
         assert!(units[1].text.contains("wake-cli 的 --since"));
     }
 
+    /// 过滤掉的每一次调用都要逐次记下来,带所在消息的 seq、接入渠道与工具名;
+    /// 正文里提到 wake-cli 不算
+    #[test]
+    fn wake_lookups_are_recorded_per_call() {
+        let messages = [
+            msg(
+                0,
+                "看看历史",
+                &[
+                    ("mcp__wake__wake_search", "二维码"),
+                    ("Bash", "wake-cli search \"二维码\" --limit 3"),
+                    ("Read", "src/db.rs"),
+                ],
+            ),
+            msg(1, "", &[("wake_get_session", "claude-code:abc")]),
+            msg(2, "wake-cli 的 --since 该怎么写", &[]),
+        ];
+        let found: Vec<(i64, LookupChannel, &str)> = wake_lookups_from_messages(&messages)
+            .iter()
+            .map(|l| (l.seq, l.channel, l.tool))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (0, LookupChannel::Mcp, "wake_search"),
+                (0, LookupChannel::Cli, "wake-cli"),
+                (1, LookupChannel::Mcp, "wake_get_session"),
+            ]
+        );
+        assert!(wake_lookups_from_messages(&messages[2..]).is_empty());
+    }
+
     #[test]
     fn wake_lookup_detection_is_narrow() {
         let lookup = |name: &str, preview: &str, input: Option<&str>| {
-            is_wake_lookup(&tc(name, preview, input))
+            wake_lookup_kind(&tc(name, preview, input)).is_some()
         };
         assert!(lookup("mcp__wake__wake_list_projects", "", None));
         assert!(lookup("wake_search", "x", None));

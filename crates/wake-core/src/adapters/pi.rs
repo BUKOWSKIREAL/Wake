@@ -1,6 +1,6 @@
 use super::parse_utils::*;
 use super::pi_format::{PiRender, PiRenderOptions};
-use super::{units_from_messages, AgentAdapter};
+use super::AgentAdapter;
 use crate::models::*;
 use anyhow::Result;
 use std::fs;
@@ -183,12 +183,11 @@ impl AgentAdapter for PiAdapter {
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
         let parsed = parse_pi_jsonl(Path::new(&r.file_path), false)?;
         let meta = build_meta(self.agent, r, &parsed);
-        let units = units_from_messages(&parsed.messages);
-        Ok(ParsedSession {
+        Ok(ParsedSession::derive(
             meta,
-            units,
-            unknown_line_count: parsed.unknown_lines,
-        })
+            &parsed.messages,
+            parsed.unknown_lines,
+        ))
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
