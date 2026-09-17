@@ -119,7 +119,8 @@ To make this automatic instead of per-project, install the skill (next section).
 
 ## Teaching an agent to use it
 
-Two ways, same content.
+Two ways to teach it, same content — and a third that skips the teaching by handing the
+agent this project's recent sessions before it asks.
 
 **A skill, once, for every project** — the repository ships one at `skills/wake/`:
 
@@ -136,7 +137,46 @@ an error has been seen before — and how to read keys, references and pages.
 into that project's `CLAUDE.md` or `AGENTS.md`. Use this when you would rather not
 install anything, or want the guidance to live in the repository.
 
-Neither writes to another tool's configuration; Wake only ever prints.
+**Automatically, at session start (Claude Code)** — a `SessionStart` hook runs a command
+when a session begins and hands its output to the agent as context. This one lists the
+project's recent sessions, so the agent already knows what happened here before you say
+"continue from yesterday":
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wake-cli sessions --project \"$CLAUDE_PROJECT_DIR\" --limit 5 --since 14d 2>/dev/null || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Put it in `~/.claude/settings.json` to get it in every project, or in a project's
+`.claude/settings.json`. A few things to know:
+
+- If `wake-cli` is not on your `PATH`, use its full path (see *Where it lives*).
+- Keep the trailing `|| true`. A hook that exits `2` stops the session from starting, and
+  `wake-cli` exits `2` when there is no index yet.
+- What gets injected is titles, keys and dates — a handful of lines, not transcripts. The
+  agent still reads a session with `show` when it needs the details.
+- `startup|resume` skips `/clear` and compaction; drop the matcher to run on those too.
+- A lookup made by the hook is not the agent asking Wake, so it does not show up in
+  Insights under *Agents asking Wake*; the lookups the agent then makes on its own do.
+- Only Claude Code has this hook. Codex and Gemini CLI have no equivalent, so there the
+  skill is the way in.
+
+None of the three writes to another tool's configuration; Wake only ever prints, and the
+hook is yours to add.
 
 ### `index`
 

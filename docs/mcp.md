@@ -85,6 +85,10 @@ Before asking me for context about this repository, check earlier sessions with 
 wake_list_sessions with the current directory, then wake_get_session for the relevant one.
 ```
 
+Claude Code can also be handed the project's recent sessions automatically when a session
+starts, through a `SessionStart` hook that runs `wake-cli` — see
+[Automatically, at session start](cli.md#teaching-an-agent-to-use-it) in the command-line guide.
+
 ### A worked example
 
 ```

@@ -124,7 +124,7 @@ wake-cli setup                                    # path, PATH setup, and a bloc
 
 It prints what the MCP tools return, asserted byte for byte in the test suite apart from a trailing newline the CLI adds, so an agent driving it through a shell sees what a connected one does. Full reference in [docs/cli.md](docs/cli.md).
 
-To make an agent reach for it without being told, install the bundled skill with `npx skills add iAmCorey/Wake` (or copy `skills/wake/` into `~/.claude/skills/wake/`).
+To make an agent reach for it without being told, install the bundled skill with `npx skills add iAmCorey/Wake` (or copy `skills/wake/` into `~/.claude/skills/wake/`). Claude Code can go one step further and receive the project's recent sessions the moment a session starts, through a `SessionStart` hook that runs `wake-cli` — the recipe is in [docs/cli.md](docs/cli.md#teaching-an-agent-to-use-it).
 
 ## Language
 
