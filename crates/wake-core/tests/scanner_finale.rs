@@ -75,6 +75,72 @@ fn temp_store(dir: &Path) -> Arc<Store> {
     Arc::new(Store::open(&dir.join("scan.db")).expect("open store"))
 }
 
+/// `spawn_agent` 子代理端到端:进索引、不出现在顶层列表、parent_key 指向
+/// 父线程,父行的子会话计数认得它(issue #42)
+/// Codex 的登记表是 home 的一张总表,不像 grok 的边车长在 parent 自己的
+/// location 里:用户给某个更深的目录单独加了 location 之后,两个文件都归那个
+/// 实例,而边只有 home 实例报得出来。"报边者必须拥有 parent"那条按 grok 写的
+/// 规矩会把这种边整条丢掉,子会话于是静默变回顶层
+#[test]
+fn codex_spawn_links_survive_a_deeper_custom_location() {
+    let home = tempfile::tempdir().unwrap();
+    let (parent_id, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    // 默认实例(有 state DB、报得出边)在前,更深的自定义 location 在后——
+    // 后者按最长根拥有这两个 rollout
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().to_path_buf()),
+        CodexAdapter::new().with_custom_root(home.path().join("sessions/2026/09/16")),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    assert_eq!(
+        store
+            .parent_key_of(&format!("codex:{child_id}"))
+            .unwrap()
+            .as_deref(),
+        Some(format!("codex:{parent_id}").as_str())
+    );
+}
+
+#[test]
+fn codex_spawned_subagents_nest_under_their_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let (parent_id, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(home.path().to_path_buf())];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let parent_key = format!("codex:{parent_id}");
+    let child_key = format!("codex:{child_id}");
+    let child = store.get_session(&child_key).unwrap().expect("子代理入库");
+    assert_eq!(child.title, "review_issue17");
+    assert_eq!(
+        store.parent_key_of(&child_key).unwrap().as_deref(),
+        Some(parent_key.as_str())
+    );
+
+    let filter = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!(total, 1, "子代理不进顶层列表");
+    assert_eq!(roots[0].key, parent_key);
+    assert_eq!(
+        store
+            .child_counts(&filter)
+            .unwrap()
+            .get(&parent_key)
+            .copied(),
+        Some(1)
+    );
+}
+
 #[test]
 fn finale_fires_on_empty_scan() {
     let dir = tempfile::tempdir().unwrap();

@@ -579,8 +579,9 @@ fn codex_internal_threads_are_excluded_at_the_file_boundary() {
     let spawn = serde_json::json!({
         "parent_thread_id": id(99), "depth": 1, "agent_path": "/root/research"
     });
-    // 隐藏的那组是上游各种落盘形态的抽样:`source` 是对象这一条就够判,列全是
-    // 为了谁把它收窄成按路径取值(pointer("/source/subagent/other"))时立刻红
+    // 对象来源默认即噪音,唯一的例外是 `subagent.thread_spawn`(issue #42)。
+    // 列全上游各种落盘形态,是为了谁把默认那一侧从"除 thread_spawn 外全挡"
+    // 收窄成白名单(只认 review/compact 几个词)时立刻红
     let cases = [
         // guardian auto-review:早期写端 thread_source 仍是 subagent;只带对象;
         // issue #30 的过渡格式只带 thread_source;字符串来源 + thread_source=subagent
@@ -588,15 +589,16 @@ fn codex_internal_threads_are_excluded_at_the_file_boundary() {
         (meta(2, serde_json::json!({"source": {"subagent": {"other": "guardian"}}})), false),
         (meta(3, serde_json::json!({"source": "cli", "thread_source": "guardian_review"})), false),
         (meta(4, serde_json::json!({"source": "exec", "thread_source": "subagent"})), false),
-        // `/review`、compaction、thread_spawn 子代理
+        // `/review`、compaction
         (meta(5, serde_json::json!({"source": {"subagent": "review"}, "thread_source": "subagent"})), false),
         (meta(6, serde_json::json!({"source": {"subagent": "compact"}, "thread_source": "subagent"})), false),
-        (meta(7, serde_json::json!({"parent_thread_id": id(99), "source": {"subagent": {"thread_spawn": spawn}}, "thread_source": "subagent"})), false),
         // memory consolidation 的 subagent / internal 两种写法;上游今天落盘前会把
         // Internal(Guardian) 改写成 subagent/other,哪天不改写了也要认
         (meta(8, serde_json::json!({"source": {"subagent": "memory_consolidation"}})), false),
         (meta(9, serde_json::json!({"source": {"internal": "memory_consolidation"}, "thread_source": "memory_consolidation"})), false),
         (meta(10, serde_json::json!({"source": {"internal": "guardian"}, "thread_source": "guardian_review"})), false),
+        // `spawn_agent` 子代理:同样是 subagent/对象来源,但它是用户自己派的活
+        (meta(7, serde_json::json!({"source": {"subagent": {"thread_spawn": spawn}}, "thread_source": "subagent"})), true),
         // 用户线程:字符串来源的各种写法,含 `codex exec --thread-source` 的 Feature 标签
         (meta(11, serde_json::json!({"source": "vscode", "thread_source": "user"})), true),
         (meta(12, serde_json::json!({"source": "exec"})), true),
@@ -656,6 +658,283 @@ fn codex_internal_threads_are_excluded_at_the_file_boundary() {
         .map(|r| r.native_id)
         .collect();
     assert_eq!(actual, expected, "full scan must use the same boundary");
+}
+
+/// `spawn_agent` 子代理进索引(issue #42),但 `fork_turns` 复制进来的父线程
+/// 历史必须整段折掉:原样入库就是子线程偷走父线程的标题、父线程每一轮在
+/// FTS 里出现两次、Insights 的 prompt 数翻倍。分界点认首行的
+/// `subagent_history_start_ordinal`,子线程自己的工具调用必须活下来——折叠是
+/// 按下标 splice 的,而工具调用默认挂在"最后一条助手消息"上,fork 段以助手
+/// 消息收尾时那一条正在待删区里
+#[test]
+fn codex_spawned_subagent_keeps_only_its_own_turns() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let (parent_id, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+
+    let refs = adapter.list_session_files().unwrap();
+    let ids: HashSet<String> = refs.iter().map(|r| r.native_id.clone()).collect();
+    assert_eq!(
+        ids,
+        HashSet::from([parent_id.clone(), child_id.clone()]),
+        "子代理必须与父线程一起进索引"
+    );
+
+    let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+    let parsed = adapter.parse_session(child).unwrap();
+    assert_eq!(
+        parsed.meta.title, "review_issue17",
+        "标题取 spawn_agent 的任务名:子线程自己没有用户消息"
+    );
+
+    let transcript = adapter.parse_transcript(child).unwrap();
+    let visible: Vec<&TranscriptMessage> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .collect();
+    let text: String = visible
+        .iter()
+        .map(|m| m.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("inherited"),
+        "fork 段整段折成一条 Meta:{text}"
+    );
+    assert!(text.contains("child found the missing dependency array"));
+    let tools: Vec<&ToolCallView> = visible.iter().flat_map(|m| &m.tool_calls).collect();
+    assert_eq!(
+        tools.len(),
+        1,
+        "子线程自己的工具调用不得随 fork 段一起被删掉"
+    );
+    assert_eq!(tools[0].output.as_deref(), Some("CHILD_TOOL_OUTPUT"));
+
+    let indexed: String = parsed
+        .units
+        .iter()
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !indexed.contains("inherited"),
+        "父线程的话不得在子线程里再进一次 FTS:{indexed}"
+    );
+    // seq 契约:两侧解析器同源,FTS 单元的 seq 必须等于详情页的消息序号
+    assert_eq!(parsed.units[0].seq, visible[0].seq);
+
+    assert_eq!(
+        adapter.parent_links(),
+        vec![(format!("codex:{child_id}"), format!("codex:{parent_id}"))]
+    );
+}
+
+/// 首行没写 `subagent_history_start_ordinal`(老写端)时退回派活信封,并且
+/// **认收件人**:fork 段里那封发给 `/root/other_task` 的信不算数
+#[test]
+fn codex_spawn_cut_falls_back_to_the_dispatch_envelope() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let (_, child_id, child_path) = common::stage_codex_spawn_pair(home.path());
+    strip_history_ordinal(&child_path);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let refs = adapter.list_session_files().unwrap();
+    let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+    let parsed = adapter.parse_session(child).unwrap();
+    assert_eq!(parsed.meta.title, "review_issue17");
+    let indexed: String = parsed
+        .units
+        .iter()
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!indexed.contains("inherited"), "{indexed}");
+    assert!(indexed.contains("child found the missing dependency array"));
+}
+
+/// 既没有权威 ordinal、又认不出发给自己的信封(半写入、未来格式、agent_path
+/// 缺失)就**一条都不折**:内容多一份好过凭空消失,与"首行判不出用途一律保守
+/// 放行"同一取舍。退回"第一条信封"才是要防的事——那会在 fork 段中间切一刀
+#[test]
+fn codex_spawn_without_a_usable_cut_keeps_everything() {
+    setup();
+    for blank_agent_path in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let (_, child_id, child_path) = common::stage_codex_spawn_pair(home.path());
+        let mut head = strip_history_ordinal(&child_path);
+        if blank_agent_path {
+            // agent_path 认不出来:不得退化成"第一条 agent_message 就是分界"
+            head["payload"]["source"]["subagent"]["thread_spawn"]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent_path");
+            head["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent_path");
+        } else {
+            // 信封整行不见了,但子线程首行还在,它仍然是子代理
+            let rest = fs::read_to_string(&child_path).unwrap();
+            let kept: String = rest
+                .lines()
+                .filter(|line| !line.contains("\"recipient\":\"/root/review_issue17\""))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            fs::write(&child_path, kept).unwrap();
+        }
+        if blank_agent_path {
+            rewrite_head(&child_path, &head);
+        }
+
+        let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+        let refs = adapter.list_session_files().unwrap();
+        let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+        let parsed = adapter.parse_session(child).unwrap();
+        let indexed: String = parsed
+            .units
+            .iter()
+            .map(|u| u.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            indexed.contains("inherited parent turn") && indexed.contains("missing dependency"),
+            "blank_agent_path={blank_agent_path}: {indexed}"
+        );
+        // 仍然认得出是子代理,所以标题还是任务名(agent_path 抹掉那次退昵称)
+        let expected = if blank_agent_path {
+            "Wegener"
+        } else {
+            "review_issue17"
+        };
+        assert_eq!(
+            parsed.meta.title, expected,
+            "blank_agent_path={blank_agent_path}"
+        );
+    }
+}
+
+/// 只跑了工具、还没出正文的子代理:`has_real` 为假,折叠若在 event_fallback
+/// 里留下标记,那条标记会把子线程自己的 response_item 整条流挤掉
+#[test]
+fn codex_running_subagent_keeps_its_tool_calls_over_the_event_stream() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let (_, child_id, child_path) = common::stage_codex_spawn_pair(home.path());
+    // 权威 ordinal 去掉,改由信封定界(下面要往 fork 段里插行,插了 ordinal 就
+    // 对不上了);fork 段补一条 event_msg 让 event_fallback 非空,子线程自己
+    // 那段只留工具调用(删掉它的助手正文)
+    strip_history_ordinal(&child_path);
+    let event = serde_json::json!({
+        "timestamp": "2026-09-16T09:05:00.000Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "inherited parent turn about the qr login bug"}
+    });
+    let mut kept: Vec<String> = Vec::new();
+    for line in fs::read_to_string(&child_path).unwrap().lines() {
+        if line.contains("child found the missing dependency array") {
+            continue;
+        }
+        if line.contains("\"recipient\":\"/root/review_issue17\"") {
+            kept.push(event.to_string());
+        }
+        kept.push(line.to_string());
+    }
+    fs::write(
+        &child_path,
+        kept.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let refs = adapter.list_session_files().unwrap();
+    let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+    let transcript = adapter.parse_transcript(child).unwrap();
+    let tools: Vec<&ToolCallView> = transcript
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .collect();
+    assert_eq!(tools.len(), 1, "{:#?}", transcript.mainline);
+    assert_eq!(tools[0].output.as_deref(), Some("CHILD_TOOL_OUTPUT"));
+}
+
+/// 父子关系只认 state DB 的 thread_spawn_edges——它与 quick_meta 的 key 同一
+/// id 空间,而且每次都是现问磁盘,不受"本进程扫到哪了"影响。代价写在这里:
+/// 没有 state DB 的根认不出关系,子线程降级成带任务名的顶层会话,不是 Untitled
+#[test]
+fn codex_spawn_links_need_the_state_db_registry() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let (_, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    fs::remove_file(home.path().join("state_5.sqlite")).unwrap();
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let refs = adapter.list_session_files().unwrap();
+    assert!(adapter.parent_links().is_empty());
+    let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+    assert_eq!(
+        adapter.parse_session(child).unwrap().meta.title,
+        "review_issue17"
+    );
+}
+
+/// 子代理线程的 state 行没有手工命名时,Codex 自动生成的 title 是按 fork 进来
+/// 的父线程对话编的,不能拿它盖掉任务名(0.6.6 修掉的"标题是父会话的副本")
+#[test]
+fn codex_spawn_title_survives_codex_auto_title() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let (_, child_id, _) = common::stage_codex_spawn_pair(home.path());
+    let conn = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE threads SET title = 'inherited parent turn about the qr login bug' WHERE id = ?1",
+        rusqlite::params![child_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let refs = adapter.list_session_files().unwrap();
+    let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
+    let quick = adapter.quick_meta(&refs).expect("state db readable");
+    let parsed = adapter.parse_session(child).unwrap();
+    let merged = adapter.merge_quick_meta(parsed.meta, quick.get(&child.file_path).unwrap());
+    assert_eq!(merged.title, "review_issue17");
+
+    // 用户手工命名(name 列)仍然说了算
+    let conn = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE threads SET name = 'Renamed by user' WHERE id = ?1",
+        rusqlite::params![child_id],
+    )
+    .unwrap();
+    drop(conn);
+    let quick = adapter.quick_meta(&refs).unwrap();
+    let parsed = adapter.parse_session(child).unwrap();
+    let merged = adapter.merge_quick_meta(parsed.meta, quick.get(&child.file_path).unwrap());
+    assert_eq!(merged.title, "Renamed by user");
+}
+
+/// 子线程首行:去掉权威 ordinal,返回改过的首行 JSON 供调用方继续改
+fn strip_history_ordinal(child_path: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(child_path).unwrap();
+    let (head, rest) = text.split_once('\n').unwrap();
+    let mut head: serde_json::Value = serde_json::from_str(head).unwrap();
+    head["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("subagent_history_start_ordinal");
+    fs::write(child_path, format!("{head}\n{rest}")).unwrap();
+    head
+}
+
+fn rewrite_head(child_path: &Path, head: &serde_json::Value) {
+    let text = fs::read_to_string(child_path).unwrap();
+    let (_, rest) = text.split_once('\n').unwrap();
+    fs::write(child_path, format!("{head}\n{rest}")).unwrap();
 }
 
 #[test]

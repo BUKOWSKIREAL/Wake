@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Update: Codex sub-agents started with `spawn_agent` are indexed again, nested under the session that spawned them and titled with their task name; the parent's conversation that Codex copies into each sub-agent is folded away so it is only indexed once. The guardian auto-review, `/review`, compaction and memory-consolidation threads stay excluded. In the MCP tools and `wake-cli`, a session now names its parent and lists its child sessions, for every agent that has them (#42, thanks @ShadowySpirits). Existing indexes are re-read once after upgrading
 - New: ZCode (Z.ai's GLM-5.3 desktop harness) sessions are indexed from its local database — titles, models, tool calls and token counts included. Forks and side chats are listed like any other conversation; sub-agent runs and conversations imported from Claude Code are left out so nothing appears twice. Read-only, and no Open In: the app has no command line to resume from
 
 ## [0.7.0] — 2026-09-16

@@ -135,7 +135,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
 /// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声,
 /// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token,
 /// "4" = Cursor 项目路径优先读取工作区元数据,并恢复 slug 中的空格。
-pub const FTS_FORMAT: &str = "4";
+pub const FTS_FORMAT: &str = "5";
 
 fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -1300,11 +1300,8 @@ impl Store {
     pub fn parent_key_of(&self, key: &str) -> Result<Option<String>> {
         let conn = self.read.lock().unwrap();
         let value: Option<String> = conn
-            .query_row(
-                "SELECT NULLIF(parent_key, '') FROM sessions WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT NULLIF(parent_key, '') FROM sessions WHERE key = ?1")?
+            .query_row(params![key], |row| row.get(0))
             .optional()?
             .flatten();
         Ok(value)

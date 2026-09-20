@@ -743,6 +743,57 @@ fn find_session(store: &Store, key: &str) -> Result<Result<SessionMeta, String>,
 
 /// 主线页脚最多列多少个子代理转录;再多就 "… and N more"(Task 开得多的会话有上百个)
 const MAX_SUBAGENTS_LISTED: usize = 30;
+/// 子会话页脚的同款预算(与上面那个各自独立:一条会话可以既有子会话又有
+/// 侧边转录,两张清单不共享额度)
+const MAX_CHILDREN_LISTED: usize = 30;
+
+/// 挂在这条会话下面的子会话。它们是完整会话(各有 key、各自可分页读),
+/// 但 `wake_list_sessions` 只给根(roots_only),所以父会话是唯一的发现
+/// 入口——Codex 的 `spawn_agent` 子代理、Grok 的子会话都走这里。
+/// 与侧边的 subagent 转录不是一回事:那些没有自己的 key,按 id 读
+fn child_sessions(ctx: &ToolContext, parent_key: &str) -> Vec<SessionMeta> {
+    // 字段全列、不带 ..Default:新增筛选字段时这里必须表态(与 workbench
+    // current_filter 同一约定)。list_children 不在 SQL 里限量,上限在下面截
+    ctx.store
+        .list_children(
+            parent_key,
+            &SessionFilter {
+                agents: Vec::new(),
+                favorite_only: false,
+                include_archived: false,
+                roots_only: false,
+                title_query: None,
+                sort: SortKey::Updated,
+                ascending: false,
+                limit: 0,
+                offset: 0,
+                updated_since: None,
+                project_paths: Vec::new(),
+                ignore_pins: true,
+            },
+        )
+        .unwrap_or_default()
+}
+
+fn child_lines(children: &[SessionMeta]) -> String {
+    let mut out = String::new();
+    for child in children.iter().take(MAX_CHILDREN_LISTED) {
+        out.push_str(&format!(
+            "- `{}` — \"{}\" · {} message{}\n",
+            child.key,
+            one_line(&child.title, 120),
+            child.message_count,
+            plural(child.message_count)
+        ));
+    }
+    if children.len() > MAX_CHILDREN_LISTED {
+        out.push_str(&format!(
+            "- … and {} more\n",
+            children.len() - MAX_CHILDREN_LISTED
+        ));
+    }
+    out
+}
 
 /// `agent-a1b2 — Explore: find the watcher code`;没有边车信息时只有 id
 fn subagent_label(sc: &SidechainInfo) -> String {
@@ -894,6 +945,11 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     if !meta.host.is_empty() {
         facts.push(format!("host: @{}", meta.host));
     }
+    // 子会话给出回父会话的路:它自己不在 wake_list_sessions 的结果里,
+    // 读者多半是顺着搜索命中落进来的,得知道上下文挂在哪
+    if let Ok(Some(parent)) = ctx.store.parent_key_of(&meta.key) {
+        facts.push(format!("parent: `{parent}`"));
+    }
     if let Some((info, _)) = &sidechain {
         facts.push(format!("subagent: {}", subagent_label(info)));
     }
@@ -936,6 +992,26 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str(&facts.join(" · "));
     out.push_str("\n\n");
 
+    // 子会话页脚在空页上也得给:`wake_list_sessions` 只回根会话,父会话是
+    // 它们唯一的发现入口,而"这一页什么都没渲染"(整条都是 Meta、from_seq
+    // 翻过了尾)与"没有子会话"是两回事
+    let children = if sub_id.is_none() {
+        child_sessions(ctx, &meta.key)
+    } else {
+        Vec::new()
+    };
+    let children_footer = |out: &mut String| {
+        if children.is_empty() {
+            return;
+        }
+        out.push_str(&format!(
+            "{} child session{} (read one with {GET_SESSION} using its key):\n{}",
+            children.len(),
+            plural(children.len() as i64),
+            child_lines(&children)
+        ));
+    };
+
     if page.rendered == 0 {
         out.push_str(&match last_seq {
             Some(last) => format!(
@@ -943,6 +1019,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
             ),
             None => "This transcript has no messages.\n".to_string(),
         });
+        children_footer(&mut out);
         return Ok(out);
     }
     out.push_str(&page.text);
@@ -965,14 +1042,18 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     }
     out.push_str(&summary);
     out.push_str(".\n");
-    // 主线页脚列出子代理转录:它们不并进主线(各有自己的 seq),按 id 单独读
-    if sub_id.is_none() && !transcript.sidechains.is_empty() {
-        out.push_str(&format!(
-            "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
-            transcript.sidechains.len(),
-            plural(transcript.sidechains.len() as i64),
-            subagent_lines(&transcript.sidechains, Some(MAX_SUBAGENTS_LISTED))
-        ));
+    // 主线页脚两张清单:挂在这条会话下面的子会话(有自己的 key,按 key 读),
+    // 与侧边的子代理转录(不并进主线、各有自己的 seq,按 id 读)
+    children_footer(&mut out);
+    if sub_id.is_none() {
+        if !transcript.sidechains.is_empty() {
+            out.push_str(&format!(
+                "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
+                transcript.sidechains.len(),
+                plural(transcript.sidechains.len() as i64),
+                subagent_lines(&transcript.sidechains, Some(MAX_SUBAGENTS_LISTED))
+            ));
+        }
     }
     let with_sub = sub_id
         .map(|id| format!("subagent=\"{id}\" and "))

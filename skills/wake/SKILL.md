@@ -63,7 +63,9 @@ wake-cli show 'claude-code:1b2c3d4e-…'
 Add `--tools` for tool inputs and outputs, `--thinking` for recorded reasoning. Both are
 verbose — start without them. Work done by subagents (Claude Code sidechains, Cursor
 subagents) is not in the main transcript; its ids are listed at the end of the output —
-read one with `--subagent ID`, or `--subagent '*'` to list them all.
+read one with `--subagent ID`, or `--subagent '*'` to list them all. Sub-agents that run
+as sessions of their own (Codex `spawn_agent`, Grok) are listed at the end too, by key;
+`sessions` only lists parents, so this is where to find them.
 
 **Which projects have history**
 

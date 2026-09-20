@@ -498,6 +498,19 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
 
     let mut changed = false;
     for agent in managed_agents {
+        // 这一家眼下一条关系都没有、库里也没有:整段对账是纯浪费——
+        // session_sources_for_agent 要把这家全部会话读一遍,replace_parent_links
+        // 还要开写事务与扫描线程抢锁。watcher 只要**任一**受影响 agent 管关系
+        // 就会走到这里,而多数 agent 常年零关系(Codex 是 spawn_agent 用过才有)
+        let current = store.parent_links_for_agent(agent)?;
+        let has_links = links_by_adapter
+            .iter()
+            .enumerate()
+            .any(|(ix, links)| adapters[ix].agent() == agent && !links.is_empty());
+        if !has_links && current.is_empty() {
+            continue;
+        }
+
         let sources = store.session_sources_for_agent(agent)?;
         let mut source_by_key = std::collections::HashMap::new();
         let mut owner_by_key = std::collections::HashMap::new();
@@ -523,6 +536,25 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
                 }
             }
         }
+        // 上面那条"报边的实例必须拥有 parent"是照 Grok 写的:它的边车长在
+        // parent 自己的 location 里,报边者天然就是拥有者。Codex 的
+        // thread_spawn_edges 是 home 的一张总表,parent 的胜出文件完全可能
+        // 归另一个同家实例(用户给某个备份目录加了 location)。所以补一轮:
+        // 上一轮没认领的 child,只要 parent 确实在库里就接受——先来后到按
+        // roster 顺序,权威那一轮的结论不会被这一轮盖掉
+        for (adapter_ix, links) in links_by_adapter.iter().enumerate() {
+            if adapters[adapter_ix].agent() != agent {
+                continue;
+            }
+            for (child, parent) in links {
+                if source_by_key.contains_key(child)
+                    && owner_by_key.contains_key(parent)
+                    && !direct.contains_key(child)
+                {
+                    direct.insert(child.clone(), parent.clone());
+                }
+            }
+        }
 
         // 各 location 只能看见自己的直接/局部链；合并后再走到全局 root。
         let mut desired_map = std::collections::HashMap::new();
@@ -532,12 +564,33 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
             }
         }
 
+        // 仍被 adapter 声称的关系,不算"已解除"。parent 行这一刻不在库里是
+        // 常态:watcher 的增量不走 SCAN_GATE,与全量扫描并发,一批事件很可能
+        // 在 parent 写进库之前就读了 sources 快照。少了这道判断,这一批会拿
+        // replace_parent_links 的整家清空把全量刚建好的关系抹掉,而 Codex 没有
+        // is_parent_link_event、state DB 也不在监听路径里,没有第二次机会补救
+        let asserted: std::collections::HashSet<(&str, &str)> = links_by_adapter
+            .iter()
+            .enumerate()
+            .filter(|(adapter_ix, _)| adapters[*adapter_ix].agent() == agent)
+            .flat_map(|(_, links)| {
+                links
+                    .iter()
+                    .map(|(child, parent)| (child.as_str(), parent.as_str()))
+            })
+            .collect();
+
         // replace_parent_links 会把关系内 child 的 project 覆写成父项目。关系
         // 解除或换父时，先从 child 自己的胜出文件重解析，恢复 fallback project；
         // 解析失败则保留仍有效的旧关系，下一次 Grok 事件继续重试。
-        let current = store.parent_links_for_agent(agent)?;
         for (child, old_parent) in current {
             if desired_map.get(&child) == Some(&old_parent) {
+                continue;
+            }
+            // 保留不会留下悬空关系:replace_parent_links 的 UPDATE 带
+            // EXISTS(parent),parent 真没了这条边写不进去
+            if asserted.contains(&(child.as_str(), old_parent.as_str())) {
+                desired_map.insert(child, old_parent);
                 continue;
             }
             let restored = source_by_key.get(&child).is_some_and(|file_path| {

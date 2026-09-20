@@ -61,7 +61,7 @@ wake-cli search -- --dry-run          # a query that starts with a dash
 
 ### `sessions`
 
-The most recently updated sessions. Subagent sessions Wake tracks on their own (Grok) are folded into their parents; Claude Code and Cursor subagent transcripts live inside their session and are read with `show --subagent`; Codex's background threads (auto-review, `/review`, compaction, memory consolidation, spawned sub-agents) are not indexed at all. Archived sessions are excluded. This is what to run when you want the key of "the session from yesterday".
+The most recently updated sessions. Sub-agents that their agent records as sessions of their own (Codex `spawn_agent`, Grok) are folded into their parents — `show` on the parent lists them by key; Claude Code and Cursor subagent transcripts live inside their session and are read with `show --subagent`; Codex's background threads (auto-review, `/review`, compaction, memory consolidation) are not indexed at all. Archived sessions are excluded. This is what to run when you want the key of "the session from yesterday".
 
 Same options as `search`, plus `--starred` (only sessions you starred in Wake). `--limit` defaults to 20, max 100.
 

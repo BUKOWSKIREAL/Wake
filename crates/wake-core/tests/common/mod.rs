@@ -14,6 +14,184 @@ pub fn fixture(rel: &str) -> PathBuf {
         .join(rel)
 }
 
+/// 一个最小的 Codex home:state DB + 一条用户线程 + 一条 `spawn_agent` 子线程。
+/// 子线程的前半段是 `fork_turns` 复制进来的父线程历史,分界点由首行的
+/// `subagent_history_start_ordinal` 指定(真机形态,实测 0.151 会写);那一段里
+/// 还夹着一封发给**别的**子代理的派活信封,用来卡住"认收件人而不是认第一条
+/// 信封"这条兜底判据。fork 段**以助手消息收尾**、子线程自己**从工具调用开头**
+/// ——这正是折叠会把子线程自己的工具调用一起 splice 掉的形状。父子关系登记在
+/// state DB 的 thread_spawn_edges 里。adapter_contracts 与 scanner_finale 共用
+/// 一份,免得两边各写一套慢慢漂开。返回 (父线程 id, 子线程 id, 子线程文件路径)
+pub fn stage_codex_spawn_pair(home: &Path) -> (String, String, PathBuf) {
+    let parent_id = "11111111-aaaa-4bbb-8ccc-000000000001".to_string();
+    let child_id = "22222222-aaaa-4bbb-8ccc-000000000002".to_string();
+    let day = home.join("sessions/2026/09/16");
+    fs::create_dir_all(&day).unwrap();
+
+    // Codex 给每行编 ordinal(= 行号);子线程首行的
+    // subagent_history_start_ordinal 就是按它指的
+    let write_jsonl = |path: &Path, lines: &[serde_json::Value]| {
+        let text: String = lines
+            .iter()
+            .enumerate()
+            .map(|(ordinal, line)| {
+                let mut line = line.clone();
+                line["ordinal"] = serde_json::json!(ordinal);
+                format!("{line}\n")
+            })
+            .collect();
+        fs::write(path, text).unwrap();
+    };
+    let session_meta = |id: &str, extra: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "id": id,
+            "timestamp": "2026-09-16T09:00:00.000Z",
+            "cwd": "/work/wake",
+            "originator": "codex_cli_rs"
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": payload
+        })
+    };
+    let message = |role: &str, text: &str| {
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:05:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": text}]
+            }
+        })
+    };
+    // 派活信封:抬头明文、Payload 加密,与实测形态一致
+    let dispatch = |to: &str| {
+        serde_json::json!({
+            "timestamp": "2026-09-16T09:30:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": to,
+                "content": [
+                    {"type": "input_text", "text": format!("Message Type: NEW_TASK\nTask name: {to}\nSender: /root\nPayload:\n")},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAAB-opaque"}
+                ]
+            }
+        })
+    };
+
+    let parent_head = session_meta(
+        &parent_id,
+        serde_json::json!({"source": "cli", "thread_source": "user"}),
+    );
+    write_jsonl(
+        &day.join(format!("rollout-2026-09-16T09-00-00-{parent_id}.jsonl")),
+        &[
+            parent_head.clone(),
+            message("user", "inherited parent turn about the qr login bug"),
+            message("assistant", "inherited parent answer"),
+        ],
+    );
+
+    let child_head = session_meta(
+        &child_id,
+        serde_json::json!({
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": parent_id,
+                "depth": 1,
+                "agent_path": "/root/review_issue17",
+                "agent_nickname": "Wegener",
+                "agent_role": null
+            }}},
+            "thread_source": "subagent",
+            "agent_path": "/root/review_issue17",
+            "subagent_history_start_ordinal": 7
+        }),
+    );
+    let child_path = day.join(format!("rollout-2026-09-16T09-30-00-{child_id}.jsonl"));
+    write_jsonl(
+        &child_path,
+        &[
+            child_head,
+            // spawn 时原样复制进来的父线程首行,saw_session_meta 必须挡住它
+            parent_head,
+            message("user", "inherited parent turn about the qr login bug"),
+            message("assistant", "inherited parent answer"),
+            dispatch("/root/other_task"),
+            message("user", "inherited follow-up turn"),
+            message("assistant", "inherited parent tail"),
+            dispatch("/root/review_issue17"),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:31:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "call_child_1",
+                    "arguments": "{\"command\":\"rg useEffect\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:31:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_child_1",
+                    "output": "CHILD_TOOL_OUTPUT"
+                }
+            }),
+            message("assistant", "child found the missing dependency array"),
+        ],
+    );
+
+    // state DB:threads 两行(子线程的 title/name 与真机一样是空的,标题只能
+    // 由解析侧的任务名给)+ 父子关系登记表
+    let conn = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT, name TEXT,
+         tokens_used INTEGER, archived INTEGER, git_branch TEXT, model TEXT, source TEXT,
+         created_at_ms INTEGER, updated_at_ms INTEGER);
+         CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL,
+         child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL);",
+    )
+    .unwrap();
+    for (id, file, source) in [
+        (
+            &parent_id,
+            format!("rollout-2026-09-16T09-00-00-{parent_id}.jsonl"),
+            "cli",
+        ),
+        (
+            &child_id,
+            format!("rollout-2026-09-16T09-30-00-{child_id}.jsonl"),
+            // 真机把整个结构化来源原样存进 source 列
+            "{\"subagent\":{\"thread_spawn\":{}}}",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2, '/work/wake', '', NULL, 0, 0,
+             NULL, NULL, ?3, 1789000000000, 1789000000000)",
+            rusqlite::params![id, day.join(file).to_string_lossy(), source],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO thread_spawn_edges VALUES (?1, ?2, 'open')",
+        rusqlite::params![parent_id, child_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    (parent_id, child_id, child_path)
+}
+
 pub fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
