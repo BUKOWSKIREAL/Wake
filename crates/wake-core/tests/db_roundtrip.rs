@@ -1209,3 +1209,371 @@ fn search_ranks_recently_active_sessions_higher() {
         ["claude-code:fresh", "claude-code:old"]
     );
 }
+
+/// 记忆表:按 (agent, host) 整组替换——没变的不动、变了的换、多出的删;列表项目内
+/// 新到旧、用户级最后且不受项目筛选影响;搜索命中带 snippet 并随删除消失;rebuild 清空
+/// `limit` 只封项目级:用户级(对每个项目都成立)不限量接在后面——否则默认 50 条
+/// 一刀切砍掉的正是它们;侧栏计数与列表同口径:项目行的计数含用户级,点开看到几行
+/// 徽章就是几;LIKE 降级的 snippet 遇到小写不保长的字符(Ω)与全角标点不得 panic
+/// (2026-09-21 review)
+#[test]
+fn memory_limit_keeps_user_level_and_counts_and_snippets_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("t.db")).unwrap();
+    let doc = |key: &str, scope: MemoryScope, project: &str, body: &str, updated: i64| MemoryDoc {
+        key: key.to_string(),
+        agent: AgentId::ClaudeCode,
+        host: String::new(),
+        scope,
+        project_path: project.to_string(),
+        project_name: if project.is_empty() {
+            String::new()
+        } else {
+            "app".to_string()
+        },
+        session_key: String::new(),
+        path: key.trim_start_matches("claude-code:").to_string(),
+        title: key.to_string(),
+        updated_at: updated,
+        size_bytes: body.len() as i64,
+        body: body.to_string(),
+    };
+    let docs = vec![
+        doc(
+            "claude-code:/m/p1.md",
+            MemoryScope::Project,
+            "/work/app",
+            "Ωmega，二维码在这里",
+            3,
+        ),
+        doc(
+            "claude-code:/m/p2.md",
+            MemoryScope::Project,
+            "/work/app",
+            "second",
+            2,
+        ),
+        doc(
+            "claude-code:/m/p3.md",
+            MemoryScope::Project,
+            "/work/app",
+            "third",
+            1,
+        ),
+        doc(
+            "claude-code:/m/u.md",
+            MemoryScope::User,
+            "",
+            "global prefs",
+            9,
+        ),
+    ];
+    store
+        .replace_memories(AgentId::ClaudeCode, "", &docs, &[])
+        .unwrap();
+    let keys = |v: &[MemoryDoc]| v.iter().map(|d| d.key.clone()).collect::<Vec<_>>();
+
+    let limited = store
+        .list_memories(&MemoryFilter {
+            project_paths: vec!["/work/app".into()],
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        keys(&limited),
+        [
+            "claude-code:/m/p1.md",
+            "claude-code:/m/p2.md",
+            "claude-code:/m/u.md"
+        ],
+        "项目级封顶 2,用户级照列"
+    );
+    let limited_all = store
+        .list_memories(&MemoryFilter {
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        keys(&limited_all),
+        ["claude-code:/m/p1.md", "claude-code:/m/u.md"]
+    );
+
+    let counts = store.memory_counts().unwrap();
+    assert_eq!(counts.total, 4);
+    assert_eq!(
+        counts
+            .projects
+            .iter()
+            .map(|p| (p.path.as_str(), p.count))
+            .collect::<Vec<_>>(),
+        [("/work/app", 4)],
+        "项目行的计数含用户级"
+    );
+    let opened = store
+        .list_memories(&MemoryFilter {
+            project_paths: vec!["/work/app".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        opened.len() as i64,
+        counts.projects[0].count,
+        "徽章 == 点开的行数"
+    );
+
+    // 2 个码点走 LIKE 降级;Ω 小写成 ω 后字节数变了,原先拿小写串的字节偏移切原文会 panic
+    let hits = store
+        .search_memories("二维", &MemoryFilter::default())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains("二维"), "{}", hits[0].snippet);
+}
+
+#[test]
+fn memories_replace_list_and_search() {
+    let (_dir, store) = temp_store();
+    let doc =
+        |key: &str, scope: MemoryScope, project: &str, title: &str, body: &str, updated: i64| {
+            MemoryDoc {
+                key: key.to_string(),
+                agent: AgentId::ClaudeCode,
+                host: String::new(),
+                scope,
+                project_path: project.to_string(),
+                project_name: project.rsplit('/').next().unwrap_or("").to_string(),
+                session_key: String::new(),
+                path: key.trim_start_matches("claude-code:").to_string(),
+                title: title.to_string(),
+                updated_at: updated,
+                size_bytes: body.len() as i64,
+                body: body.to_string(),
+            }
+        };
+    let a = doc(
+        "claude-code:/m/a.md",
+        MemoryScope::Project,
+        "/work/app",
+        "Scanner notes",
+        "The scanner finale guard must always fire.",
+        100,
+    );
+    let b = doc(
+        "claude-code:/m/b.md",
+        MemoryScope::Project,
+        "/work/app",
+        "Style",
+        "Four-space indent, no tabs.",
+        200,
+    );
+    let u = doc(
+        "claude-code:/m/user.md",
+        MemoryScope::User,
+        "",
+        "Preferences",
+        "Concise replies.",
+        50,
+    );
+    let all_three = [a.clone(), b.clone(), u.clone()];
+    assert!(store
+        .replace_memories(AgentId::ClaudeCode, "", &all_three, &[])
+        .unwrap());
+    assert!(
+        !store
+            .replace_memories(AgentId::ClaudeCode, "", &all_three, &[])
+            .unwrap(),
+        "没变不算改动"
+    );
+
+    let keys = |docs: &[MemoryDoc]| docs.iter().map(|d| d.key.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        keys(&store.list_memories(&MemoryFilter::default()).unwrap()),
+        [
+            "claude-code:/m/b.md",
+            "claude-code:/m/a.md",
+            "claude-code:/m/user.md"
+        ],
+        "项目内新到旧,用户级最后"
+    );
+    let scoped = store
+        .list_memories(&MemoryFilter {
+            project_paths: vec!["/other".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        keys(&scoped),
+        ["claude-code:/m/user.md"],
+        "项目筛选下用户级照列"
+    );
+    assert_eq!(
+        store
+            .get_memory("claude-code:/m/a.md")
+            .unwrap()
+            .unwrap()
+            .body,
+        a.body
+    );
+
+    let hits = store
+        .search_memories("finale guard", &MemoryFilter::default())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].doc.key, a.key);
+    assert!(hits[0].snippet.contains("finale"), "{}", hits[0].snippet);
+    let degraded = store
+        .search_memories("no", &MemoryFilter::default())
+        .unwrap();
+    assert!(
+        degraded.iter().any(|h| h.doc.key == b.key),
+        "<3 码点走 LIKE: {degraded:?}"
+    );
+
+    // b 变了、u 消失:替换后 b 是新正文,u 从列表与搜索里都不见
+    let mut b2 = b.clone();
+    b2.body = "Tabs are fine now.".into();
+    b2.updated_at = 300;
+    b2.size_bytes = b2.body.len() as i64;
+    assert!(store
+        .replace_memories(AgentId::ClaudeCode, "", &[a.clone(), b2.clone()], &[])
+        .unwrap());
+    assert_eq!(
+        store.list_memories(&MemoryFilter::default()).unwrap().len(),
+        2
+    );
+    assert_eq!(store.get_memory(&b.key).unwrap().unwrap().body, b2.body);
+    assert!(
+        store
+            .search_memories("Concise", &MemoryFilter::default())
+            .unwrap()
+            .is_empty(),
+        "删掉的记忆不再命中"
+    );
+
+    store.rebuild_all().unwrap();
+    assert!(store
+        .list_memories(&MemoryFilter::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// 项目归属在读库时按 session_key 连 sessions 解析:会话晚于记忆入库、会话换了项目,
+/// 记忆都自动跟上;没有锚点也没有项目的落 Unknown,项目筛选捞不到它
+#[test]
+fn memories_resolve_their_project_through_the_anchor_session() {
+    let (_dir, store) = temp_store();
+    let anchored = MemoryDoc {
+        key: "claude-code:/m/anchored.md".to_string(),
+        agent: AgentId::ClaudeCode,
+        host: String::new(),
+        scope: MemoryScope::Project,
+        project_path: String::new(),
+        project_name: String::new(),
+        session_key: "claude-code:s1".to_string(),
+        path: "/m/anchored.md".to_string(),
+        title: "Anchored".to_string(),
+        updated_at: 10,
+        size_bytes: 4,
+        body: "body".to_string(),
+    };
+    let orphan = MemoryDoc {
+        key: "claude-code:/m/orphan.md".to_string(),
+        session_key: String::new(),
+        path: "/m/orphan.md".to_string(),
+        title: "Orphan".to_string(),
+        ..anchored.clone()
+    };
+    store
+        .replace_memories(AgentId::ClaudeCode, "", &[anchored.clone(), orphan], &[])
+        .unwrap();
+    let project_of = |key: &str| store.get_memory(key).unwrap().unwrap().project_path;
+    assert_eq!(project_of(&anchored.key), "", "会话还没入库:暂时没有项目");
+
+    // 会话入库(晚于记忆)——记忆立刻有了项目,写入时没有定格
+    let mut s1 = meta("claude-code:s1", "Session one");
+    s1.project_path = "/work/app".into();
+    s1.project_name = "app".into();
+    store
+        .write_session_guarded(&s1, 5, &[], &|_| 0, None)
+        .unwrap();
+    assert_eq!(project_of(&anchored.key), "/work/app");
+    assert_eq!(
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.key.as_str())
+            .collect::<Vec<_>>(),
+        [anchored.key.as_str(), "claude-code:/m/orphan.md"],
+        "没归属的一组排在项目之后"
+    );
+    let scoped = store
+        .list_memories(&MemoryFilter {
+            project_paths: vec!["/work/app".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        scoped.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(),
+        [anchored.key.as_str()],
+        "项目筛选按解析出的项目;没归属的不算任何项目"
+    );
+    assert_eq!(scoped[0].project_name, "app");
+    let unknown = store
+        .list_memories(&MemoryFilter {
+            unattributed: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        unknown.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(),
+        ["claude-code:/m/orphan.md"],
+        "空串筛的是没归属的那一组(侧栏 Unknown project 行)"
+    );
+    // 侧栏计数与列表同一口径:总数、按 agent、按解析出的项目(没归属的垫底)
+    let counts = store.memory_counts().unwrap();
+    assert_eq!(counts.total, 2);
+    assert_eq!(counts.agents, vec![(AgentId::ClaudeCode, 2)]);
+    assert_eq!(
+        counts
+            .projects
+            .iter()
+            .map(|p| (p.path.as_str(), p.name.as_str(), p.count))
+            .collect::<Vec<_>>(),
+        [("/work/app", "app", 1), ("", "", 1)]
+    );
+
+    // 会话换了项目,记忆跟着走
+    s1.project_path = "/work/app-renamed".into();
+    s1.project_name = "app-renamed".into();
+    store
+        .write_session_guarded(&s1, 6, &[], &|_| 0, None)
+        .unwrap();
+    assert_eq!(project_of(&anchored.key), "/work/app-renamed");
+
+    // 锚点换了(目录里来了更新的会话)是改动,同 key 重写;正文与时间没变也要写。
+    // 同 key 重复(同家两个实例的根重叠)后者胜——前面那份与库里相同也不算数
+    let mut moved = anchored.clone();
+    moved.session_key = "claude-code:s2".to_string();
+    assert!(store
+        .replace_memories(
+            AgentId::ClaudeCode,
+            "",
+            &[anchored.clone(), moved.clone()],
+            &[]
+        )
+        .unwrap());
+    assert_eq!(
+        store.get_memory(&moved.key).unwrap().unwrap().session_key,
+        "claude-code:s2"
+    );
+    assert!(
+        store
+            .search_memories("body", &MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .all(|h| h.doc.key == moved.key),
+        "重写后 FTS 里只剩这一份、没有旧行残留"
+    );
+}

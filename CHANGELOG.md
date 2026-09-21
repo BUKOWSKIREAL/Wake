@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- New: Memory page — the notes coding agents keep for themselves on this machine (Claude Code's per-project auto-memory, Codex's memories and per-session summaries, ZCode's project memory) in one place, grouped by project with the sidebar switching to memory navigation. Read-only: open a file in its own app to change it
+- New: `wake_list_memories` in the MCP server and `wake-cli memories` list those files for other agents; `wake_get_session` reads one by its `wake://memory/…` reference and `wake_search` also surfaces memory files that mention the query
+- Update: the sidebar switches between Sessions, Memory, Insights and Clean Up from an icon strip at the bottom; Refresh moved into each page header
+- Fix: a search term of one or two characters no longer crashes Wake when a matching message contains characters such as Ω, İ or K before the match
 - Update: Codex sub-agents started with `spawn_agent` are indexed again, nested under the session that spawned them and titled with their task name; the parent's conversation that Codex copies into each sub-agent is folded away so it is only indexed once. The guardian auto-review, `/review`, compaction and memory-consolidation threads stay excluded. In the MCP tools and `wake-cli`, a session now names its parent and lists its child sessions, for every agent that has them (#42, thanks @ShadowySpirits). Existing indexes are re-read once after upgrading
 - New: ZCode (Z.ai's GLM-5.3 desktop harness) sessions are indexed from its local database — titles, models, tool calls and token counts included. Forks and side chats are listed like any other conversation; sub-agent runs and conversations imported from Claude Code are left out so nothing appears twice. Read-only, and no Open In: the app has no command line to resume from
 

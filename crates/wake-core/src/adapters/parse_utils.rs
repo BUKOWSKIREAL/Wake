@@ -697,17 +697,39 @@ impl<T: Clone> MtimeCache<T> {
     }
 
     pub fn get_or_try_build(&self, mtime: i64, build: impl FnOnce() -> Option<T>) -> Option<T> {
+        self.get_or_build_result(mtime, || build().ok_or(())).ok()
+    }
+
+    /// 同 `get_or_try_build`,但 build 失败时交回**上一次成功的值**(戳不更新,下次照样
+    /// 重试)。给"读不出来也得给个答案"的调用方:ZCode 的隐藏名单与行清单这类接口表达
+    /// 不了"不知道",而空答案的后果是全部放出 / 全部删掉(2026-09-21 review),旧答案
+    /// 至少是上一次的事实。从没成功过才是 None
+    pub fn get_or_stale(&self, mtime: i64, build: impl FnOnce() -> Option<T>) -> Option<T> {
+        if let Some(v) = self.get_or_try_build(mtime, build) {
+            return Some(v);
+        }
+        self.0.lock().unwrap().as_ref().map(|(_, v)| v.clone())
+    }
+
+    /// build 带错误:Ok 才缓存,Err 原样带回、不记——"失败不缓存"是这个缓存本来的
+    /// 契约,只是多把原因交出去(记忆目录列不出、读不出时 scanner 要靠 Err 跳过该组,
+    /// 不能拿到一个空的 Ok);`get_or_try_build` 是它的 Option 壳
+    pub fn get_or_build_result<E>(
+        &self,
+        mtime: i64,
+        build: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         {
             let cache = self.0.lock().unwrap();
             if let Some((t, v)) = cache.as_ref() {
                 if *t == mtime {
-                    return Some(v.clone());
+                    return Ok(v.clone());
                 }
             }
         }
         let v = build()?;
         *self.0.lock().unwrap() = Some((mtime, v.clone()));
-        Some(v)
+        Ok(v)
     }
 }
 
@@ -777,18 +799,20 @@ pub fn sqlite_dt_ms(s: &str) -> i64 {
 /// ISO8601 字符串或 unix 秒/毫秒 → epoch ms
 pub fn to_epoch_ms(v: &Value) -> i64 {
     match v {
-        Value::Number(n) => {
-            let f = n.as_f64().unwrap_or(0.0);
-            if f > 1e12 {
-                f as i64
-            } else if f > 0.0 {
-                (f * 1000.0) as i64
-            } else {
-                0
-            }
-        }
+        Value::Number(n) => epoch_ms(n.as_f64().unwrap_or(0.0)),
         Value::String(s) => iso_ms(s),
         _ => 0,
+    }
+}
+
+/// unix 秒或毫秒(> 1e12 当毫秒)→ epoch ms;非正数给 0。秒/毫秒的唯一裁定点
+pub fn epoch_ms(n: f64) -> i64 {
+    if n > 1e12 {
+        n as i64
+    } else if n > 0.0 {
+        (n * 1000.0) as i64
+    } else {
+        0
     }
 }
 

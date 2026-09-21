@@ -57,7 +57,7 @@ If the index does not exist yet, the server exits with status 2 and a message on
 
 ### Check that it is connected
 
-- **Claude Code**: `claude mcp list` shows `wake` as connected; inside a session, `/mcp` lists the server and its four tools.
+- **Claude Code**: `claude mcp list` shows `wake` as connected; inside a session, `/mcp` lists the server and its five tools.
 - **Codex**: restart Codex after editing `config.toml`; the `wake_*` tools show up in its tool list.
 - **Cursor**: Settings → MCP shows `wake` with a green status dot.
 - **No client at hand**: `wake-mcp call wake_list_projects` in a terminal prints exactly what an agent would see.
@@ -121,7 +121,7 @@ so an agent can tell how recent the data is. Two replies carry no freshness line
 
 ## Tools
 
-All four tools are read-only and return Markdown text (`content[0].text`). Parameters are JSON; every parameter except the ones marked required is optional.
+All five tools are read-only and return Markdown text (`content[0].text`). Parameters are JSON; every parameter except the ones marked required is optional.
 
 ### Shared parameters
 
@@ -209,11 +209,23 @@ Projects (working directories) that have indexed sessions, most recently active 
 | `since` | string | |
 | `limit` | integer 1–200 | 50 |
 
+### `wake_list_memories`
+
+The memory files coding agents keep for themselves on this machine, read-only: Claude Code's per-project auto-memory (`~/.claude/projects/<project>/memory/`: `MEMORY.md` plus one file per topic) Codex's memories (`~/.codex/memories/*.md`, user-level, and the per-session summaries in `memories_1.sqlite`) and ZCode's per-project memory (`~/.zcode/cli/memories/projects/<project>/memory/`, the same `MEMORY.md` + topic-file layout; its project is recovered from the workspace hash in the directory name). Grouped by project, user-level entries last; user-level entries are listed under any `project` filter because they apply everywhere (a `project` that matches no indexed project still lists them, with a note), and `limit` only caps the project-level entries — user-level ones are always appended. A memory file's project is the one its sessions belong to, so a Claude Code memory whose sessions have all expired shows under *Unknown project*. Each entry ends with a `wake://memory/<key>` reference — pass it to `wake_get_session` to read the file (the file is read live from disk, so an agent's latest edit shows). Wake never writes, edits or syncs these files.
+
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `project`, `agents` | | | see above |
+| `limit` | integer 1–100 | 50 | |
+
+`wake_search` also appends up to five memory files that mention the query, under *Memory files that mention …*, with the same references.
+
 ## Session keys and references
 
 - Local sessions: `<agent>:<native id>`, for example `codex:0195c2a1-…`.
 - Sessions mirrored from a remote host: `<agent>:<host>:<native id>`.
 - References: `wake://session/<key>#<seq>` point at one message; `wake_get_session` accepts them as `key` and starts the page there.
+- Memory files: `wake://memory/<agent>:<path>` (with a host segment for mirrored hosts); `wake_get_session` accepts them as `key` and returns the file.
 
 The native id is the one the agent's own `--resume` flag expects.
 

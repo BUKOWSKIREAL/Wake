@@ -128,6 +128,33 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
   title,
   tokenize="trigram case_sensitive 0"
 );
+
+-- agent 自己写下的记忆(Claude Code auto-memory、Codex memories)的只读镜像:
+-- 扫描收尾按 (agent, host) 整组替换(2026-09-17)。正文一并入库(小 Markdown),
+-- 搜索走 memories_fts(rowid = memories.id,删改按 rowid 定位——FTS 表里
+-- UNINDEXED 列的 WHERE 是整表扫描,正文列在里面扫不起);阅读时文件型先读
+-- 磁盘、读不到再用这份。project_path 多半为空,读时按 session_key 连 sessions 解析
+CREATE TABLE IF NOT EXISTS memories (
+  id           INTEGER PRIMARY KEY,
+  key          TEXT NOT NULL UNIQUE,
+  agent_id     TEXT NOT NULL,
+  host         TEXT NOT NULL DEFAULT '',
+  scope        TEXT NOT NULL,
+  project_path TEXT NOT NULL DEFAULT '',
+  project_name TEXT NOT NULL DEFAULT '',
+  session_key  TEXT NOT NULL DEFAULT '',
+  path         TEXT NOT NULL,
+  title        TEXT NOT NULL DEFAULT '',
+  updated_at   INTEGER DEFAULT 0,
+  size_bytes   INTEGER DEFAULT 0,
+  body         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_memories_group ON memories(agent_id, host);
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  title,
+  body,
+  tokenize="trigram case_sensitive 0"
+);
 "#;
 
 /// 会话元数据和 FTS 单元的派生规则版本(`adapters::units_from_messages` 及其上游解析)。改了派生
@@ -135,7 +162,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
 /// "1" = 2026-09-14 前(工具段不过滤 Wake 自指),"2" = 过滤自指回声,
 /// "3" = Pi / omp / OpenClaw 累计每次 assistant 调用的 token,
 /// "4" = Cursor 项目路径优先读取工作区元数据,并恢复 slug 中的空格。
-pub const FTS_FORMAT: &str = "5";
+pub const FTS_FORMAT: &str = "7";
 
 fn open_conn(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -231,8 +258,9 @@ fn open_conn(path: &Path) -> Result<Connection> {
 /// 最近一次迁移加的列——`open_read_only` 用它判断库够不够新。**加新迁移时把
 /// 这里改成新列**,否则只读入口会放行老库、深处查询才报 no such column
 const NEWEST_COLUMN: (&str, &str) = ("sessions", "host");
-/// 最近一次迁移加的表,与 NEWEST_COLUMN 同一用途、同一维护规矩
-const NEWEST_TABLE: &str = "titles_fts";
+/// 最近一次迁移加的、只读读者会查的表(wake_list_memories 读 memories),与
+/// NEWEST_COLUMN 同一用途、同一维护规矩
+const NEWEST_TABLE: &str = "memories";
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
@@ -1126,7 +1154,8 @@ impl Store {
     pub fn rebuild_all(&self) -> Result<()> {
         let conn = self.write.lock().unwrap();
         conn.execute_batch(
-            "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM titles_fts; DELETE FROM sessions;",
+            "DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM titles_fts;
+             DELETE FROM memories; DELETE FROM memories_fts; DELETE FROM sessions;",
         )?;
         Ok(())
     }
@@ -1392,6 +1421,294 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    // ---------- 记忆(agent 写的 Markdown,只读镜像) ----------
+
+    /// 一组 (agent, host) 的记忆整体对齐到 `docs`:多出的删、变了的换(按 updated_at、
+    /// size 与归属锚点 / 项目判,正文不比)、没变的不动;返回有没有改动。同 key
+    /// 重复后者胜。这是 memories / memories_fts 的**唯一写点**(rebuild_all 只清空)
+    pub fn replace_memories(
+        &self,
+        agent: AgentId,
+        host: &str,
+        docs: &[MemoryDoc],
+        frozen: &[std::path::PathBuf],
+    ) -> Result<bool> {
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        // key → (id, 指纹);指纹含 session_key 与 project_path,锚点换了(目录里来了
+        // 更新的会话)同样要重写,否则项目归属定格在首次入库那一刻
+        let existing: HashMap<String, (i64, (i64, i64, String, String))> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT key, id, updated_at, size_bytes, session_key, project_path
+                 FROM memories WHERE agent_id = ?1 AND host = ?2",
+            )?;
+            let rows = stmt.query_map(params![agent.as_str(), host], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, i64>(1)?,
+                        (
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                        ),
+                    ),
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // 同 key 重复(同家两个实例的根重叠)后者胜:先按 key 收成一份再写,否则
+        // 前一份写了、后一份与库里相同被跳过,就成了前者胜
+        let latest: std::collections::BTreeMap<&str, &MemoryDoc> =
+            docs.iter().map(|d| (d.key.as_str(), d)).collect();
+        let mut changed = false;
+        for d in latest.values() {
+            let stamp = (
+                d.updated_at,
+                d.size_bytes,
+                d.session_key.clone(),
+                d.project_path.clone(),
+            );
+            if existing.get(&d.key).is_some_and(|(_, s)| *s == stamp) {
+                continue;
+            }
+            upsert_memory(&tx, d)?;
+            changed = true;
+        }
+        // `frozen` 是这一轮读失败的实例的根:那些根下的行不删(它们没出现在 docs 里
+        // 只是因为读不出,不是文件没了)
+        let frozen: Vec<String> = frozen
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let mut stmt_fts = tx.prepare_cached("DELETE FROM memories_fts WHERE rowid = ?1")?;
+        let mut stmt_row = tx.prepare_cached("DELETE FROM memories WHERE key = ?1")?;
+        for (key, (id, (_, _, _, _))) in existing.iter() {
+            if latest.contains_key(key.as_str()) {
+                continue;
+            }
+            let path: String = tx.query_row(
+                "SELECT path FROM memories WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )?;
+            if frozen.iter().any(|root| memory_root_covers(root, &path)) {
+                continue;
+            }
+            stmt_fts.execute(params![id])?;
+            stmt_row.execute(params![key])?;
+            changed = true;
+        }
+        drop(stmt_fts);
+        drop(stmt_row);
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// 库里现有记忆的 (agent, host) 分组——scanner 拿它对照当前 roster,不再配置的来源
+    /// (删掉的远程 host、停用的 agent)整组清掉
+    pub fn memory_groups(&self) -> Result<Vec<(AgentId, String)>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT DISTINCT agent_id, host FROM memories")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (agent, host) = r?;
+            if let Some(agent) = AgentId::from_str(&agent) {
+                out.push((agent, host));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Memory 页侧栏的计数:agent 按 AgentId 声明序(与会话侧栏同序,计数平局不抖),
+    /// 项目按最近更新降序、没归属的一项(path 为空)垫底。项目按读时解析的归属算,
+    /// 与 list_memories 同一口径——**用户级记忆对每个项目都成立**,list_memories 在
+    /// 任何项目筛选下都列它们,所以每个项目行(含 Unknown project)的计数都把用户级
+    /// 加进去,点开看到多少行、徽章就是多少(2026-09-21 review)
+    pub fn memory_counts(&self) -> Result<MemoryCounts> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT m.agent_id, {MEMORY_PROJECT},
+                    COALESCE(NULLIF(m.project_name, ''), s.project_name, ''),
+                    m.scope, COUNT(*), MAX(m.updated_at)
+             FROM memories m {MEMORY_SESSION_JOIN}
+             GROUP BY 1, 2, 3, 4"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut counts = MemoryCounts::default();
+        let mut agents: HashMap<AgentId, i64> = HashMap::new();
+        let mut projects: HashMap<String, MemoryProject> = HashMap::new();
+        let mut user_level = 0i64;
+        for r in rows {
+            let (agent, path, name, scope, n, last) = r?;
+            let Some(agent) = AgentId::from_str(&agent) else {
+                continue;
+            };
+            counts.total += n;
+            *agents.entry(agent).or_default() += n;
+            if scope == MemoryScope::User.as_str() {
+                user_level += n;
+                continue;
+            }
+            let p = projects
+                .entry(path.clone())
+                .or_insert_with(|| MemoryProject {
+                    path,
+                    name,
+                    count: 0,
+                    updated_at: 0,
+                });
+            p.count += n;
+            p.updated_at = p.updated_at.max(last);
+        }
+        for p in projects.values_mut() {
+            p.count += user_level;
+        }
+        counts.agents = agents.into_iter().collect();
+        counts.agents.sort_by_key(|(agent, _)| *agent);
+        counts.projects = projects.into_values().collect();
+        counts.projects.sort_by(|a, b| {
+            a.path
+                .is_empty()
+                .cmp(&b.path.is_empty())
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        Ok(counts)
+    }
+
+    /// 记忆列表:项目级按项目路径成组、组内新到旧,没归属的一组排在项目之后,
+    /// 用户级(对每个项目都成立)最后;项目筛选下用户级照列。**`limit` 只封项目级**:
+    /// 用户级排在最后,一刀切的 LIMIT 砍掉的正是筛选特意放进来的那几份(2026-09-21
+    /// review),所以项目级带 LIMIT 查、用户级不限量另查再接上。**行里 body 是空串**
+    /// (`MEMORY_LIST_COLS`),要正文走 `get_memory`
+    pub fn list_memories(&self, f: &MemoryFilter) -> Result<Vec<MemoryDoc>> {
+        let (filter_sql, args) = memory_filter(f);
+        let user = MemoryScope::User.as_str();
+        let conn = self.read.lock().unwrap();
+        let order = format!(
+            "ORDER BY m.scope = '{user}', {MEMORY_PROJECT} = '', {MEMORY_PROJECT},
+                      m.updated_at DESC, m.key"
+        );
+        if f.limit <= 0 {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {MEMORY_LIST_COLS} FROM memories m {MEMORY_SESSION_JOIN}
+                 WHERE 1 = 1{filter_sql} {order}"
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+                row_to_memory,
+            )?;
+            return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        let mut out = {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {MEMORY_LIST_COLS} FROM memories m {MEMORY_SESSION_JOIN}
+                 WHERE m.scope != '{user}'{filter_sql} {order} LIMIT ?"
+            ))?;
+            let limit: Box<dyn rusqlite::ToSql> = Box::new(f.limit);
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(
+                    args.iter()
+                        .chain(std::iter::once(&limit))
+                        .map(|b| b.as_ref()),
+                ),
+                row_to_memory,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEMORY_LIST_COLS} FROM memories m {MEMORY_SESSION_JOIN}
+             WHERE m.scope = '{user}'{filter_sql} {order}"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+            row_to_memory,
+        )?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        Ok(out)
+    }
+
+    pub fn get_memory(&self, key: &str) -> Result<Option<MemoryDoc>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEMORY_COLS} FROM memories m {MEMORY_SESSION_JOIN} WHERE m.key = ?1"
+        ))?;
+        Ok(stmt.query_row(params![key], row_to_memory).optional()?)
+    }
+
+    /// 记忆全文搜索(标题 + 正文),与会话搜索同一套分词与 <3 码点降级规则;命中按
+    /// bm25 排、snippet 取自正文。筛选同 list_memories
+    pub fn search_memories(&self, q: &str, f: &MemoryFilter) -> Result<Vec<MemoryHit>> {
+        let segs = fts_terms(q);
+        if segs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = if f.limit > 0 { f.limit } else { 20 };
+        let (filter_sql, filter_args) = memory_filter(f);
+        let conn = self.read.lock().unwrap();
+        let mut out = Vec::new();
+        if !needs_like_fallback(&segs) {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {MEMORY_COLS}, snippet(memories_fts, 1, ?, ?, '…', 16)
+                 FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
+                 {MEMORY_SESSION_JOIN}
+                 WHERE memories_fts MATCH ?{filter_sql}
+                 ORDER BY bm25(memories_fts) LIMIT ?"
+            ))?;
+            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(HL_OPEN.to_string()),
+                Box::new(HL_CLOSE.to_string()),
+                Box::new(fts_match_expr(&segs)),
+            ];
+            all_args.extend(filter_args);
+            all_args.push(Box::new(limit));
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
+                |r| {
+                    Ok(MemoryHit {
+                        doc: row_to_memory(r)?,
+                        snippet: r.get(12)?,
+                    })
+                },
+            )?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let like_where = like_where(&["m.title", "m.body"], segs.len());
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {MEMORY_COLS} FROM memories m {MEMORY_SESSION_JOIN}
+                 WHERE {like_where}{filter_sql}
+                 ORDER BY m.updated_at DESC LIMIT ?"
+            ))?;
+            let mut all_args = like_args(&segs, 2);
+            all_args.extend(filter_args);
+            all_args.push(Box::new(limit));
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
+                row_to_memory,
+            )?;
+            for r in rows {
+                let doc = r?;
+                let snippet = make_like_snippet(&doc.body, segs[0]);
+                out.push(MemoryHit { doc, snippet });
+            }
+        }
+        Ok(out)
     }
 
     pub fn agent_counts(&self) -> Result<HashMap<String, i64>> {
@@ -1685,11 +2002,11 @@ impl Store {
     /// 全文搜索的完整筛选形态(多项目并集 + 时间下界);`search` 是它的便捷壳。
     /// 命中按 bm25 排序、消息级一行一条;archived 会话不排除(meta.archived 标出)
     pub fn search_with(&self, q: &str, f: &SearchFilter) -> Result<(Vec<SearchHit>, bool)> {
-        let segs: Vec<&str> = q.split_whitespace().filter(|s| !s.is_empty()).collect();
+        let segs = fts_terms(q);
         if segs.is_empty() {
             return Ok((Vec::new(), false));
         }
-        let degraded = segs.iter().any(|s| s.chars().count() < 3);
+        let degraded = needs_like_fallback(&segs);
         let limit = if f.limit > 0 { f.limit } else { 60 };
         // 近因加权:bm25 是负数、越小越相关,乘上 (1 + W / (1 + 距今天数 / H)) 让
         // 新会话的命中"更负"。W = 1、H = 30 天:今天的会话 ×2、一个月前 ×1.5、
@@ -1732,11 +2049,7 @@ impl Store {
             v
         };
         // FTS 的 MATCH 表达式(正文与标题两张表共用)
-        let match_expr = segs
-            .iter()
-            .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
+        let match_expr = fts_match_expr(&segs);
 
         let conn = self.read.lock().unwrap();
         let mut raw: Vec<(String, i64, Option<String>, String, Option<i64>, String)> = Vec::new();
@@ -1777,11 +2090,7 @@ impl Store {
                 raw.push(r?);
             }
         } else {
-            let like_where = segs
-                .iter()
-                .map(|_| "m.text LIKE ? ESCAPE '\\'")
-                .collect::<Vec<_>>()
-                .join(" AND ");
+            let like_where = like_where(&["m.text"], segs.len());
             let sql = format!(
                 "SELECT m.session_key, m.seq, m.sidechain_id, m.role, m.ts, m.text
                  FROM messages m JOIN sessions s ON s.key = m.session_key
@@ -1789,10 +2098,7 @@ impl Store {
                  ORDER BY m.ts DESC LIMIT ?"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = segs
-                .iter()
-                .map(|s| Box::new(format!("%{}%", escape_like(s))) as Box<dyn rusqlite::ToSql>)
-                .collect();
+            let mut all_args = like_args(&segs, 1);
             all_args.extend(filter_args(f));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
@@ -1849,21 +2155,14 @@ impl Store {
                 title_raw.push(r?);
             }
         } else {
-            let like_where = segs
-                .iter()
-                .map(|_| "s.title LIKE ? ESCAPE '\\'")
-                .collect::<Vec<_>>()
-                .join(" AND ");
+            let like_where = like_where(&["s.title"], segs.len());
             let sql = format!(
                 "SELECT s.key, s.title FROM sessions s
                  WHERE {like_where}{filter_sql}
                  ORDER BY s.updated_at DESC LIMIT ?"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let mut all_args: Vec<Box<dyn rusqlite::ToSql>> = segs
-                .iter()
-                .map(|s| Box::new(format!("%{}%", escape_like(s))) as Box<dyn rusqlite::ToSql>)
-                .collect();
+            let mut all_args = like_args(&segs, 1);
             all_args.extend(filter_args(f));
             all_args.push(Box::new(limit));
             let rows = stmt.query_map(
@@ -2042,6 +2341,135 @@ fn push_session_filters(
     }
 }
 
+/// memories 连它的归属会话:项目路径在读时解析——adapter 填了就用 adapter 的,
+/// 否则取 `session_key` 指向的会话的(线程级记忆是它所属的会话,Claude 项目级是
+/// 同目录最新的会话)。归属随索引走,会话被重新归属、晚于记忆才入库都自动跟上
+const MEMORY_SESSION_JOIN: &str = "LEFT JOIN sessions s ON s.key = m.session_key";
+const MEMORY_PROJECT: &str = "COALESCE(NULLIF(m.project_path, ''), s.project_path, '')";
+
+/// memories 的列(带 `m.` 前缀:搜索要与 memories_fts 连表,裸 key 会歧义);
+/// 必须带上 `MEMORY_SESSION_JOIN` 选,项目两列就是 `MEMORY_PROJECT` 那个表达式。
+/// 最后一列是正文的位置,`row_to_memory` 按位读
+macro_rules! memory_cols {
+    ($body:literal) => {
+        concat!(
+            "m.key, m.agent_id, m.host, m.scope,
+    COALESCE(NULLIF(m.project_path, ''), s.project_path, ''),
+    COALESCE(NULLIF(m.project_name, ''), s.project_name, ''),
+    m.session_key, m.path, m.title, m.updated_at, m.size_bytes, ",
+            $body
+        )
+    };
+}
+const MEMORY_COLS: &str = memory_cols!("m.body");
+/// 列表用的同一组列,只是正文给空串:列表谁都不看正文(GUI 阅读时经 get_memory
+/// 另取,MCP 的 wake_list_memories 只打标题),没必要每次刷新把几百 KB 文本拉出来
+const MEMORY_LIST_COLS: &str = memory_cols!("''");
+
+/// `path` 在不在这个记忆根下:目录根按分隔符划界,SQLite 型的库文件根认虚拟路径
+/// `<db>#<id>`(`replace_memories` 的冻结判据)
+fn memory_root_covers(root: &str, path: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with(std::path::is_separator) || rest.starts_with('#'))
+}
+
+fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDoc> {
+    let agent: String = r.get(1)?;
+    let scope: String = r.get(3)?;
+    Ok(MemoryDoc {
+        key: r.get(0)?,
+        agent: AgentId::from_str(&agent).unwrap_or(AgentId::ClaudeCode),
+        host: r.get(2)?,
+        scope: MemoryScope::parse(&scope).unwrap_or(MemoryScope::Project),
+        project_path: r.get(4)?,
+        project_name: r.get(5)?,
+        session_key: r.get(6)?,
+        path: r.get(7)?,
+        title: r.get(8)?,
+        updated_at: r.get(9)?,
+        size_bytes: r.get(10)?,
+        body: r.get(11)?,
+    })
+}
+
+/// list_memories / search_memories 共用的筛选谓词(表别名 m):agent 并集;项目并集
+/// 之外用户级记忆恒放行——它对每个项目都成立
+fn memory_filter(f: &MemoryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::new();
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !f.agents.is_empty() {
+        sql.push_str(&format!(
+            " AND m.agent_id IN ({})",
+            placeholders(f.agents.len())
+        ));
+        for a in &f.agents {
+            args.push(Box::new(a.as_str().to_string()));
+        }
+    }
+    if f.scopes_projects() {
+        // 项目并集 ∪ 没归属的一组(显式的 unattributed,不拿空串当暗号:空串什么都
+        // 不匹配)∪ 用户级(对每个项目都成立)
+        let mut terms: Vec<String> = Vec::new();
+        if !f.project_paths.is_empty() {
+            terms.push(format!(
+                "({MEMORY_PROJECT} != '' AND {MEMORY_PROJECT} IN ({}))",
+                placeholders(f.project_paths.len())
+            ));
+            for p in &f.project_paths {
+                args.push(Box::new(p.clone()));
+            }
+        }
+        if f.unattributed {
+            terms.push(format!("{MEMORY_PROJECT} = ''"));
+        }
+        terms.push(format!("m.scope = '{}'", MemoryScope::User.as_str()));
+        sql.push_str(&format!(" AND ({})", terms.join(" OR ")));
+    }
+    (sql, args)
+}
+
+/// 写一份记忆:memories 行按 key 就地更新(id 不变,memories_fts 的 rowid 就是它),
+/// FTS 那份先按 rowid 删再插。语句都走 prepare_cached——一次冷建一百多份,逐条
+/// 编译 SQL 白费
+fn upsert_memory(tx: &rusqlite::Transaction<'_>, d: &MemoryDoc) -> Result<()> {
+    let id: i64 = tx
+        .prepare_cached(
+            "INSERT INTO memories(key, agent_id, host, scope, project_path, project_name,
+           session_key, path, title, updated_at, size_bytes, body)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(key) DO UPDATE SET agent_id = excluded.agent_id, host = excluded.host,
+           scope = excluded.scope, project_path = excluded.project_path,
+           project_name = excluded.project_name, session_key = excluded.session_key,
+           path = excluded.path, title = excluded.title, updated_at = excluded.updated_at,
+           size_bytes = excluded.size_bytes, body = excluded.body
+         RETURNING id",
+        )?
+        .query_row(
+            params![
+                d.key,
+                d.agent.as_str(),
+                d.host,
+                d.scope.as_str(),
+                d.project_path,
+                d.project_name,
+                d.session_key,
+                d.path,
+                d.title,
+                d.updated_at,
+                d.size_bytes,
+                d.body,
+            ],
+            |r| r.get::<_, i64>(0),
+        )?;
+    tx.prepare_cached("DELETE FROM memories_fts WHERE rowid = ?1")?
+        .execute(params![id])?;
+    tx.prepare_cached("INSERT INTO memories_fts(rowid, title, body) VALUES (?1, ?2, ?3)")?
+        .execute(params![id, d.title, d.body])?;
+    Ok(())
+}
+
 fn row_to_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     let agent_str: String = r.get(1)?;
     Ok(SessionMeta {
@@ -2167,27 +2595,93 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn make_like_snippet(text: &str, first_seg: &str) -> String {
-    let lower = text.to_lowercase();
-    let seg_lower = first_seg.to_lowercase();
-    let Some(byte_idx) = lower.find(&seg_lower) else {
-        return text.chars().take(120).collect();
+/// 搜索串按空白切成词项(会话搜索与记忆搜索同一套分词)
+fn fts_terms(q: &str) -> Vec<&str> {
+    q.split_whitespace().filter(|s| !s.is_empty()).collect()
+}
+
+/// 有词项短于 3 码点就走 LIKE 子串扫描——trigram 分词对更短的词无能为力
+fn needs_like_fallback(segs: &[&str]) -> bool {
+    segs.iter().any(|s| s.chars().count() < 3)
+}
+
+/// FTS5 的 MATCH 表达式:每个词项加引号(内部引号翻倍)、AND 连接。三张 FTS 表共用,
+/// 转义规则只此一处
+fn fts_match_expr(segs: &[&str]) -> String {
+    segs.iter()
+        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// LIKE 降级路径的 WHERE:每个词项对每一列各一个 `LIKE ? ESCAPE '\'`(列之间 OR、
+/// 词项之间 AND),参数由 `like_args` 按同一顺序给。正文、标题、记忆三条降级路径共用
+fn like_where(cols: &[&str], terms: usize) -> String {
+    let per_term = cols
+        .iter()
+        .map(|c| format!("{c} LIKE ? ESCAPE '\\'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let per_term = if cols.len() > 1 {
+        format!("({per_term})")
+    } else {
+        per_term
     };
-    // 定位到字符边界安全的窗口
+    std::iter::repeat_n(per_term, terms)
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// `like_where` 的参数:每个词项转义成 `%term%`,每列一份
+fn like_args(segs: &[&str], cols: usize) -> Vec<Box<dyn rusqlite::ToSql>> {
+    segs.iter()
+        .flat_map(|s| {
+            let pat = format!("%{}%", escape_like(s));
+            std::iter::repeat_n(pat, cols)
+        })
+        .map(|pat| Box::new(pat) as Box<dyn rusqlite::ToSql>)
+        .collect()
+}
+
+/// LIKE 降级路径的 snippet:不区分大小写找首个词项,前 40 / 后 80 字符开窗并高亮。
+/// 全程按**字符**下标走:逐字符小写并记下每个小写字符来自原文第几个字符——小写
+/// 不保长(Ω→ω、İ→i̇、K→k 字节数与字符数都会变),拿小写串里的字节偏移去切原文正是
+/// 2026-09-21 review 复现的 panic(⌘K 逐字键入 CJK 查询必经此路,后台线程 panic
+/// 直接 abort 整个 app)
+fn make_like_snippet(text: &str, first_seg: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let char_idx = text[..byte_idx].chars().count();
-    let seg_len = first_seg.chars().count();
+    let needle: Vec<char> = first_seg.to_lowercase().chars().collect();
+    let mut lower: Vec<char> = Vec::with_capacity(chars.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(chars.len());
+    for (i, c) in chars.iter().enumerate() {
+        for lc in c.to_lowercase() {
+            lower.push(lc);
+            origin.push(i);
+        }
+    }
+    let hit = (!needle.is_empty())
+        .then(|| {
+            lower
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+        })
+        .flatten();
+    let Some(pos) = hit else {
+        return chars.iter().take(120).collect();
+    };
+    let char_idx = origin[pos];
+    let match_end = origin[pos + needle.len() - 1] + 1;
     let start = char_idx.saturating_sub(40);
-    let end = (char_idx + seg_len + 80).min(chars.len());
+    let end = (match_end + 80).min(chars.len());
     let mut out = String::new();
     if start > 0 {
         out.push('…');
     }
     out.extend(&chars[start..char_idx]);
     out.push(HL_OPEN);
-    out.extend(&chars[char_idx..(char_idx + seg_len).min(chars.len())]);
+    out.extend(&chars[char_idx..match_end]);
     out.push(HL_CLOSE);
-    out.extend(&chars[(char_idx + seg_len).min(chars.len())..end]);
+    out.extend(&chars[match_end..end]);
     if end < chars.len() {
         out.push('…');
     }

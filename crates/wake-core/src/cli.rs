@@ -209,6 +209,7 @@ const SHOW_FLAGS: &[FlagSpec] = &[
     F_SUBAGENT,
 ];
 const PROJECTS_FLAGS: &[FlagSpec] = &[F_SINCE, F_LIMIT];
+const MEMORIES_FLAGS: &[FlagSpec] = &[F_PROJECT, F_AGENT, F_LIMIT];
 
 /// 子命令与 MCP 工具一一对应。加一家工具就在这里加一行,否则单测红
 pub const COMMANDS: &[CommandSpec] = &[
@@ -239,6 +240,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         positional: None,
         flags: PROJECTS_FLAGS,
         summary: "list projects that have session history",
+    },
+    CommandSpec {
+        name: "memories",
+        tool: tools::LIST_MEMORIES,
+        positional: None,
+        flags: MEMORIES_FLAGS,
+        summary: "list the memory files agents keep, grouped by project",
     },
 ];
 
@@ -756,11 +764,13 @@ whether an error has been seen before — git history does not hold that.
     wake-cli sessions --project \"$PWD\" --limit 10
     wake-cli search \"<terms>\" --project \"$PWD\"
     wake-cli show <key>
+    wake-cli memories --project \"$PWD\"
 
 `sessions` and `search` print a key for every session; `search` also prints a
-`wake://session/<key>#<seq>` reference that `show` accepts. Always pass
---project \"$PWD\" — without it every project on the machine is in scope.
-Everything is read-only.";
+`wake://session/<key>#<seq>` reference that `show` accepts. `memories` lists the
+notes agents keep for themselves about the project, each with a `wake://memory/…`
+reference `show` accepts. Always pass --project \"$PWD\" — without it every
+project on the machine is in scope. Everything is read-only.";
 
 /// 一行装好 skill。`owner/repo` 形式由 vercel-labs 的 skills CLI 认,仓库里
 /// 有 `skills/` 目录即可被发现。Settings → Connect 的 Skill 卡展示的就是它,
@@ -858,6 +868,14 @@ mod tests {
     /// 故意不给 CLI 子命令的工具(现在没有)。加工具时要么进 COMMANDS,要么
     /// 在这里写明白为什么不进
     const NOT_IN_CLI: &[&str] = &[];
+
+    /// 贴进 CLAUDE.md 的那段是 agent 唯一常驻的说明:记忆这一面(子命令与引用形态)
+    /// 得点到名,否则只读这段的 agent 不知道有它(2026-09-21 review)
+    #[test]
+    fn agent_memo_mentions_memories() {
+        assert!(AGENT_MEMO.contains("wake-cli memories --project"));
+        assert!(AGENT_MEMO.contains("wake://memory/"));
+    }
 
     fn p(a: &[&str]) -> Result<Invocation, CliError> {
         parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())

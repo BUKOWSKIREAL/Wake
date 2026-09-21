@@ -470,6 +470,9 @@ fn run_scan_inner(
     if sync_parent_links(adapters, store)? {
         events.on_sessions_changed();
     }
+    if sync_memories(adapters, store) {
+        events.on_sessions_changed();
+    }
     if force_grok_backfill && grok_backfill_succeeded {
         store.finish_grok_parent_backfill()?;
     }
@@ -480,17 +483,90 @@ fn run_scan_inner(
     Ok(())
 }
 
+/// 记忆文档随每轮扫描整组刷新:同 (agent, host) 的各实例(默认根 + 自定义根;远程
+/// 镜像按 host 自成组)合并后交给 store 按组替换,消失的文件随之出库。项目归属
+/// 不在这里算(读库时按 session_key 连 sessions)。某家读失败只 eprintln 并**跳过
+/// 该组**(None,不替换,免得一次瞬时失败把库里那组清空),不截断整轮——与会话
+/// 枚举同规矩。库里有、roster 里已经没有的分组(删掉的远程 host、停用的 agent)
+/// 整组清掉——否则它们的记忆在会话与缓存都没了之后还能被列出、搜到(Codex review
+/// 2026-09-17)
+fn sync_memories(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool {
+    /// 一组的收集结果:读成功的实例给文档,读失败的实例给它的根(那些根下的行冻结)
+    #[derive(Default)]
+    struct Group {
+        docs: Vec<MemoryDoc>,
+        frozen: Vec<std::path::PathBuf>,
+        succeeded: usize,
+        failed: usize,
+    }
+    let mut groups: std::collections::BTreeMap<(AgentId, String), Group> =
+        std::collections::BTreeMap::new();
+    for (agent, host) in store.memory_groups().unwrap_or_default() {
+        groups.entry((agent, host)).or_default();
+    }
+    for adapter in adapters {
+        let group = groups
+            .entry((adapter.agent(), adapter.host().to_string()))
+            .or_default();
+        match adapter.list_memories() {
+            Ok(docs) => {
+                group.docs.extend(docs);
+                group.succeeded += 1;
+            }
+            Err(e) => {
+                // 同 (agent, host) 的别的实例(默认根 + 自定义根)照常对账,只冻结这个
+                // 实例根下的行——原先一个实例失败就整组不写,一个坏 location 会让默认
+                // 实例的记忆永远停在上次(2026-09-21 review)
+                eprintln!(
+                    "[scanner] memories of {} failed: {e}",
+                    adapter.agent().as_str()
+                );
+                group.frozen.extend(adapter.memory_roots());
+                group.failed += 1;
+            }
+        }
+    }
+    let mut changed = false;
+    for ((agent, host), group) in groups {
+        // 这一组的实例全失败:整组原样保留(roster 里没有实例的组是 0/0,照常清空)
+        if group.succeeded == 0 && group.failed > 0 {
+            continue;
+        }
+        match store.replace_memories(agent, &host, &group.docs, &group.frozen) {
+            Ok(c) => changed |= c,
+            Err(e) => eprintln!(
+                "[scanner] memories write failed for {}: {e}",
+                agent.as_str()
+            ),
+        }
+    }
+    changed
+}
+
 /// 多 location 下关系元数据跟着 parent 会话，而 child 的胜出文件可能在另一根。
 /// 因此先接受“关系目标 parent 的胜出文件也属于该快照”的直接边，再跨快照把
 /// 嵌套链扁平到 root。解除/换父前重解析 child，恢复被旧父项目覆盖的自身归属。
 fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> Result<bool> {
     let mut managed_agents = std::collections::HashSet::new();
+    let mut unknown_agents = std::collections::HashSet::new();
     let mut links_by_adapter: Vec<std::collections::HashMap<String, String>> =
         Vec::with_capacity(adapters.len());
     for adapter in adapters {
         if adapter.manages_parent_links() {
             managed_agents.insert(adapter.agent());
-            links_by_adapter.push(adapter.parent_links().into_iter().collect());
+            match adapter.parent_links() {
+                Some(links) => links_by_adapter.push(links.into_iter().collect()),
+                None => {
+                    // 这一刻读不出关系(state DB 打不开):这一家整段跳过,库里的关系
+                    // 原样保留——拿空快照对账就是整家清空(2026-09-21 review)
+                    eprintln!(
+                        "[scanner] parent links of {} unreadable this round; keeping the indexed ones",
+                        adapter.agent().as_str()
+                    );
+                    unknown_agents.insert(adapter.agent());
+                    links_by_adapter.push(std::collections::HashMap::new());
+                }
+            }
         } else {
             links_by_adapter.push(std::collections::HashMap::new());
         }
@@ -498,6 +574,9 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
 
     let mut changed = false;
     for agent in managed_agents {
+        if unknown_agents.contains(&agent) {
+            continue;
+        }
         // 这一家眼下一条关系都没有、库里也没有:整段对账是纯浪费——
         // session_sources_for_agent 要把这家全部会话读一遍,replace_parent_links
         // 还要开写事务与扫描线程抢锁。watcher 只要**任一**受影响 agent 管关系
@@ -588,8 +667,13 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
                 continue;
             }
             // 保留不会留下悬空关系:replace_parent_links 的 UPDATE 带
-            // EXISTS(parent),parent 真没了这条边写不进去
-            if asserted.contains(&(child.as_str(), old_parent.as_str())) {
+            // EXISTS(parent),parent 真没了这条边写不进去。只在这一轮算不出这个
+            // child 的父时才保留:算得出(parent 已入库、链已扁平到 root)就以算出的
+            // 为准——否则先入库的直接边 child→mid 会一直压住 child→root,两层
+            // spawn 链永远钉在中间那层(2026-09-21 review)
+            if !desired_map.contains_key(&child)
+                && asserted.contains(&(child.as_str(), old_parent.as_str()))
+            {
                 desired_map.insert(child, old_parent);
                 continue;
             }

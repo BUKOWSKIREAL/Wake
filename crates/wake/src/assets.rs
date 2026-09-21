@@ -78,6 +78,10 @@ icons!(
     "window-maximize",
     "window-restore",
     "window-close",
+    // 底部工具条的页切换:Sessions 用双气泡(单气泡 message-square 留给消息级用途)
+    "messages-square",
+    // Memory 页(侧栏模式标题与底部工具条入口)
+    "brain",
     "star",
     "pin",
     "download",

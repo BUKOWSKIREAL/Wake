@@ -38,6 +38,18 @@
 //! tool / step-start / step-finish 五种 part、中途换模型、429 失败的 turn 全吻合;
 //! 同日 ZCode 开源(github.com/zai-org/zcode,Apache-2.0),task_type / semantics /
 //! title_source / migration_source / deleted 的语义全部按源码核过。
+//!
+//! 记忆(2026-09-21 晚,记忆可见层):`cli/memories/projects/<slug>-<hash>/memory/*.md`,
+//! `MEMORY.md` 索引 + 逐条主题文件,frontmatter(name / description / metadata.type)
+//! 与 Claude auto-memory 同款——源码 context/sections/memory.ts 那段提示词就是照着
+//! Claude 的写的,由它的 memory extraction 子代理在对话后写入,桌面端自己也有一个
+//! 只认 `*.md` 的 Project Memory 列表。目录名的 hash 是 sha256(工作区路径) 的前
+//! 16 位(memory/project-root.ts;win32 先小写),而库里每条会话都带 directory:
+//! 逐条算一遍就精确对上项目,不用会话锚点、不用像 Claude 那样在磁盘上反推;
+//! 对不上的落 Unknown project。只从 home 形态取(裸库拷贝没有 home,不摸父目录)。
+//! 本机目录还是空的:目录名规则对真机核过(`default-0e81bcb7a4286b1b` 正是库里唯一
+//! 工作区 `~/.zcode/workspace/default` 的 hash),文件格式按源码推断、**未经真机验证**
+//! (OpenClaw / CodeBuddy 同款),fixture 合成。
 use super::opencode::{parse_v1_messages, V1Order};
 use super::parse_utils::*;
 use super::sqlite_ro::{
@@ -48,7 +60,8 @@ use crate::models::*;
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde_json::Value;
-use std::collections::HashSet;
+use sha2::{Digest as _, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const HOME_DIR_NAME: &str = ".zcode";
@@ -56,15 +69,21 @@ const HOME_DIR_NAME: &str = ".zcode";
 const DB_REL: &str = "cli/db/db.sqlite";
 /// 桌面层的任务索引,相对 ZCode home
 const TASKS_REL: &str = "v2/tasks-index.sqlite";
+/// 按项目的记忆目录,相对 ZCode home:`<slug>-<hash>/memory/*.md`
+const MEMORIES_REL: &str = "cli/memories/projects";
 
 pub struct ZcodeAdapter {
     db: PathBuf,
     /// None = 孤立的库拷贝(自定义 location 直接选了 db.sqlite),没有桌面层,什么都不藏
     tasks_db: Option<PathBuf>,
+    /// ZCode home(记忆目录的所在);孤立的库拷贝没有——侧档绝不越界摸父目录(不变量 8⑨)
+    home: Option<PathBuf>,
     /// 枚举查询带全表相关子查询,按库 mtime 缓存一轮扫描内的重复调用
     rows_cache: MtimeCache<Vec<ZcRow>>,
     /// tasks-index 里要藏的会话 id,按它自己的 mtime 缓存
     hidden_cache: MtimeCache<HashSet<String>>,
+    /// 记忆文档按目录指纹缓存(每轮扫描都会列,没变不重读)
+    memories: MtimeCache<Vec<MemoryDoc>>,
 }
 
 #[derive(Clone)]
@@ -133,15 +152,30 @@ impl ZcodeAdapter {
         let home = super::env_dir("ZCODE_STORAGE_DIR")
             .filter(|dir| dir.join(DB_REL).is_file())
             .unwrap_or_else(|| super::home_dir().unwrap_or_default().join(HOME_DIR_NAME));
-        Self::with_paths(home.join(DB_REL), Some(home.join(TASKS_REL)))
+        Self::from_home(home)
     }
 
-    fn with_paths(db: PathBuf, tasks_db: Option<PathBuf>) -> Self {
+    /// home 形态:库、任务索引、记忆目录全相对派生
+    fn from_home(home: PathBuf) -> Self {
         Self {
-            db,
-            tasks_db,
+            db: home.join(DB_REL),
+            tasks_db: Some(home.join(TASKS_REL)),
+            home: Some(home),
             rows_cache: MtimeCache::new(),
             hidden_cache: MtimeCache::new(),
+            memories: MtimeCache::new(),
+        }
+    }
+
+    /// 孤立的库拷贝:只有会话,没有桌面层、没有记忆
+    fn from_db(db: PathBuf) -> Self {
+        Self {
+            db,
+            tasks_db: None,
+            home: None,
+            rows_cache: MtimeCache::new(),
+            hidden_cache: MtimeCache::new(),
+            memories: MtimeCache::new(),
         }
     }
 
@@ -149,23 +183,29 @@ impl ZcodeAdapter {
         open_sqlite_ro(&self.db, "zcode")
     }
 
+    /// 行清单。库这一刻读不出(ZCode 原地 migration、copy 梯度失败)交回**上一次读到
+    /// 的**:枚举接口表达不了"不知道",而空清单会让 scanner 把整家会话当"磁盘已删"
+    /// 清掉、下一轮再全部重解析回来;从没读成功过才是 None(2026-09-21 review)
     fn rows(&self) -> Option<Vec<ZcRow>> {
         let stamp = db_cache_stamp(&self.db);
-        self.rows_cache.get_or_try_build(stamp, || {
+        self.rows_cache.get_or_stale(stamp, || {
             let ro = self.open()?;
             query_rows(&ro.conn, ZcSchema::probe(&ro.conn), None).ok()
         })
     }
 
-    /// 桌面层要藏起来的会话 id。`None`(库在但读不出)不缓存、下次重试;
-    /// 库不在 = 确定没有要藏的(只同步了 cli 库的远程缓存、没装桌面端)
+    /// 桌面层要藏起来的会话 id。库不在 = 确定没有要藏的(只同步了 cli 库的远程缓存、
+    /// 没装桌面端);库在但读不出 = 不知道,用上一次读到的名单(`get_or_stale`,戳不
+    /// 更新、下次重试)——折成空名单会把用户在桌面端删掉的、向导从 Claude 导入的
+    /// 会话整批放进索引(2026-09-21 review);本进程从没读成功过的第一轮仍是空,
+    /// 那一轮多列的行在下一轮读成功后随枚举消失
     fn hidden(&self) -> HashSet<String> {
         let Some(tasks_db) = &self.tasks_db else {
             return HashSet::new();
         };
         let stamp = db_cache_stamp(tasks_db);
         self.hidden_cache
-            .get_or_try_build(stamp, || read_hidden(tasks_db))
+            .get_or_stale(stamp, || read_hidden(tasks_db))
             .unwrap_or_default()
     }
 
@@ -417,18 +457,89 @@ impl AgentAdapter for ZcodeAdapter {
         vec![self.db.clone()]
     }
 
+    fn memory_roots(&self) -> Vec<PathBuf> {
+        self.home
+            .as_ref()
+            .map(|home| vec![home.join(MEMORIES_REL)])
+            .unwrap_or_default()
+    }
+
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        let Some(home) = &self.home else {
+            return Ok(Vec::new());
+        };
+        let projects = home.join(MEMORIES_REL);
+        let entries = match std::fs::read_dir(&projects) {
+            Ok(entries) => entries,
+            // 没这个目录 = 确定没有记忆;别的读取失败报 Err,scanner 跳过这一组不动库
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!("read {}: {e}", projects.display())),
+        };
+        // 目录名 `<slug>-<hash>` 的 hash 对应库里会话的 directory(见 memory_dir_hash);
+        // 库读不出就都对不上,记忆照列、落 Unknown project
+        let workspaces: HashMap<String, String> = self
+            .rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (memory_dir_hash(&row.directory), row.directory))
+            .collect();
+        let mut dirs: Vec<super::MemoryDir> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let dir = entry.path().join("memory");
+                if !dir.is_dir() {
+                    return None;
+                }
+                let project_path = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.rsplit_once('-'))
+                    .and_then(|(_, hash)| workspaces.get(hash))
+                    .cloned()
+                    .unwrap_or_default();
+                Some(super::MemoryDir {
+                    scope: MemoryScope::Project,
+                    session_key: String::new(),
+                    project_path,
+                    dir,
+                })
+            })
+            .collect();
+        dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
+        super::cached_memory_docs(&self.memories, AgentId::Zcode, &dirs)
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 只按路径形状整形、不看存不存在:远程缓存首次同步前目录还没落盘,
         // 判据随目录出现而改判会让先构造的实例指错树(契约测试卡)。认两种:
         // ZCode home,或直接给到 db.sqlite——后者是孤立的库拷贝,没有桌面层;
         // 中间层(cli/、cli/db/)由 normalize_custom_root 在入库前上提到 home
         if dir.file_name().is_some_and(|n| n == "db.sqlite") {
-            Box::new(Self::with_paths(dir, None))
+            Box::new(Self::from_db(dir))
         } else {
-            Box::new(Self::with_paths(
-                dir.join(DB_REL),
-                Some(dir.join(TASKS_REL)),
-            ))
+            Box::new(Self::from_home(dir))
         }
     }
+}
+
+/// 记忆目录名 `<slug>-<hash>` 里的 hash:sha256(工作区路径) 的十六进制前 16 位
+/// (源码 memory/project-root.ts:路径先 `resolve`——这里只剥收尾分隔符——win32 再
+/// 小写)。库里 session.directory 就是那条工作区路径,算一遍就能对上
+pub fn memory_dir_hash(workspace: &str) -> String {
+    let trimmed = workspace.trim_end_matches(std::path::is_separator);
+    let key = if trimmed.is_empty() {
+        workspace
+    } else {
+        trimmed
+    };
+    let key = if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key.to_string()
+    };
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }

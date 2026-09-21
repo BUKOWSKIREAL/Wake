@@ -613,6 +613,149 @@ pub const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
 pub const MAX_TOOL_IO: usize = 16 * 1024;
 pub const MAX_TITLE: usize = 80;
 
+/// agent 自己写下的记忆文档(Claude Code 的 auto-memory、Codex 的 memories)。Wake
+/// 只读:列出、搜索、阅读,不编辑、不同步、不删除——写别家数据破铁律,各家格式
+/// 与语义也不同。落 memories 表,扫描收尾时由各家 `list_memories` 按 (agent, host)
+/// 整组替换
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDoc {
+    /// `{agent}:{path}`,远程 `{agent}:{host}:{path}`——与会话 key 同一构造点
+    /// (`session_key`),远程装饰器插 host 的逻辑因此一份通吃;agent 恒为首段
+    pub key: String,
+    pub agent: AgentId,
+    /// 远程 host 名;空 = 本地
+    pub host: String,
+    pub scope: MemoryScope,
+    /// 归属的项目路径。adapter 一般不填(留空),读库时按 `session_key` 连 sessions
+    /// 表解析——项目归属随索引走、永远是新的,不在写入时定格;adapter 自己知道
+    /// 项目时可以直接填,填了优先。用户级恒空
+    pub project_path: String,
+    pub project_name: String,
+    /// 归属锚点:线程级记忆是它所属的会话,Claude 项目级记忆是该项目目录里最新的
+    /// 一条会话(同目录的会话同一个 cwd);用户级为空。只有线程级才在界面上标成
+    /// "session memory",项目级的锚点只用来解析项目
+    pub session_key: String,
+    /// 文件路径;SQLite 型是 `<db>#<id>` 虚拟路径(sqlite_ro::virtual_path)
+    pub path: String,
+    pub title: String,
+    /// epoch ms
+    pub updated_at: i64,
+    pub size_bytes: i64,
+    /// 正文原样(含 frontmatter);文件型阅读时先读磁盘,这份是索引与兜底
+    pub body: String,
+}
+
+/// Memory 页侧栏的导航计数:总数、按 agent、按解析出的项目(用户级记忆只计入
+/// 总数与 agent,不属于任何项目;没归属的记在 path 为空的那一项)
+#[derive(Debug, Clone, Default)]
+pub struct MemoryCounts {
+    pub total: i64,
+    pub agents: Vec<(AgentId, i64)>,
+    pub projects: Vec<MemoryProject>,
+}
+
+/// 一个项目名下的记忆文件数(path 为空 = 没归属的那一组)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryProject {
+    pub path: String,
+    pub name: String,
+    pub count: i64,
+    /// 组内最近一次更新,epoch ms
+    pub updated_at: i64,
+}
+
+/// 记忆文档归哪一组:用户级一组、没归属一组、其余按项目——GUI 的分组/侧栏/页头与
+/// MCP 的组头都从这里派生,判据(scope、project_path 空不空)只写一处
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryGroup<'a> {
+    User,
+    Unknown,
+    Project { path: &'a str, name: &'a str },
+}
+
+impl MemoryDoc {
+    pub fn group(&self) -> MemoryGroup<'_> {
+        if self.scope == MemoryScope::User {
+            MemoryGroup::User
+        } else if self.project_path.is_empty() {
+            MemoryGroup::Unknown
+        } else {
+            MemoryGroup::Project {
+                path: &self.project_path,
+                name: &self.project_name,
+            }
+        }
+    }
+}
+
+/// 记忆的归属层级
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    /// 跨项目的用户级(Codex 的 memories/*.md)
+    User,
+    /// 某个项目的(Claude Code 的 projects/<dir>/memory/)
+    Project,
+    /// 某条会话的(Codex 的 stage1_outputs 逐线程摘要)
+    Thread,
+}
+
+impl MemoryScope {
+    /// 落库/传输用的小写名
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Thread => "thread",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(Self::User),
+            "project" => Some(Self::Project),
+            "thread" => Some(Self::Thread),
+            _ => None,
+        }
+    }
+
+    /// 人读标签(MCP 输出用;UI 另过 t())
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user-level",
+            Self::Project => "project",
+            Self::Thread => "session",
+        }
+    }
+}
+
+/// 记忆列表/搜索的筛选面(Memory 页与 wake_list_memories / wake_search 共用)
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilter {
+    pub agents: Vec<AgentId>,
+    /// 项目路径并集;空串不匹配任何东西。用户级记忆对每个项目都成立,任何项目筛选
+    /// 下都列出
+    pub project_paths: Vec<String>,
+    /// 只要没归属(项目解析不出)的那一组——GUI 侧栏的 Unknown project 行;与
+    /// `project_paths` 一起时取并集。显式一位,不拿空串当暗号
+    pub unattributed: bool,
+    /// 0 = 不限
+    pub limit: i64,
+}
+
+impl MemoryFilter {
+    /// 有没有任何项目维度的筛选
+    pub fn scopes_projects(&self) -> bool {
+        !self.project_paths.is_empty() || self.unattributed
+    }
+}
+
+/// 记忆搜索的一条命中(snippet 带 HL_OPEN/HL_CLOSE 高亮哨兵,与会话命中同款)
+#[derive(Debug, Clone)]
+pub struct MemoryHit {
+    pub doc: MemoryDoc,
+    pub snippet: String,
+}
+
 /// 无标题会话的占位标题(quickMeta 守卫与 adapters 共用,防半/全角漂移)
 pub const UNTITLED: &str = "Untitled";
 

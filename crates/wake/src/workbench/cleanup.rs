@@ -496,7 +496,8 @@ impl Workbench {
             self.leave_cleanup(cx);
             return;
         }
-        self.insights_open = false;
+        // 叠在会话视图上:整页目的地(Insights / Memory)先落回会话列表
+        self.page = Page::Sessions;
         self.cleanup.saved_detail = self.detail.take();
         self.cleanup.open = true;
         self.cleanup.history_open = false;

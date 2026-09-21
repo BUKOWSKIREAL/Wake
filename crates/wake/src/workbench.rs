@@ -16,6 +16,7 @@
 // ============================================================================
 use crate::i18n::t;
 mod cleanup;
+mod memory;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -872,22 +873,7 @@ impl ListDelegate for SessionsDelegate {
         if label.is_empty() {
             return None;
         }
-        let theme = cx.theme();
-
-        Some(
-            h_flex()
-                .h(px(32.))
-                .w_full()
-                .items_center()
-                .gap(SPACE_SM)
-                .px(SPACE_MD)
-                .pt(SPACE_XS)
-                .text_size(FONT_LABEL)
-                .font_medium()
-                .text_color(theme.muted_foreground)
-                .child(div().flex_shrink_0().child(label))
-                .child(div().h(px(1.)).flex_1().bg(theme.border.opacity(0.72))),
-        )
+        Some(section_header_row(label, cx.theme()))
     }
 
     // 还有下一页时返回 true。失败后停住，等待用户刷新重建 delegate，
@@ -2092,6 +2078,17 @@ mod detail_selection_tests {
 
 // ---------------- Workbench ----------------
 
+/// 主区当前显示的页:会话列表 + 阅读面,或两个整页目的地(侧栏底部入口)。一个
+/// 字段承担互斥——三个 bool 各自"关掉别人"漏一处就是两页同时亮(2026-09-17
+/// /simplify)。Clean up 是叠在会话视图上的模式(侧栏筛选仍然作用于它),另有
+/// `cleanup.open`,进入时把这里落回 Sessions
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Sessions,
+    Insights,
+    Memory,
+}
+
 pub struct Workbench {
     focus_handle: FocusHandle,
     store: Arc<Store>,
@@ -2164,10 +2161,13 @@ pub struct Workbench {
     /// 器也不会误清新状态。
     image_action_feedback_generation: u64,
 
-    /// Insights 页(侧栏底部入口):打开时替换中栏+右栏。与其他导航目的地
-    /// 互斥(侧栏单选模型);数据在 open/refresh 时后台重算,Rc 免深拷贝
-    insights_open: bool,
+    /// 主区当前的页(侧栏单选模型):Insights / Memory 打开时替换中栏+右栏,
+    /// 数据在 open/refresh 时后台重算
+    page: Page,
     cleanup: cleanup::CleanupState,
+    /// Memory 页的数据与选中态(agent 自己写的记忆文档)
+    memory: memory::MemoryState,
+    /// Insights 页数据,Rc 免深拷贝
     insights: Option<Rc<InsightsData>>,
     insights_loading: bool,
     insights_range: InsightsRange,
@@ -2495,8 +2495,9 @@ impl Workbench {
             detail_selection_auto_scroll: AutoScroll::default(),
             detail: None,
             image_action_feedback_generation: 0,
-            insights_open: false,
+            page: Page::Sessions,
             cleanup: cleanup::CleanupState::default(),
+            memory: memory::MemoryState::default(),
             insights: None,
             insights_loading: false,
             insights_range: InsightsRange::Hour,
@@ -2620,9 +2621,9 @@ impl Workbench {
         self.agent_counts = counts;
         self.projects = self.store.list_projects(false).unwrap_or_default();
         self.starred_count = self.store.starred_count().unwrap_or(0);
-        // Insights 打开着就顺带重算:扫描增量/收藏变更等一切走 refresh 的
+        // Insights / Memory 打开着就顺带重算:扫描增量/收藏变更等一切走 refresh 的
         // 路径都会让页面数据跟上,不设第二条失效通道
-        self.reload_insights(cx);
+        self.reload_page(cx);
         cx.notify();
     }
 
@@ -2668,27 +2669,40 @@ impl Workbench {
         }
     }
 
-    /// 侧栏底部入口。再点一次(或点任意导航行)退回会话列表
-    fn toggle_insights(&mut self, cx: &mut Context<Self>) {
+    /// 底部工具条的页切换(不是开关:再点当前页不退出)。回会话列表不动筛选;去整页
+    /// 目的地时清掉三个会话筛选、Memory 的侧栏筛选也从全部开始——互斥单选,点任意
+    /// 导航行都退回会话列表(`set_scope`)
+    fn show_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.leave_cleanup(cx);
-        if self.insights_open {
-            self.insights_open = false;
+        if self.page == page {
             cx.notify();
             return;
         }
-        self.insights_open = true;
-        // 互斥单选:Insights 是独立目的地,退出时落回 All Sessions
-        self.selected_agent = None;
-        self.selected_project = None;
-        self.favorite_only = false;
+        self.page = page;
+        if page != Page::Sessions {
+            self.selected_agent = None;
+            self.selected_project = None;
+            self.favorite_only = false;
+            self.reset_memory_scope();
+        }
         self.refresh(cx);
+    }
+
+    /// 打开着的整页目的地顺带重载(refresh 与扫描终态都走这里);各页自己按住
+    /// "扫描中且已有数据"的情形
+    fn reload_page(&mut self, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Sessions => {}
+            Page::Insights => self.reload_insights(cx),
+            Page::Memory => self.reload_memories(cx),
+        }
     }
 
     /// messages 全表分桶几十毫秒量级,走后台;已有数据时静默换新不闪 loading。
     /// 扫描进行中 Changed 事件每秒都来,有旧数据就先按住——终态 Progress
     /// 会补最后一次;新任务覆盖 insights_task 即取消旧查询,不堆积读锁竞争
     fn reload_insights(&mut self, cx: &mut Context<Self>) {
-        if !self.insights_open {
+        if self.page != Page::Insights {
             return;
         }
         if self.scan.scanning && self.insights.is_some() {
@@ -3940,9 +3954,9 @@ impl Workbench {
                     self.pending_rescan = false;
                     self.kick_incremental_scan(cx);
                 }
-                // 扫描期间 reload_insights 被按住(见其注释),终态补最后一次
+                // 扫描期间整页目的地的重载被按住(见 reload_insights 注释),终态补最后一次
                 if !self.scan.scanning {
-                    self.reload_insights(cx);
+                    self.reload_page(cx);
                 }
                 cx.notify();
                 note
@@ -4425,7 +4439,7 @@ impl Workbench {
         self.selected_agent = agent;
         self.selected_project = project;
         self.favorite_only = favorite;
-        self.insights_open = false;
+        self.page = Page::Sessions;
         self.refresh(cx);
     }
 
@@ -4448,6 +4462,11 @@ impl Workbench {
             .flatten()
             .is_some_and(|session| !session.archived)
         {
+            // 阅读面只在会话页才画:从 Memory / Insights(或清理模式)里 ⌘K 打开归档命中,
+            // 得先落回会话页,否则 detail 设了却什么都不显示(2026-09-21 review)
+            self.leave_cleanup(cx);
+            self.page = Page::Sessions;
+            cx.notify();
             return;
         }
         self.show_all_sessions(window, cx);
@@ -4970,7 +4989,7 @@ impl Workbench {
         let all_active = self.selected_agent.is_none()
             && self.selected_project.is_none()
             && !self.favorite_only
-            && !self.insights_open
+            && self.page == Page::Sessions
             && !self.cleanup.open;
         // 常态沉默,仅刷新中/监听失效时出现;None 时状态栏整行不渲染。
         // 文案在此按 scan 现算,不另存字段——存下来就会有第二个写入点要维护
@@ -5060,9 +5079,70 @@ impl Workbench {
                             .text_size(FONT_HEADING)
                             .font_semibold()
                             .text_color(theme.foreground)
-                            .child("Wake"),
+                            // Memory 页标题换成 Memory:侧栏顶上就说明现在管的是什么,
+                            // 不另加模式标题行(用户 2026-09-21)
+                            .child(if self.page == Page::Memory {
+                                t("Memory")
+                            } else {
+                                "Wake"
+                            }),
                     ),
             )
+            // 导航按页切换:Memory 页是记忆的导航(All Memory / Agents / Projects,按记忆
+            // 计数),其余是会话的(搜索框 + All Sessions / Starred + Agents / Projects)
+            .child(match self.page {
+                Page::Memory => self.render_memory_nav(cx),
+                _ => self.render_sessions_nav(all_active, cx),
+            })
+            // 底部工具条:次要操作(数据源、刷新)与扫描状态同处一区,与上方
+            // 导航行只用一条 border 分隔。按钮透明底、hover 才出色,不跟导航
+            // 行的选中态抢注意力;图标-only 元素改 text_color 不丢字号
+            .child(
+                v_flex()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.sidebar_border)
+                    .when_some(status, |this, status| {
+                        this.child(
+                            h_flex()
+                                .px(SPACE_XL)
+                                .pt(SPACE_MD)
+                                .text_size(FONT_LABEL)
+                                .child(status),
+                        )
+                    })
+                    // 两端分置的图标条(Zed 状态栏 / Xcode 导航条那种,不带盒子):左端
+                    // 页切换 Sessions / Memory / Insights,当前页那颗用侧栏选中色做底;
+                    // 右端只有 Settings。Refresh 不在这里——它住在各页页头右端(全库重扫,
+                    // 三页同一条路;用户 2026-09-21 三轮反馈:六个一样的图标挤一排不行、
+                    // 刷新不该放这里、带边框的分段盒子也不行)
+                    .child(
+                        h_flex()
+                            .h(SIDEBAR_FOOTER_ROW_HEIGHT)
+                            .pl(FOOTER_LEAD_INSET)
+                            .pr(SIDEBAR_EDGE)
+                            .items_center()
+                            .justify_between()
+                            .child(self.render_page_switch(cx))
+                            .child(h_flex().gap(px(2.)).child(sidebar_tool_btn(
+                                "settings",
+                                t("Settings"),
+                                false,
+                                "icons/settings.svg",
+                                cx.listener(|this, _, _window, cx| this.open_settings(cx)),
+                                cx,
+                            ))),
+                    ),
+            )
+    }
+
+    /// 会话导航(Insights 页也画它——点任何一行都回会话列表):搜索框(搜的是会话,
+    /// ⌘K 同一条路)、All Sessions / Starred 两行,再接 Agents / Projects 两组
+    fn render_sessions_nav(&self, all_active: bool, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .flex_1()
+            .min_h_0()
             .child(
                 div().flex_shrink_0().px(SIDEBAR_EDGE).pb(SPACE_MD).child(
                     h_flex().gap(SPACE_SM).child(
@@ -5079,8 +5159,8 @@ impl Workbench {
                                 this.toggle_search(&ToggleSearch, window, cx)
                             }))
                             .child(icon("icons/search.svg").with_size(px(13.)).flex_shrink_0())
-                            // flex_1 + min_w_0 + truncate:空间不足时压这里,
-                            // 绝不把右侧刷新按钮挤出侧栏
+                            // flex_1 + min_w_0 + truncate:空间不足时压文案,右侧的 ⌘K
+                            // 提示不被挤出侧栏
                             .child(
                                 div()
                                     .flex_1()
@@ -5135,169 +5215,168 @@ impl Workbench {
                         cx,
                     )),
             )
-            .child(
-                v_flex()
-                    .id("sidebar-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(SIDEBAR_EDGE)
-                    .pt(SPACE_XS)
-                    .pb(SPACE_LG)
-                    .gap(SPACE_XS)
-                    .child(group_header(
-                        "agents-header",
-                        t("Agents"),
-                        self.agents_collapsed,
-                        cx.listener(|this, _, _window, cx| {
-                            this.agents_collapsed = !this.agents_collapsed;
-                            cx.notify();
+            .child(self.sidebar_groups(
+                "sidebar-scroll",
+                self.agent_counts.iter().map(|(agent, count)| {
+                    (
+                        *agent,
+                        *count,
+                        self.selected_agent == Some(*agent) && !self.cleanup.open,
+                    )
+                }),
+                self.projects.iter().map(|p| {
+                    (
+                        p.path.clone(),
+                        SharedString::from(p.name.clone()),
+                        p.session_count,
+                        self.selected_project.as_deref() == Some(p.path.as_str())
+                            && !self.cleanup.open,
+                    )
+                }),
+                |this, next, cx| this.set_scope(next, None, false, cx),
+                |this, next, cx| this.set_scope(None, next, false, cx),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// 侧栏的 Agents / Projects 两组(会话导航与 Memory 导航同一套行组件、同一个单选
+    /// 模型,折叠状态两页共用)。每行给 (身份, 计数, 是否当前);点击回调收到切换后的
+    /// 目标——点当前项就是 None(回全部)
+    fn sidebar_groups(
+        &self,
+        id: &'static str,
+        agents: impl IntoIterator<Item = (AgentId, i64, bool)>,
+        projects: impl IntoIterator<Item = (String, SharedString, i64, bool)>,
+        on_agent: fn(&mut Self, Option<AgentId>, &mut Context<Self>),
+        on_project: fn(&mut Self, Option<String>, &mut Context<Self>),
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let dark = cx.theme().mode.is_dark();
+        v_flex()
+            .id(id)
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(SIDEBAR_EDGE)
+            .pt(SPACE_XS)
+            .pb(SPACE_LG)
+            .gap(SPACE_XS)
+            .child(group_header(
+                "agents-header",
+                t("Agents"),
+                self.agents_collapsed,
+                cx.listener(|this, _, _window, cx| {
+                    this.agents_collapsed = !this.agents_collapsed;
+                    cx.notify();
+                }),
+                cx,
+            ))
+            .when(!self.agents_collapsed, |this| {
+                this.children(agents.into_iter().map(|(agent, count, active)| {
+                    sidebar_row(
+                        agent.as_str(),
+                        RowLead::Brand(agent.brand_icon(dark)),
+                        agent.display_name(),
+                        Some(count),
+                        active,
+                        RowLevel::Sub,
+                        cx.listener(move |this, _, _window, cx| {
+                            on_agent(this, (!active).then_some(agent), cx)
                         }),
                         cx,
-                    ))
-                    .when(!self.agents_collapsed, |this| {
-                        this.children(self.agent_counts.iter().map(|(agent, count)| {
-                            let agent = *agent;
-                            sidebar_row(
-                                agent.as_str(),
-                                RowLead::Brand(agent.brand_icon(theme.mode.is_dark())),
-                                agent.display_name(),
-                                Some(*count),
-                                self.selected_agent == Some(agent) && !self.cleanup.open,
-                                RowLevel::Sub,
-                                cx.listener(move |this, _, _window, cx| {
-                                    let next = if this.selected_agent == Some(agent)
-                                        && !this.cleanup.open
-                                    {
-                                        None
-                                    } else {
-                                        Some(agent)
-                                    };
-                                    this.set_scope(next, None, false, cx);
-                                }),
-                                cx,
-                            )
-                        }))
-                    })
-                    .child(group_header(
-                        "projects-header",
-                        t("Projects"),
-                        self.projects_collapsed,
-                        cx.listener(|this, _, _window, cx| {
-                            this.projects_collapsed = !this.projects_collapsed;
-                            cx.notify();
-                        }),
-                        cx,
-                    ))
-                    .when(!self.projects_collapsed, |this| {
-                        this.children(self.projects.iter().enumerate().map(|(ix, p)| {
-                            let path = p.path.clone();
-                            sidebar_row(
-                                ("proj", ix),
-                                RowLead::Icon(icon("icons/folder.svg")),
-                                p.name.clone(),
-                                Some(p.session_count),
-                                self.selected_project.as_deref() == Some(p.path.as_str())
-                                    && !self.cleanup.open,
-                                RowLevel::Sub,
-                                cx.listener(move |this, _, _window, cx| {
-                                    let next = if !this.cleanup.open
-                                        && this.selected_project.as_deref() == Some(path.as_str())
-                                    {
-                                        None
-                                    } else {
-                                        Some(path.clone())
-                                    };
-                                    this.set_scope(None, next, false, cx);
-                                }),
-                                cx,
-                            )
-                        }))
-                    }),
-            )
-            // 底部工具条:次要操作(数据源、刷新)与扫描状态同处一区,与上方
-            // 导航行只用一条 border 分隔。按钮透明底、hover 才出色,不跟导航
-            // 行的选中态抢注意力;图标-only 元素改 text_color 不丢字号
-            .child(
-                v_flex()
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme.sidebar_border)
-                    .when_some(status, |this, status| {
-                        this.child(
-                            h_flex()
-                                .px(SPACE_XL)
-                                .pt(SPACE_MD)
-                                .text_size(FONT_LABEL)
-                                .child(status),
+                    )
+                }))
+            })
+            .child(group_header(
+                "projects-header",
+                t("Projects"),
+                self.projects_collapsed,
+                cx.listener(|this, _, _window, cx| {
+                    this.projects_collapsed = !this.projects_collapsed;
+                    cx.notify();
+                }),
+                cx,
+            ))
+            .when(!self.projects_collapsed, |this| {
+                this.children(projects.into_iter().enumerate().map(
+                    |(ix, (path, label, count, active))| {
+                        sidebar_row(
+                            ("proj", ix),
+                            RowLead::Icon(icon("icons/folder.svg")),
+                            label,
+                            Some(count),
+                            active,
+                            RowLevel::Sub,
+                            cx.listener(move |this, _, _window, cx| {
+                                on_project(this, (!active).then(|| path.clone()), cx)
+                            }),
+                            cx,
                         )
-                    })
-                    .child(
-                        h_flex()
-                            .h(SIDEBAR_FOOTER_ROW_HEIGHT)
-                            .px(SIDEBAR_EDGE)
-                            .items_center()
-                            .justify_end()
-                            .gap(SPACE_XS)
-                            .child(sidebar_tool_btn(
-                                "insights",
-                                t("Insights"),
-                                true,
-                                // 页面打开时图标点亮 primary(显式设色后不被
-                                // hover 的容器 text_color 覆盖)
-                                {
-                                    let mut ic = icon("icons/chart-column.svg").with_size(px(14.));
-                                    if self.insights_open {
-                                        ic = ic.text_color(theme.primary);
-                                    }
-                                    ic.into_any_element()
-                                },
-                                cx.listener(|this, _, _window, cx| this.toggle_insights(cx)),
-                                cx,
-                            ))
-                            .child(sidebar_tool_btn(
-                                "cleanup",
-                                t("Clean Up Sessions"),
-                                true,
-                                icon("icons/brush-cleaning.svg")
-                                    .with_size(px(14.))
-                                    .text_color(if self.cleanup.open {
-                                        theme.primary
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .into_any_element(),
-                                cx.listener(|this, _, window, cx| this.toggle_cleanup(window, cx)),
-                                cx,
-                            ))
-                            .child(sidebar_tool_btn(
-                                "settings",
-                                t("Settings"),
-                                true,
-                                icon("icons/settings.svg")
-                                    .with_size(px(14.))
-                                    .into_any_element(),
-                                cx.listener(|this, _, _window, cx| this.open_settings(cx)),
-                                cx,
-                            ))
-                            .child(sidebar_tool_btn(
-                                "refresh",
-                                t("Refresh sessions"),
-                                !self.scan.scanning,
-                                if self.scan.scanning {
-                                    Spinner::new().small().into_any_element()
-                                } else {
-                                    icon("icons/refresh-cw.svg")
-                                        .with_size(px(14.))
-                                        .into_any_element()
-                                },
-                                cx.listener(|this, _, window, cx| {
-                                    this.refresh_sessions(window, cx)
-                                }),
-                                cx,
-                            )),
-                    ),
+                    },
+                ))
+            })
+    }
+
+    /// 侧栏底部左端的一组:三颗页切换 + Clean up,同尺寸图标钮,当前页那颗 `active`
+    /// (侧栏选中色圆角底)。Sessions 也是一颗——否则从 Memory 回来只能"再点一次
+    /// Memory"。Clean up 打开时三颗页都不亮、它自己亮(它是叠在会话视图上的模式,
+    /// 不是页;用户 2026-09-21 定它也靠左,右端只留 Settings)
+    fn render_page_switch(&self, cx: &Context<Self>) -> AnyElement {
+        let current = (!self.cleanup.open).then_some(self.page);
+        let button = |id: &'static str, tooltip: &'static str, glyph: &'static str, page: Page| {
+            sidebar_tool_btn(
+                id,
+                tooltip,
+                current == Some(page),
+                glyph,
+                cx.listener(move |this, _, _window, cx| this.show_page(page, cx)),
+                cx,
             )
+        };
+        h_flex()
+            .gap(px(2.))
+            .child(button(
+                "page-sessions",
+                t("Sessions"),
+                "icons/messages-square.svg",
+                Page::Sessions,
+            ))
+            .child(button(
+                "page-memory",
+                t("Memory"),
+                "icons/brain.svg",
+                Page::Memory,
+            ))
+            .child(button(
+                "page-insights",
+                t("Insights"),
+                "icons/chart-column.svg",
+                Page::Insights,
+            ))
+            .child(sidebar_tool_btn(
+                "cleanup",
+                t("Clean Up Sessions"),
+                self.cleanup.open,
+                "icons/brush-cleaning.svg",
+                cx.listener(|this, _, window, cx| this.toggle_cleanup(window, cx)),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// 各页页头右端的 Refresh(⌘R 同一条路,全库重扫、不分页——Memory 与 Insights 的
+    /// 数据都是扫描收尾派生的):扫描进行中显示转圈并禁用
+    fn refresh_button(&self, cx: &Context<Self>) -> AnyElement {
+        Button::new("refresh")
+            .ghost()
+            .rounded(RADIUS_BUTTON)
+            .icon(icon("icons/refresh-cw.svg").with_size(px(16.)))
+            .loading(self.scan.scanning)
+            .disabled(self.scan.scanning)
+            .tooltip(t("Refresh"))
+            .on_click(cx.listener(|this, _, window, cx| this.refresh_sessions(window, cx)))
+            .into_any_element()
     }
 
     fn render_session_list(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -5390,7 +5469,13 @@ impl Workbench {
                 self.context_title(),
                 shown_label,
                 SPACE_LG,
-                Some(sort_menu.into_any_element()),
+                Some(
+                    h_flex()
+                        .gap(SPACE_XS)
+                        .child(self.refresh_button(cx))
+                        .child(sort_menu)
+                        .into_any_element(),
+                ),
                 cx,
             ))
             .child(if shown == 0 {
@@ -5992,7 +6077,7 @@ impl Workbench {
                 t("Insights"),
                 subtitle,
                 SPACE_XXL,
-                None,
+                Some(self.refresh_button(cx)),
                 cx,
             ))
             .child(body)
@@ -6311,7 +6396,6 @@ impl Workbench {
             })
             .disabled(detail.source_path.as_deref().is_none_or(str::is_empty))
             .on_click(cx.listener(|this, _, _, cx| this.copy_session_path(cx)));
-        let detail_title_tooltip: SharedString = meta.title.clone().into();
         let session_id = meta.id.clone();
         let export_entity = cx.entity();
         let reveal_entity = export_entity.clone();
@@ -6410,446 +6494,341 @@ impl Workbench {
         });
         let branch: Option<SharedString> =
             visible_git_branch(meta.git_branch.as_deref()).map(|branch| branch.to_string().into());
-        let project_badge: AnyElement = {
-            let badge = badge(
-                meta.project_name.clone(),
-                theme.muted,
-                theme.muted_foreground,
+
+        let project_badge = project_badge(
+            "detail-project",
+            &meta.project_path,
+            meta.project_name.clone(),
+            theme,
+        );
+        let mut lead: Vec<AnyElement> = Vec::new();
+        if self.cleanup.open {
+            lead.push(
+                Button::new("cleanup-back")
+                    .ghost()
+                    .h(px(28.))
+                    .px(SPACE_SM)
+                    .text_size(FONT_CAPTION)
+                    .rounded(RADIUS_BUTTON)
+                    .icon(icon("icons/chevron-left.svg").with_size(px(15.)))
+                    .label(t("Back"))
+                    .tooltip(t("Back to cleanup list"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_cleanup_preview(window, cx);
+                    }))
+                    .into_any_element(),
             );
-            if meta.project_path.is_empty() {
-                div().child(badge).into_any_element()
-            } else {
-                let project_path = meta.project_path.clone();
-                div()
-                    .id("detail-project")
-                    .cursor_pointer()
-                    .tooltip(|window, cx| {
-                        gpui_component::tooltip::Tooltip::new(show_in_fm()).build(window, cx)
-                    })
-                    .on_click(move |_, _, _| terminal::open_in_file_manager(&project_path))
-                    .child(badge)
-                    .into_any_element()
-            }
+        }
+        lead.push(
+            img(meta.agent.brand_icon(theme.mode.is_dark()))
+                .size(px(15.))
+                .flex_shrink_0()
+                .into_any_element(),
+        );
+        lead.push(
+            div()
+                .flex_shrink_0()
+                .child(meta.agent.display_name())
+                .into_any_element(),
+        );
+        lead.push(project_badge);
+        if let Some(branch) = branch {
+            lead.push(
+                h_flex()
+                    .min_w_0()
+                    .gap(SPACE_XS)
+                    .child(
+                        icon("icons/git-branch.svg")
+                            .with_size(px(11.))
+                            .flex_shrink_0(),
+                    )
+                    .child(div().min_w_0().truncate().child(branch))
+                    .into_any_element(),
+            );
+        }
+        let open_in: AnyElement = if terminal::resume_targets(meta).is_empty() {
+            // 没有 resume 形制的 agent(OpenClaw 的 TUI 只按 session
+            // key 开会话):不画 Open In,别给一组点了才报错的死按钮
+            div().into_any_element()
+        } else if let [terminal::ResumeTarget::CopySshCommand] =
+            terminal::resume_targets(meta).as_slice()
+        {
+            // 远程会话(阶段 1 只有 Copy SSH command):单段控件用
+            // 现成 Button,无 chevron 无记忆(split 按钮手搓只因它
+            // 要双段共壳)。本地会话即便只剩一个终端也走 split
+            // 按钮,品牌图标与 per-agent 记忆不丢
+            crate::settings::settings_button(Button::new("open-in-single"), cx)
+                .h(px(28.))
+                .icon(icon("icons/terminal.svg").with_size(px(13.)))
+                .label(t("Copy SSH command"))
+                .tooltip(t(
+                    "Copy the SSH command that resumes this session on its host",
+                ))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.do_resume(terminal::ResumeTarget::CopySshCommand, false, window, cx);
+                }))
+                .into_any_element()
+        } else {
+            // Open In split 按钮(Codex/kooky 风):左段 = 上次
+            // 目标的应用图标,点击直开;右段 chevron 展开列表。
+            // 目标列表按 agent 过滤(Kooky 深链不认 dsh);
+            // 偏好目标不在列表时(如 dsh 会话 + 偏好 Kooky)回退首项
+            let terms: Vec<terminal::TerminalApp> = terminal::resume_targets(meta)
+                .into_iter()
+                .filter_map(|t| match t {
+                    terminal::ResumeTarget::App(app) => Some(app),
+                    _ => None,
+                })
+                .collect();
+            let current = self.open_in_target(meta.agent, &terms);
+            let current_icon = current.and_then(|t| self.terminal_icons.get(t.id()).cloned());
+            let term_items: Vec<(terminal::TerminalApp, Option<PathBuf>)> = terms
+                .iter()
+                .map(|t| (*t, self.terminal_icons.get(t.id()).cloned()))
+                .collect();
+            let menu_entity = cx.entity();
+            // 无常显分隔线,hover 分段高亮暗示两段(Codex 同款);
+            // 右段 Button 用 custom variant 与左段 hover 完全一致
+            h_flex()
+                .h(px(28.))
+                .rounded(RADIUS_BUTTON)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("open-in-main")
+                        .h_full()
+                        .px(px(7.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.secondary_hover))
+                        .active(|s| s.bg(theme.secondary_active))
+                        .child(open_in_icon(
+                            current,
+                            current_icon.as_ref(),
+                            icon("icons/terminal.svg")
+                                .with_size(px(13.))
+                                .text_color(theme.secondary_foreground),
+                        ))
+                        .tooltip({
+                            let label: SharedString = match current {
+                                Some(t) => {
+                                    crate::tf!("Open this session in {}", t.display_name()).into()
+                                }
+                                None => t("Open this session").into(),
+                            };
+                            move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(label.clone())
+                                    .build(window, cx)
+                            }
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(term) = current {
+                                this.do_resume(
+                                    terminal::ResumeTarget::App(term),
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                // 空列表在 macOS 不可能(Terminal.app 恒在),
+                                // Windows/Linux 上 PATH 被启动器改写时会发生
+                                // ——静默无操作是死按钮,至少说一声为什么
+                                window.push_notification(
+                                    Notification::warning(t(
+                                        "No terminal application found on PATH",
+                                    )),
+                                    cx,
+                                );
+                            }
+                        })),
+                )
+                .child(div().w(px(1.)).h_full().flex_shrink_0().bg(theme.border))
+                .child(
+                    Button::new("open-in-more")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(theme.muted_foreground)
+                                .hover(theme.secondary_hover)
+                                .active(theme.secondary_active),
+                        )
+                        .rounded(px(0.))
+                        .h(px(26.))
+                        .w(px(22.))
+                        .icon(icon("icons/chevron-down.svg").with_size(px(12.)))
+                        .tooltip(t("Open this session in…"))
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu.min_w(px(170.));
+                            for (term, icon_path) in term_items.clone() {
+                                let entity = menu_entity.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::element(move |_, _| {
+                                        h_flex()
+                                            .gap(SPACE_SM)
+                                            .items_center()
+                                            .child(open_in_icon(
+                                                Some(term),
+                                                icon_path.as_ref(),
+                                                icon("icons/terminal.svg").with_size(px(15.)),
+                                            ))
+                                            .child(term.display_name())
+                                    })
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            entity.update(cx, |this, cx| {
+                                                this.do_resume(
+                                                    terminal::ResumeTarget::App(term),
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        })
+                        .anchor(Anchor::TopRight),
+                )
+                .into_any_element()
         };
+        let actions: Vec<AnyElement> = vec![
+            open_in,
+            tool_btn(
+                "fav",
+                "icons/star.svg",
+                "icons/star-filled.svg",
+                rgb(crate::theme::STAR_YELLOW).into(),
+                if meta.favorite {
+                    t("Unstar")
+                } else {
+                    t("Star")
+                },
+                meta.favorite,
+                cx.listener(|this, _, window, cx| this.toggle_favorite(window, cx)),
+            )
+            .into_any_element(),
+            tool_btn(
+                "pin",
+                "icons/pin.svg",
+                "icons/pin-filled.svg",
+                theme.primary,
+                if meta.pinned { t("Unpin") } else { t("Pin") },
+                meta.pinned,
+                cx.listener(|this, _, window, cx| this.toggle_pinned(window, cx)),
+            )
+            .into_any_element(),
+            copy_path.into_any_element(),
+            more_menu.into_any_element(),
+        ];
+        let mut meta_rows: Vec<AnyElement> = vec![
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap(SPACE_MD)
+                .items_center()
+                .when_some(meta.model.clone(), |this, model| {
+                    this.child(outline_badge(
+                        model,
+                        rgb(crate::theme::MODEL_BADGE_BG).into(),
+                    ))
+                })
+                .when_some(
+                    meta.source.clone().filter(|s| !s.is_empty()),
+                    |this, source| {
+                        let color = if source == "opencode2" {
+                            theme.primary
+                        } else {
+                            theme.success
+                        };
+                        this.child(outline_badge(source, color))
+                    },
+                )
+                .when(!meta.host.is_empty(), |this| {
+                    // 详情页保持 model/source 同排的描边形态,色相与列表行的 host
+                    // 胶囊一致(primary);muted 描边用户否决 2026-09-03
+                    this.child(outline_badge(format!("@{}", meta.host), theme.primary))
+                })
+                .when(has_detail_facts, |this| {
+                    this.child(div().flex_1().min_w_0().truncate().child(detail_fact_line))
+                })
+                .into_any_element(),
+            h_flex()
+                .min_w_0()
+                .gap(px(6.))
+                .child(icon("icons/folder.svg").with_size(px(12.)).flex_shrink_0())
+                .child(div().min_w_0().truncate().child(detail_path))
+                .into_any_element(),
+        ];
+        if self.cleanup.open {
+            meta_rows.push(self.render_cleanup_detail_facts(cx));
+        }
+        if created_time.is_some() || updated_time.is_some() {
+            meta_rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(
+                        icon("icons/calendar.svg")
+                            .with_size(px(12.))
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap(SPACE_MD)
+                            .when_some(created_time.clone(), |row, (created, tooltip)| {
+                                row.child(
+                                    div()
+                                        .id("detail-created-time")
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(created)
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                                .build(window, cx)
+                                        }),
+                                )
+                            })
+                            .when(created_time.is_some() && updated_time.is_some(), |row| {
+                                row.child(div().flex_shrink_0().text_color(theme.border).child("·"))
+                            })
+                            .when_some(updated_time.clone(), |row, (updated, tooltip)| {
+                                row.child(
+                                    div()
+                                        .id("detail-updated-time")
+                                        .flex_shrink_0()
+                                        .child(updated)
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                                .build(window, cx)
+                                        }),
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(theme.background)
-            .child(
-                v_flex()
-                    .id("detail-header")
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag)
-                    .px(SPACE_XXL)
-                    .pb(SPACE_SM)
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .h(WINDOW_TITLEBAR_HEIGHT)
-                            .items_center()
-                            .justify_between()
-                            .gap(SPACE_MD)
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap(SPACE_SM)
-                                    .items_center()
-                                    .text_size(FONT_LABEL)
-                                    .text_color(theme.muted_foreground)
-                                    .when(self.cleanup.open, |row| row.child(
-                                        Button::new("cleanup-back")
-                                            .ghost()
-                                            .h(px(28.))
-                                            .px(SPACE_SM)
-                                            .text_size(FONT_CAPTION)
-                                            .rounded(RADIUS_BUTTON)
-                                            .icon(icon("icons/chevron-left.svg").with_size(px(15.)))
-                                            .label(t("Back"))
-                                            .tooltip(t("Back to cleanup list"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.close_cleanup_preview(window, cx);
-                                            }))
-                                    ))
-                                    .child(img(meta.agent.brand_icon(theme.mode.is_dark())).size(px(15.)).flex_shrink_0())
-                                    .child(div().flex_shrink_0().child(meta.agent.display_name()))
-                                    .child(project_badge)
-                                    .when_some(branch, |this, branch| {
-                                        this.child(
-                                            h_flex()
-                                                .min_w_0()
-                                                .gap(SPACE_XS)
-                                                .child(icon("icons/git-branch.svg").with_size(px(11.)).flex_shrink_0())
-                                                .child(div().min_w_0().truncate().child(branch)),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .gap(SPACE_XS)
-                                    .child(if terminal::resume_targets(meta).is_empty() {
-                                        // 没有 resume 形制的 agent(OpenClaw 的 TUI 只按 session
-                                        // key 开会话):不画 Open In,别给一组点了才报错的死按钮
-                                        div().into_any_element()
-                                    } else if let [terminal::ResumeTarget::CopySshCommand] =
-                                        terminal::resume_targets(meta).as_slice()
-                                    {
-                                        // 远程会话(阶段 1 只有 Copy SSH command):单段控件用
-                                        // 现成 Button,无 chevron 无记忆(split 按钮手搓只因它
-                                        // 要双段共壳)。本地会话即便只剩一个终端也走 split
-                                        // 按钮,品牌图标与 per-agent 记忆不丢
-                                        crate::settings::settings_button(
-                                            Button::new("open-in-single"),
-                                            cx,
-                                        )
-                                            .h(px(28.))
-                                            .icon(icon("icons/terminal.svg").with_size(px(13.)))
-                                            .label(t("Copy SSH command"))
-                                            .tooltip(
-                                                t("Copy the SSH command that resumes this session on its host"),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.do_resume(
-                                                    terminal::ResumeTarget::CopySshCommand,
-                                                    false,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }))
-                                            .into_any_element()
-                                    } else {
-                                        // Open In split 按钮(Codex/kooky 风):左段 = 上次
-                                        // 目标的应用图标,点击直开;右段 chevron 展开列表。
-                                        // 目标列表按 agent 过滤(Kooky 深链不认 dsh);
-                                        // 偏好目标不在列表时(如 dsh 会话 + 偏好 Kooky)回退首项
-                                        let terms: Vec<terminal::TerminalApp> =
-                                            terminal::resume_targets(meta)
-                                                .into_iter()
-                                                .filter_map(|t| match t {
-                                                    terminal::ResumeTarget::App(app) => Some(app),
-                                                    _ => None,
-                                                })
-                                                .collect();
-                                        let current = self.open_in_target(meta.agent, &terms);
-                                        let current_icon = current
-                                            .and_then(|t| self.terminal_icons.get(t.id()).cloned());
-                                        let term_items: Vec<(terminal::TerminalApp, Option<PathBuf>)> =
-                                            terms
-                                                .iter()
-                                                .map(|t| {
-                                                    (*t, self.terminal_icons.get(t.id()).cloned())
-                                                })
-                                                .collect();
-                                        let menu_entity = cx.entity();
-                                        // 无常显分隔线,hover 分段高亮暗示两段(Codex 同款);
-                                        // 右段 Button 用 custom variant 与左段 hover 完全一致
-                                        h_flex()
-                                            .h(px(28.))
-                                            .rounded(RADIUS_BUTTON)
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .bg(theme.secondary)
-                                            .overflow_hidden()
-                                            .child(
-                                                div()
-                                                    .id("open-in-main")
-                                                    .h_full()
-                                                    .px(px(7.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(theme.secondary_hover))
-                                                    .active(|s| s.bg(theme.secondary_active))
-                                                    .child(open_in_icon(
-                                                        current,
-                                                        current_icon.as_ref(),
-                                                        icon("icons/terminal.svg")
-                                                            .with_size(px(13.))
-                                                            .text_color(theme.secondary_foreground),
-                                                    ))
-                                                    .tooltip({
-                                                        let label: SharedString = match current {
-                                                            Some(t) => crate::tf!("Open this session in {}", t.display_name()).into(),
-                                                            None => t("Open this session").into(),
-                                                        };
-                                                        move |window, cx| {
-                                                            gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
-                                                        }
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        if let Some(term) = current {
-                                                            this.do_resume(
-                                                                terminal::ResumeTarget::App(term),
-                                                                false,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        } else {
-                                                            // 空列表在 macOS 不可能(Terminal.app 恒在),
-                                                            // Windows/Linux 上 PATH 被启动器改写时会发生
-                                                            // ——静默无操作是死按钮,至少说一声为什么
-                                                            window.push_notification(
-                                                                Notification::warning(
-                                                                    t("No terminal application found on PATH"),
-                                                                ),
-                                                                cx,
-                                                            );
-                                                        }
-                                                    })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(1.))
-                                                    .h_full()
-                                                    .flex_shrink_0()
-                                                    .bg(theme.border),
-                                            )
-                                            .child(
-                                                Button::new("open-in-more")
-                                                    .custom(
-                                                        ButtonCustomVariant::new(cx)
-                                                            .foreground(theme.muted_foreground)
-                                                            .hover(theme.secondary_hover)
-                                                            .active(theme.secondary_active),
-                                                    )
-                                                    .rounded(px(0.))
-                                                    .h(px(26.))
-                                                    .w(px(22.))
-                                                    .icon(
-                                                        icon("icons/chevron-down.svg")
-                                                            .with_size(px(12.)),
-                                                    )
-                                                    .tooltip(t("Open this session in…"))
-                                                    .dropdown_menu(move |menu, _, _| {
-                                                        let mut menu = menu.min_w(px(170.));
-                                                        for (term, icon_path) in term_items.clone() {
-                                                            let entity = menu_entity.clone();
-                                                            menu = menu.item(
-                                                                PopupMenuItem::element(move |_, _| {
-                                                                    h_flex()
-                                                                        .gap(SPACE_SM)
-                                                                        .items_center()
-                                                                        .child(open_in_icon(
-                                                                            Some(term),
-                                                                            icon_path.as_ref(),
-                                                                            icon("icons/terminal.svg")
-                                                                                .with_size(px(15.)),
-                                                                        ))
-                                                                        .child(term.display_name())
-                                                                })
-                                                                .on_click(move |_, window, cx| {
-                                                                    entity.update(cx, |this, cx| {
-                                                                        this.do_resume(
-                                                                            terminal::ResumeTarget::App(term),
-                                                                            true,
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    });
-                                                                }),
-                                                            );
-                                                        }
-                                                        menu
-                                                    })
-                                                    .anchor(Anchor::TopRight),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .child(tool_btn(
-                                        "fav",
-                                        "icons/star.svg",
-                                        "icons/star-filled.svg",
-                                        rgb(crate::theme::STAR_YELLOW).into(),
-                                        if meta.favorite {
-                                            t("Unstar")
-                                        } else {
-                                            t("Star")
-                                        },
-                                        meta.favorite,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.toggle_favorite(window, cx)
-                                        }),
-                                    ))
-                                    .child(tool_btn(
-                                        "pin",
-                                        "icons/pin.svg",
-                                        "icons/pin-filled.svg",
-                                        theme.primary,
-                                        if meta.pinned {
-                                            t("Unpin")
-                                        } else {
-                                            t("Pin")
-                                        },
-                                        meta.pinned,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.toggle_pinned(window, cx)
-                                        }),
-                                    ))
-                                    .child(copy_path)
-                                    .child(more_menu),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_h(WINDOW_TITLEBAR_HEIGHT)
-                            .min_w_0()
-                            .py(SPACE_SM)
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id("detail-title")
-                                    .w_full()
-                                    .min_w_0()
-                                    .whitespace_normal()
-                                    .text_size(FONT_TITLE)
-                                    .line_height(relative(1.15))
-                                    .font_semibold()
-                                    .child(meta.title.clone())
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(
-                                            detail_title_tooltip.clone(),
-                                        )
-                                        .build(window, cx)
-                                    }),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .min_w_0()
-                            .pt(SPACE_SM)
-                            .gap(SPACE_SM)
-                            .text_size(FONT_LABEL)
-                            .text_color(theme.muted_foreground)
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .gap(SPACE_MD)
-                                    .items_center()
-                                    .when_some(meta.model.clone(), |this, model| {
-                                        this.child(outline_badge(
-                                            model,
-                                            rgb(crate::theme::MODEL_BADGE_BG).into(),
-                                        ))
-                                    })
-                                    .when_some(
-                                        meta.source.clone().filter(|s| !s.is_empty()),
-                                        |this, source| {
-                                            let color = if source == "opencode2" {
-                                                theme.primary
-                                            } else {
-                                                theme.success
-                                            };
-                                            this.child(outline_badge(source, color))
-                                        },
-                                    )
-                                    .when(!meta.host.is_empty(), |this| {
-                                        // 详情页保持 model/source 同排的描边形态,色相
-                                        // 与列表行的 host 胶囊一致(primary);muted 描边
-                                        // 用户否决 2026-09-03
-                                        this.child(outline_badge(
-                                            format!("@{}", meta.host),
-                                            theme.primary,
-                                        ))
-                                    })
-                                    .when(has_detail_facts, |this| {
-                                        this.child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(detail_fact_line),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .gap(px(6.))
-                                    .child(
-                                        icon("icons/folder.svg")
-                                            .with_size(px(12.))
-                                            .flex_shrink_0(),
-                                    )
-                                    .child(div().min_w_0().truncate().child(detail_path)),
-                            )
-                            .when(self.cleanup.open, |this| this.child(self.render_cleanup_detail_facts(cx)))
-                            .when(created_time.is_some() || updated_time.is_some(), |this| {
-                                this.child(
-                                    h_flex()
-                                        .w_full()
-                                        .min_w_0()
-                                        .gap(px(6.))
-                                        .items_center()
-                                        .child(
-                                            icon("icons/calendar.svg")
-                                                .with_size(px(12.))
-                                                .flex_shrink_0(),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .min_w_0()
-                                                .gap(SPACE_MD)
-                                                .when_some(
-                                                    created_time.clone(),
-                                                    |row, (created, tooltip)| {
-                                                        row.child(
-                                                            div()
-                                                                .id("detail-created-time")
-                                                                .min_w_0()
-                                                                .truncate()
-                                                                .child(created)
-                                                                .tooltip(move |window, cx| {
-                                                                    gpui_component::tooltip::Tooltip::new(
-                                                                        tooltip.clone(),
-                                                                    )
-                                                                    .build(window, cx)
-                                                                }),
-                                                        )
-                                                    },
-                                                )
-                                                .when(
-                                                    created_time.is_some()
-                                                        && updated_time.is_some(),
-                                                    |row| {
-                                                        row.child(
-                                                            div()
-                                                                .flex_shrink_0()
-                                                                .text_color(theme.border)
-                                                                .child("·"),
-                                                        )
-                                                    },
-                                                )
-                                                .when_some(
-                                                    updated_time.clone(),
-                                                    |row, (updated, tooltip)| {
-                                                        row.child(
-                                                            div()
-                                                                .id("detail-updated-time")
-                                                                .flex_shrink_0()
-                                                                .child(updated)
-                                                                .tooltip(move |window, cx| {
-                                                                    gpui_component::tooltip::Tooltip::new(
-                                                                        tooltip.clone(),
-                                                                    )
-                                                                    .build(window, cx)
-                                                                }),
-                                                        )
-                                                    },
-                                                ),
-                                        ),
-                                )
-                            }),
-                    ),
-            )
+            .child(detail_header_frame(
+                "detail-header",
+                lead,
+                actions,
+                meta.title.clone().into(),
+                meta_rows,
+                theme,
+            ))
             .child(if detail.loading {
                 h_flex()
                     .flex_1()
@@ -8011,7 +7990,8 @@ fn message_content(
                 markdown_body(
                     format!("dmsg-{seq}-part-{part}").into(),
                     segment,
-                    session,
+                    &session.host,
+                    &session.project_path,
                     base,
                     paragraph_gap,
                     dark,
@@ -8188,10 +8168,13 @@ fn centered_pill(text: impl Into<SharedString>, cx: &App) -> Div {
 
 /// 对话正文共用的 Markdown 视图。表格、引用块与分隔线由组件原生解析；
 /// Wake 覆写样式、代码操作区,并按会话所属主机处理 macOS 正文链接。
+/// Markdown 正文(消息与记忆文档共用);`host` / `project_path` 只用来解析正文里的
+/// 相对链接(远程会话不开本地文件)
 fn markdown_body(
     id: SharedString,
-    text: &str,
-    session: &SessionMeta,
+    text: impl Into<SharedString>,
+    host: &str,
+    project_path: &str,
     base: Pixels,
     paragraph_gap: gpui::Rems,
     dark: bool,
@@ -8265,7 +8248,7 @@ fn markdown_body(
                 )
         })
         .selectable(true);
-    crate::markdown_links::with_session_links(view, &session.host, &session.project_path)
+    crate::markdown_links::with_session_links(view, host, project_path)
 }
 
 /// Thinking 折叠面板：收起是一行摘要，展开后显示完整原文。
@@ -8687,37 +8670,159 @@ fn outline_badge(name: impl Into<SharedString>, color: Hsla) -> impl IntoElement
         .child(div().truncate().child(name.into()))
 }
 
-/// 侧栏底部工具条的图标按钮。透明底、hover 才出色——底部是次要操作区,
-/// 不与导航行的选中态抢注意力;图标-only 元素改 text_color 不丢字号。
-/// enabled=false(刷新进行中)只留静态内容,连 tooltip 与点击一起摘掉
+/// 列表流里的分组头(会话流的时间分割线、记忆流的项目组头共用):Label 11 medium
+/// muted 的标签 + 右侧低对比度 hairline,32px 高、px 12
+fn section_header_row(label: impl Into<SharedString>, theme: &gpui_component::Theme) -> Div {
+    h_flex()
+        .h(px(32.))
+        .w_full()
+        .items_center()
+        .gap(SPACE_SM)
+        .px(SPACE_MD)
+        .pt(SPACE_XS)
+        .text_size(FONT_LABEL)
+        .font_medium()
+        .text_color(theme.muted_foreground)
+        .child(div().flex_shrink_0().child(label.into()))
+        .child(div().h(px(1.)).flex_1().bg(theme.border.opacity(0.72)))
+}
+
+/// 阅读面头部上下文行里的项目胶囊(会话详情与记忆阅读面共用):有路径就可点、在
+/// 文件管理器里打开;没有(Unknown project)就是静态胶囊
+fn project_badge(
+    id: &'static str,
+    path: &str,
+    label: impl Into<SharedString>,
+    theme: &gpui_component::Theme,
+) -> AnyElement {
+    let badge = badge(label, theme.muted, theme.muted_foreground);
+    if path.is_empty() {
+        return div().child(badge).into_any_element();
+    }
+    let path = path.to_string();
+    div()
+        .id(id)
+        .cursor_pointer()
+        .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(show_in_fm()).build(window, cx))
+        .on_click(move |_, _, _| terminal::open_in_file_manager(&path))
+        .child(badge)
+        .into_any_element()
+}
+
+/// 阅读面头部的骨架(会话详情与记忆阅读面共用):44px 上下文行(左 `lead`:Label muted
+/// 的品牌图 + agent + 归属;右 `actions`)→ 可换行的 22px 标题(整题挂 tooltip)→
+/// Label 的元信息行。整块是窗口拖拽区
+fn detail_header_frame(
+    id: &'static str,
+    lead: Vec<AnyElement>,
+    actions: Vec<AnyElement>,
+    title: SharedString,
+    meta_rows: Vec<AnyElement>,
+    theme: &gpui_component::Theme,
+) -> Stateful<Div> {
+    let title_tooltip = title.clone();
+    v_flex()
+        .id(id)
+        .flex_shrink_0()
+        .window_control_area(WindowControlArea::Drag)
+        .px(SPACE_XXL)
+        .pb(SPACE_SM)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            h_flex()
+                .w_full()
+                .h(WINDOW_TITLEBAR_HEIGHT)
+                .items_center()
+                .justify_between()
+                .gap(SPACE_MD)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(SPACE_SM)
+                        .items_center()
+                        .text_size(FONT_LABEL)
+                        .text_color(theme.muted_foreground)
+                        .children(lead),
+                )
+                .child(h_flex().flex_shrink_0().gap(SPACE_XS).children(actions)),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_h(WINDOW_TITLEBAR_HEIGHT)
+                .min_w_0()
+                .py(SPACE_SM)
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .id((ElementId::from(id), "title"))
+                        .w_full()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_size(FONT_TITLE)
+                        .line_height(relative(1.15))
+                        .font_semibold()
+                        .child(title)
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(title_tooltip.clone())
+                                .build(window, cx)
+                        }),
+                ),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .pt(SPACE_SM)
+                .gap(SPACE_SM)
+                .text_size(FONT_LABEL)
+                .text_color(theme.muted_foreground)
+                .children(meta_rows),
+        )
+}
+
+/// 底部工具条按钮的边长:比导航行(32)小一档
+const FOOTER_BTN: Pixels = px(28.);
+/// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽):最左那颗
+/// 图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
+const FOOTER_LEAD_INSET: Pixels = px(12.75);
+
+/// 底部工具条的图标按钮(Zed 状态栏 / Xcode 导航条同款图标条,不带盒子):透明底、
+/// hover 才出色;`active`(当前页 / 清理模式)用侧栏行的选中色做圆角底 + 选中前景,
+/// 与导航行的选中态同一套语言。14px 图标由容器 text_color 着色
 fn sidebar_tool_btn(
     id: &'static str,
     tooltip: &'static str,
-    enabled: bool,
-    content: AnyElement,
+    active: bool,
+    glyph: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &Context<Workbench>,
 ) -> Stateful<Div> {
     let theme = cx.theme();
     div()
         .id(id)
-        .size(ROW_HEIGHT)
+        .size(FOOTER_BTN)
         .flex_shrink_0()
-        .rounded(theme.radius)
+        .rounded(RADIUS_BUTTON)
         .flex()
         .items_center()
         .justify_center()
-        .text_color(theme.muted_foreground)
-        .when(enabled, |el| {
-            el.cursor_pointer()
+        .cursor_pointer()
+        .when(active, |el| {
+            el.bg(theme.sidebar_accent)
+                .text_color(theme.sidebar_accent_foreground)
+        })
+        .when(!active, |el| {
+            el.text_color(theme.muted_foreground)
                 .hover(|s| s.bg(theme.secondary_hover).text_color(theme.foreground))
                 .active(|s| s.bg(theme.secondary_active))
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx)
-                })
-                .on_click(on_click)
         })
-        .child(content)
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip).build(window, cx))
+        .on_click(on_click)
+        .child(icon(glyph).with_size(px(14.)))
 }
 
 /// Things 风源列表行:图标 + 文字 + 计数,6px 圆角选中胶囊
@@ -8918,15 +9023,17 @@ impl Render for Workbench {
                 h_flex()
                     .size_full()
                     .child(self.render_sidebar(window, cx))
-                    // Insights 是整页目的地:替换中栏+右栏,侧栏导航保持在场
+                    // Insights / Memory 是整页目的地:替换中栏+右栏,侧栏导航保持在场
                     .map(|this| {
                         if self.cleanup.open {
-                            this.child(self.render_cleanup(window, cx))
-                        } else if self.insights_open {
-                            this.child(self.render_insights(cx))
-                        } else {
-                            this.child(self.render_session_list(cx))
-                                .child(self.render_detail(window, cx))
+                            return this.child(self.render_cleanup(window, cx));
+                        }
+                        match self.page {
+                            Page::Memory => this.child(self.render_memory(cx)),
+                            Page::Insights => this.child(self.render_insights(cx)),
+                            Page::Sessions => this
+                                .child(self.render_session_list(cx))
+                                .child(self.render_detail(window, cx)),
                         }
                     }),
             )

@@ -100,6 +100,17 @@ wake-cli show 'claude-code:1b2c3d4e-…' --subagent '*'
 
 Working directories that have session history, most recently active first, with session counts. Use it to find the right `--project` value. Options: `--since`, `--limit` (default 50, max 200).
 
+### `memories`
+
+The memory files agents keep for themselves — Claude Code's per-project auto-memory (`~/.claude/projects/<project>/memory/`), Codex's memories (`~/.codex/memories/`, plus its per-session summaries), ZCode's per-project memory (`~/.zcode/cli/memories/projects/<project>/memory/`) — read-only, grouped by project with user-level files last. User-level files are listed under any `--project` because they apply everywhere, even one that matches no indexed project. Each entry ends with a `wake://memory/…` reference; pass it to `show` to read the file, which is read live from disk. Options: `--project`, `--agent`, `--limit` (default 50, max 100; it caps the project-level files — user-level ones are always included).
+
+```bash
+wake-cli memories --project "$PWD"
+wake-cli show 'wake://memory/claude-code:/Users/me/.claude/projects/-Users-me-app/memory/MEMORY.md'
+```
+
+`search` appends up to five memory files that mention the query, with the same references.
+
 ### `setup`
 
 Prints this binary's path, the index path, how to put it on your `PATH`, a paste-able block that tells an agent when and how to use it, and — when `wake-mcp` sits next to it — the one-line MCP setup for Claude Code. It installs nothing and never edits another tool's config files. The one thing it can write is Wake's own: resolving the default index path creates Wake's data directory and migrates an index left by the old `vibex` builds (`--db` skips that).

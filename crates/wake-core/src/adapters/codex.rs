@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::open_sqlite_ro;
+use super::sqlite_ro::{open_sqlite_ro, virtual_path};
 use super::{units_from_messages, AgentAdapter};
 use crate::models::*;
 use anyhow::Result;
@@ -19,6 +19,13 @@ pub struct CodexAdapter {
     scan_sessions: bool,
     scan_archived: bool,
     links_cache: MtimeCache<Vec<(String, String)>>,
+    /// CODEX_HOME(memories/ 与 memories_1.sqlite 的所在);自定义根选的是独立的
+    /// sessions 目录或裸 rollout 拷贝时没有 home——侧档绝不越界摸父目录(不变量 8⑨)
+    home: Option<PathBuf>,
+    /// memories/*.md 按目录指纹缓存、memories_1.sqlite 的线程记忆按库戳缓存
+    /// (每轮扫描都会列,没变不重读)
+    memories: MtimeCache<Vec<MemoryDoc>>,
+    thread_memories: MtimeCache<Vec<MemoryDoc>>,
 }
 
 impl CodexAdapter {
@@ -36,6 +43,9 @@ impl CodexAdapter {
             scan_sessions: true,
             scan_archived: true,
             links_cache: MtimeCache::new(),
+            home: Some(root),
+            memories: MtimeCache::new(),
+            thread_memories: MtimeCache::new(),
         }
     }
 }
@@ -973,6 +983,103 @@ fn build_meta(r: &SessionFileRef, p: &CodexParse, archived_dir: &Path) -> Sessio
     }
 }
 
+/// memories_1.sqlite 的 stage1_outputs:Codex 记忆整合的第一阶段,按线程一行——
+/// rollout_summary 是对整段会话的摘要,raw_memory 是从中抽出的记忆条目;挂到
+/// `codex:<thread_id>` 会话上,项目读库时按该会话解析。按库 + WAL 的 mtime 戳缓存
+/// (别家 SQLite 型 adapter 同款)。**`None` 与 `Some(空)` 是两件事**:库不存在、
+/// 表不存在(老版本)= 确定没有;库在但打不开 / 读出错 = 不知道,交回 None 让缓存
+/// 不记——把一次瞬时失败缓存成"没有"会让库里的线程记忆整组被删,而戳不动就再也
+/// 不读(Codex 不在跑时文件 mtime 是静止的)。schema 按 2026-09 的库推断,本机零
+/// 行、未经真数据验证
+fn thread_memories(db: &Path, cache: &MtimeCache<Vec<MemoryDoc>>) -> Option<Vec<MemoryDoc>> {
+    cache.get_or_try_build(super::sqlite_ro::db_cache_stamp(db), || {
+        read_thread_memories(db)
+    })
+}
+
+fn read_thread_memories(db: &Path) -> Option<Vec<MemoryDoc>> {
+    if !db.is_file() {
+        return Some(Vec::new());
+    }
+    let ro = open_sqlite_ro(db, "codex-memories")?;
+    let has_table: bool = ro
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stage1_outputs')",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if !has_table {
+        return Some(Vec::new());
+    }
+    let mut stmt = ro
+        .conn
+        .prepare(
+            "SELECT thread_id, rollout_slug, rollout_summary, raw_memory, generated_at
+             FROM stage1_outputs",
+        )
+        .ok()?;
+    // 列的可空性与类型是推断的(本机零行):正文两列按可空读,generated_at 认数字
+    // 与 ISO 文本;某一行的类型对不上只跳过那一行——原先一行坏就让整个函数 None、
+    // 连 memories/*.md 一起从索引里消失(2026-09-21 review);读到一半的 I/O 错误
+    // 仍是"不知道"
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, rusqlite::types::Value>(4)?,
+            ))
+        })
+        .ok()?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (thread_id, slug, summary, memory, generated) = match row {
+            Ok(row) => row,
+            Err(rusqlite::Error::InvalidColumnType(..)) => continue,
+            Err(_) => return None,
+        };
+        let summary = summary.unwrap_or_default();
+        let memory = memory.unwrap_or_default();
+        let generated = match generated {
+            rusqlite::types::Value::Real(f) => f,
+            rusqlite::types::Value::Integer(i) => i as f64,
+            rusqlite::types::Value::Text(t) => iso_ms(&t) as f64 / 1000.0,
+            _ => 0.0,
+        };
+        if summary.trim().is_empty() && memory.trim().is_empty() {
+            continue;
+        }
+        let path = virtual_path(db, &thread_id);
+        let body = format!(
+            "## Summary\n\n{}\n\n## Memory\n\n{}\n",
+            summary.trim(),
+            memory.trim()
+        );
+        out.push(MemoryDoc {
+            key: session_key(AgentId::Codex, "", &path),
+            agent: AgentId::Codex,
+            host: String::new(),
+            scope: MemoryScope::Thread,
+            project_path: String::new(),
+            project_name: String::new(),
+            session_key: session_key(AgentId::Codex, "", &thread_id),
+            title: slug
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Session memory".to_string()),
+            // 秒还是毫秒未验证,交 epoch_ms 统一裁定
+            updated_at: epoch_ms(generated),
+            size_bytes: body.len() as i64,
+            path,
+            body,
+        });
+    }
+    Some(out)
+}
+
 impl AgentAdapter for CodexAdapter {
     fn agent(&self) -> AgentId {
         AgentId::Codex
@@ -1082,24 +1189,21 @@ impl AgentAdapter for CodexAdapter {
     /// 问的是**所有**管关系的 adapter,别家 watcher 事件也会走到这里。
     /// 代价:没有 state DB 的根(自定义 location 只选了数据目录的裸 rollout
     /// 拷贝)认不出父子,子线程以任务名作为顶层会话列出——不是噪音,只是没嵌套
-    fn parent_links(&self) -> Vec<(String, String)> {
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
         let stamp = super::sqlite_ro::db_cache_stamp(&self.state_db);
-        self.links_cache
-            .get_or_try_build(stamp, || {
-                // `?` 而不是 unwrap_or_default:读不出来时交回 None,MtimeCache
-                // 于是不缓存,下次重试——把失败缓存成"没有关系"会让
-                // sync_parent_links 当成"关系全解除",一句整家清空把所有子会话
-                // 解挂,而且戳不动就不自愈
-                let mut links: Vec<(String, String)> = read_spawn_edges(&self.state_db)?
-                    .into_iter()
-                    .filter(|(child, parent)| !parent.is_empty() && child != parent)
-                    .map(|(child, parent)| (format!("codex:{child}"), format!("codex:{parent}")))
-                    .collect();
-                // HashMap 的迭代序是每进程随机的,别让它漏进返回值
-                links.sort();
-                Some(links)
-            })
-            .unwrap_or_default()
+        // 读不出来时 `?` 交回 None:MtimeCache 不缓存、下次重试,scanner 对这一家整段
+        // 跳过——原先这里 unwrap_or_default 成空,一次瞬时失败就让 sync_parent_links
+        // 当成"关系全解除",整家清空所有子会话的挂靠(2026-09-21 review)
+        self.links_cache.get_or_try_build(stamp, || {
+            let mut links: Vec<(String, String)> = read_spawn_edges(&self.state_db)?
+                .into_iter()
+                .filter(|(child, parent)| !parent.is_empty() && child != parent)
+                .map(|(child, parent)| (format!("codex:{child}"), format!("codex:{parent}")))
+                .collect();
+            // HashMap 的迭代序是每进程随机的,别让它漏进返回值
+            links.sort();
+            Some(links)
+        })
     }
 
     fn merge_quick_meta(&self, mut parsed: SessionMeta, quick: &SessionMeta) -> SessionMeta {
@@ -1148,6 +1252,37 @@ impl AgentAdapter for CodexAdapter {
         Some(self.session_paths(meta))
     }
 
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        // memories/ 与 memories_1.sqlite 是 CODEX_HOME 直属;只选了 sessions 目录或
+        // 裸 rollout 拷贝的自定义根没有 home,那里就没有记忆(不摸父目录)
+        let Some(home) = &self.home else {
+            return Ok(Vec::new());
+        };
+        let mut out = super::cached_memory_docs(
+            &self.memories,
+            AgentId::Codex,
+            &[super::MemoryDir {
+                scope: MemoryScope::User,
+                session_key: String::new(),
+                project_path: String::new(),
+                dir: home.join("memories"),
+            }],
+        )?;
+        let db = home.join("memories_1.sqlite");
+        let threads = thread_memories(&db, &self.thread_memories)
+            .ok_or_else(|| anyhow::anyhow!("{} exists but could not be read", db.display()))?;
+        out.extend(threads);
+        Ok(out)
+    }
+
+    fn memory_roots(&self) -> Vec<PathBuf> {
+        // 线程记忆的虚拟路径 `<db>#<thread_id>` 以库路径开头,按前缀就能认
+        self.home
+            .as_ref()
+            .map(|home| vec![home.join("memories"), home.join("memories_1.sqlite")])
+            .unwrap_or_default()
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // dir 视作 CODEX_HOME 形态;归一化未上提的孤立数据目录按**目录名**
         // 保留角色:空的独立 sessions 目录日后落盘的 rollout 要能被发现,
@@ -1156,11 +1291,15 @@ impl AgentAdapter for CodexAdapter {
         // 侧档一并相对 dir 派生,绝不越界摸父目录——"父目录有 home 证据"的
         // 场景由 normalize_custom_root 在入库前上提(2026-08-24 Codex review)
         let name = dir.file_name().and_then(|n| n.to_str());
-        let (sessions_dir, archived_dir) = match name {
-            Some("archived_sessions") => (dir.join("sessions"), dir.clone()),
-            Some("sessions") => (dir.clone(), dir.join("archived_sessions")),
-            _ if is_rollout_store(&dir) => (dir.clone(), dir.join("archived_sessions")),
-            _ => (dir.join("sessions"), dir.join("archived_sessions")),
+        let (sessions_dir, archived_dir, home) = match name {
+            Some("archived_sessions") => (dir.join("sessions"), dir.clone(), None),
+            Some("sessions") => (dir.clone(), dir.join("archived_sessions"), None),
+            _ if is_rollout_store(&dir) => (dir.clone(), dir.join("archived_sessions"), None),
+            _ => (
+                dir.join("sessions"),
+                dir.join("archived_sessions"),
+                Some(dir.clone()),
+            ),
         };
         Box::new(Self {
             sessions_dir,
@@ -1169,6 +1308,9 @@ impl AgentAdapter for CodexAdapter {
             scan_sessions: true,
             scan_archived: true,
             links_cache: MtimeCache::new(),
+            home,
+            memories: MtimeCache::new(),
+            thread_memories: MtimeCache::new(),
         })
     }
 
@@ -1191,6 +1333,9 @@ impl AgentAdapter for CodexAdapter {
             scan_sessions: self.scan_sessions && !roots.contains(&self.sessions_dir),
             scan_archived: self.scan_archived && !roots.contains(&self.archived_dir),
             links_cache: MtimeCache::new(),
+            home: self.home.clone(),
+            memories: MtimeCache::new(),
+            thread_memories: MtimeCache::new(),
         }))
     }
 }

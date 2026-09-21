@@ -404,8 +404,8 @@ impl AgentAdapter for GrokAdapter {
         true
     }
 
-    fn parent_links(&self) -> Vec<(String, String)> {
-        grok_group::parent_links(&self.group_ctx())
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        Some(grok_group::parent_links(&self.group_ctx()))
     }
 
     fn is_parent_link_event(&self, path: &Path) -> bool {

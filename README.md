@@ -79,7 +79,7 @@ How it works, and what it doesn't do yet:
 
 ## Connect your agents (MCP)
 
-Wake ships `wake-mcp`, a small read-only [MCP](https://modelcontextprotocol.io) server over stdio that sits next to the app binary (`Wake.app/Contents/MacOS/wake-mcp` on macOS, beside `wake` on Linux and Windows). Point an MCP client at it and the agent gets four tools:
+Wake ships `wake-mcp`, a small read-only [MCP](https://modelcontextprotocol.io) server over stdio that sits next to the app binary (`Wake.app/Contents/MacOS/wake-mcp` on macOS, beside `wake` on Linux and Windows). Point an MCP client at it and the agent gets five tools:
 
 | Tool | What it does |
 |---|---|
@@ -87,6 +87,7 @@ Wake ships `wake-mcp`, a small read-only [MCP](https://modelcontextprotocol.io) 
 | `wake_list_sessions` | Most recently updated sessions, scoped by project (pass the agent's working directory), agent, time window or starred |
 | `wake_get_session` | One transcript as compact Markdown — user and assistant messages with `[seq N]` markers, tool calls folded to a line, injected context omitted — paginated by `from_seq` |
 | `wake_list_projects` | Projects with indexed sessions, most recently active first |
+| `wake_list_memories` | The memory files agents keep for themselves (Claude Code auto-memory, Codex memories, ZCode project memory), grouped by project; read one with `wake_get_session` and its `wake://memory/…` reference |
 
 Setup is a copy-paste from Settings → Connect, or run `wake-mcp setup` in a terminal. For example, Claude Code:
 
@@ -221,8 +222,8 @@ crates/
 │   ├── scanner.rs   #   single-pass scan: meta + FTS in one go, mtime incremental
 │   ├── watcher.rs   #   notify-based file watching → per-file incremental updates
 │   ├── db.rs        #   rusqlite (WAL): sessions / messages / messages_fts / user_data / tombstones (+ location, remote_hosts & schema meta tables)
-│   ├── mcp/         #   wake-mcp: read-only MCP server over stdio (hand-written JSON-RPC, four tools)
-│   ├── cli.rs       #   wake-cli: argv → the same four tools, same text out as MCP
+│   ├── mcp/         #   wake-mcp: read-only MCP server over stdio (hand-written JSON-RPC, five tools)
+│   ├── cli.rs       #   wake-cli: argv → the same five tools, same text out as MCP
 │   └── services/    #   terminal resume (per-platform: AppleScript / argv / Win32) / export / trash / agent context helpers
 └── wake             # GPUI app (three-pane workbench + ⌘K / Ctrl+K palette)
 ```

@@ -144,6 +144,19 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.session_paths(meta)
     }
 
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        // 记忆的 key 与会话 key 同规矩:agent 段之后插 host;线程级挂的会话 key 同改
+        let mut docs = self.inner.list_memories()?;
+        for d in &mut docs {
+            d.key = self.rewrite_key(&d.key);
+            d.host = self.host.clone();
+            if !d.session_key.is_empty() {
+                d.session_key = self.rewrite_key(&d.session_key);
+            }
+        }
+        Ok(docs)
+    }
+
     fn begin_scan(&self) {
         self.inner.begin_scan();
     }
@@ -152,12 +165,19 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.manages_parent_links()
     }
 
-    fn parent_links(&self) -> Vec<(String, String)> {
-        self.inner
-            .parent_links()
-            .into_iter()
-            .map(|(child, parent)| (self.rewrite_key(&child), self.rewrite_key(&parent)))
-            .collect()
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        Some(
+            self.inner
+                .parent_links()?
+                .into_iter()
+                .map(|(child, parent)| (self.rewrite_key(&child), self.rewrite_key(&parent)))
+                .collect(),
+        )
+    }
+
+    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
+        // inner 是按缓存挂载点构造的实例,它报的根已经是缓存内路径
+        self.inner.memory_roots()
     }
 
     fn is_parent_link_event(&self, path: &Path) -> bool {

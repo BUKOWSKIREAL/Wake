@@ -566,11 +566,11 @@ impl AgentAdapter for CursorIdeAdapter {
         true
     }
 
-    fn parent_links(&self) -> Vec<(String, String)> {
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        // 库读不出 = None(scanner 保留库里的关系),不折成空
         let mtime = super::sqlite_ro::db_cache_stamp(&self.db);
         self.links_cache
             .get_or_try_build(mtime, || parent_links_from(&self.db))
-            .unwrap_or_default()
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {

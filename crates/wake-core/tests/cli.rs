@@ -218,6 +218,19 @@ fn cases() -> Vec<(Vec<String>, &'static str, Value)> {
             tools::LIST_PROJECTS,
             json!({"since":ALWAYS,"limit":10}),
         ),
+        (
+            argv(&[
+                "memories",
+                "--project",
+                CLAUDE_PROJECT,
+                "--agent",
+                "claude-code",
+                "--limit",
+                "10",
+            ]),
+            tools::LIST_MEMORIES,
+            json!({"project":CLAUDE_PROJECT,"agents":["claude-code"],"limit":10}),
+        ),
     ]
 }
 
@@ -313,13 +326,17 @@ fn unreadable_session_exits_one() {
 #[test]
 fn no_results_is_success() {
     for (argv, prefix) in [
-        (vec!["search", "zzqqxx-no-such-term"], "No matches for"),
+        (vec!["search", "zzqqxx-no-such-term"], "No session matches"),
         (
             vec!["sessions", "--project", "/nope/nope"],
             "No indexed project matches",
         ),
         (vec!["sessions", "--since", NEVER], "No sessions"),
         (vec!["projects", "--since", NEVER], "No projects"),
+        (
+            vec!["memories", "--project", "/nope/nope"],
+            "No indexed project matches",
+        ),
     ] {
         let (stdout, stderr, code) = cli_run(&argv);
         assert_eq!(code, Some(0), "argv {argv:?}: {stderr}");

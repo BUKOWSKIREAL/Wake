@@ -29,7 +29,7 @@ pub(crate) mod sqlite_ro;
 pub use sqlite_ro::strip_virtual_path as session_source_path;
 
 use crate::models::*;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::path::Path;
 
 /// agent 数据源适配器。列表扫描与详情解析共用同一核心解析器,
@@ -110,6 +110,23 @@ pub trait AgentAdapter: Send + Sync {
     fn cleanup_paths(&self, _meta: &SessionMeta) -> Option<Vec<String>> {
         None
     }
+    /// 本家 agent 自己写下的记忆文档(Claude Code 的 auto-memory 目录、Codex 的
+    /// memories)——Wake 只读:列出、搜索、阅读。默认没有。正文整份带上(记忆是
+    /// 小 Markdown),但每轮扫描都会调,实现方要**先 stat 后读**:指纹没变就交
+    /// `MtimeCache`(`cached_memory_docs`),缺根返回 Ok(空);scanner 在每轮扫描
+    /// 收尾按 (agent, host) 整组替换入库,消失的文件随之出库。项目归属不在这里
+    /// 算:填 `session_key` 指向所属会话,读库时按它连 sessions 表解析(见 MemoryDoc)。
+    /// 远程装饰器必须转发并改写 key / host / session_key
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        Ok(Vec::new())
+    }
+    /// `list_memories` 读的根(目录,或 SQLite 型的库文件;虚拟路径以库路径开头):
+    /// 同 (agent, host) 有多个实例时,某个实例 `list_memories` 报 Err,scanner 只冻结
+    /// 它这些根下的行(不删不改),其余实例照常对账——否则一个坏 location 会让默认
+    /// 实例的记忆永远停在上次(2026-09-21 review)。实现了 list_memories 就要给
+    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
     /// 一轮扫描开始前刷新 adapter 的跨会话快照。默认 adapter 没有这类状态。
     fn begin_scan(&self) {}
     /// 此 adapter 是否负责维护会话父子关系。单独的能力位用于区分“当前没有
@@ -118,9 +135,12 @@ pub trait AgentAdapter: Send + Sync {
         false
     }
     /// 当前数据根内的 `(child_key, direct_parent_key)` 全量快照。scanner 会在
-    /// 合并同 agent 的所有 location 后统一扁平到 root。
-    fn parent_links(&self) -> Vec<(String, String)> {
-        Vec::new()
+    /// 合并同 agent 的所有 location 后统一扁平到 root。**`None` 是"这一刻读不出来"**
+    /// (state DB 打不开、读到一半出错),scanner 对这一家整段跳过、库里的关系原样
+    /// 保留;`Some(空)` 才是"确定没有关系"——把读失败折成空会让 sync_parent_links
+    /// 当成关系全解除,一句整家清空(2026-09-21 review)
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        Some(Vec::new())
     }
     /// watcher 事件是否会改变父子关系快照。关系边车不是会话主文件，不能塞进
     /// `file_ref`；命中后 watcher 会单独刷新同 agent 的所有关系快照。
@@ -483,6 +503,175 @@ pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUn
             }
         })
         .collect()
+}
+
+/// 一个装 Markdown 记忆文件的目录(Claude 的 projects/<dir>/memory、Codex 的
+/// memories):目录里的 `*.md` 各成一份 MemoryDoc,`session_key` 是归属锚点
+/// (Claude 给该项目目录里最新的会话,项目路径读库时按它解析;用户级留空)
+pub(crate) struct MemoryDir {
+    pub scope: MemoryScope,
+    pub session_key: String,
+    /// adapter 自己就知道的项目路径(Claude 目录里没会话时从目录名反推);空 = 交给锚点
+    pub project_path: String,
+    pub dir: std::path::PathBuf,
+}
+
+/// 几个记忆目录的文档,经 `MtimeCache` 缓存:每轮只 stat(路径 + mtime + size +
+/// 锚点拼成指纹),指纹没变就交上一轮读好的那份,变了才重读正文——`list_memories`
+/// 每轮扫描都会调,159 份文件每轮都读是白费(2026-09-17 /simplify)。非 UTF-8 的
+/// 文件不是记忆,跳过;别的读取失败(权限、I/O)整轮报 Err、不缓存——scanner 对
+/// Err 是跳过该组不动库,下一轮再试;缓存成"少了这份"会让库里那行被删且指纹不变
+/// 就再也不读(Codex review 2026-09-17)
+pub(crate) fn cached_memory_docs(
+    cache: &parse_utils::MtimeCache<Vec<MemoryDoc>>,
+    agent: AgentId,
+    dirs: &[MemoryDir],
+) -> Result<Vec<MemoryDoc>> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut listing: Vec<(&MemoryDir, Vec<(std::path::PathBuf, i64, i64)>)> = Vec::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for md in dirs {
+        // 目录不存在 = 没有记忆;列不出来、某项 stat 不到 = 不知道,整轮报 Err——
+        // 静默当成空会让库里那组被删(与下面读正文失败同一条规矩)
+        let entries = match std::fs::read_dir(&md.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(md.dir.display().to_string())),
+        };
+        let mut files: Vec<(std::path::PathBuf, i64, i64)> = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| md.dir.display().to_string())?;
+            let path = entry.path();
+            if !path.extension().is_some_and(|x| x == "md") {
+                continue;
+            }
+            let meta = entry
+                .metadata()
+                .with_context(|| path.display().to_string())?;
+            if meta.is_file() {
+                files.push((path, parse_utils::mtime_ms(&meta), meta.len() as i64));
+            }
+        }
+        if files.is_empty() {
+            continue;
+        }
+        files.sort();
+        md.session_key.hash(&mut hasher);
+        md.project_path.hash(&mut hasher);
+        files.hash(&mut hasher);
+        listing.push((md, files));
+    }
+    let stamp = hasher.finish() as i64;
+    cache.get_or_build_result(stamp, || {
+        let mut docs = Vec::new();
+        for (md, files) in &listing {
+            for (path, updated_at, size_bytes) in files {
+                if let Some(doc) = memory_doc_from_file(agent, md, path, *updated_at, *size_bytes)?
+                {
+                    docs.push(doc);
+                }
+            }
+        }
+        Ok(docs)
+    })
+}
+
+/// 记忆标题(frontmatter 的 description)的字符上限:会话标题是 `MAX_TITLE` = 80,
+/// description 是完整一句话,给宽一档
+pub const MEMORY_TITLE_MAX: usize = 120;
+
+/// 读一份 Markdown 记忆文件成 MemoryDoc:标题取 frontmatter 的 description,其次
+/// name,再退文件名;正文原样保留(含 frontmatter,阅读面照渲染)。项目路径不在这里
+/// 填(读库时按 session_key 解析)。非 UTF-8 给 Ok(None)(不是记忆),其余读取失败
+/// 原样报错
+fn memory_doc_from_file(
+    agent: AgentId,
+    dir: &MemoryDir,
+    path: &Path,
+    updated_at: i64,
+    size_bytes: i64,
+) -> Result<Option<MemoryDoc>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
+        Err(e) => return Err(anyhow::Error::new(e).context(path.display().to_string())),
+    };
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // description 是一句话,本机实测有 565 字符的:折行、按字符封顶,列表与 MCP 一行
+    // 一条才放得下(2026-09-21 review)
+    let title = frontmatter_field(&body, "description")
+        .or_else(|| frontmatter_field(&body, "name"))
+        .map(|t| crate::text::one_line(&t, MEMORY_TITLE_MAX))
+        .unwrap_or(stem);
+    let path_str = path.to_string_lossy().to_string();
+    Ok(Some(MemoryDoc {
+        key: session_key(agent, "", &path_str),
+        agent,
+        host: String::new(),
+        scope: dir.scope,
+        project_path: dir.project_path.clone(),
+        project_name: if dir.project_path.is_empty() {
+            String::new()
+        } else {
+            parse_utils::project_name_of(&dir.project_path)
+        },
+        session_key: dir.session_key.clone(),
+        path: path_str,
+        title,
+        updated_at,
+        size_bytes,
+        body,
+    }))
+}
+
+/// 阅读一份记忆的正文:文件型现场读磁盘(agent 刚改过也能看到),读不到退库里那份;
+/// SQLite 型(虚拟路径)只有库里那份。MCP 的 wake_get_session 与 GUI 阅读面共用
+pub fn memory_body(doc: &MemoryDoc) -> String {
+    if session_source_path(&doc.path) != doc.path {
+        return doc.body.clone();
+    }
+    std::fs::read_to_string(&doc.path).unwrap_or_else(|_| doc.body.clone())
+}
+
+/// YAML frontmatter(文件开头 `---` 围起的几行)里一个顶层 `key: 值`。不做完整
+/// YAML:只认顶格的 `key:`,值去首尾引号;块标量(`key: >` / `|`,值在下面缩进的几行)
+/// 把那几行折成一行——否则标题就是一个字面的 ">"。没有 frontmatter 或没这个键给 None
+pub(crate) fn frontmatter_field(body: &str, key: &str) -> Option<String> {
+    let mut lines = body.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut lines = lines.peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == "---" {
+            break;
+        }
+        let Some(value) = line
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+        else {
+            continue;
+        };
+        let value = value.trim();
+        let value = if matches!(value, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
+            let mut folded = Vec::new();
+            while let Some(next) = lines.peek() {
+                if !next.starts_with([' ', '\t']) || next.trim() == "---" {
+                    break;
+                }
+                folded.push(next.trim());
+                lines.next();
+            }
+            folded.join(" ")
+        } else {
+            value.trim_matches('"').trim_matches('\'').to_string()
+        };
+        return (!value.is_empty()).then_some(value);
+    }
+    None
 }
 
 /// 手输路径的 `~` 前缀展开(仅前缀;边界落在分隔符上,Windows 用户手输

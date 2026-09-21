@@ -726,7 +726,7 @@ fn codex_spawned_subagent_keeps_only_its_own_turns() {
     assert_eq!(parsed.units[0].seq, visible[0].seq);
 
     assert_eq!(
-        adapter.parent_links(),
+        adapter.parent_links().unwrap(),
         vec![(format!("codex:{child_id}"), format!("codex:{parent_id}"))]
     );
 }
@@ -873,7 +873,7 @@ fn codex_spawn_links_need_the_state_db_registry() {
 
     let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
     let refs = adapter.list_session_files().unwrap();
-    assert!(adapter.parent_links().is_empty());
+    assert!(adapter.parent_links().unwrap().is_empty());
     let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
     assert_eq!(
         adapter.parse_session(child).unwrap().meta.title,
@@ -1329,7 +1329,7 @@ fn cursor_ide_parse_contract() {
     // 子代理归属来自 composerHeaders.subagentInfo
     assert!(adapter.manages_parent_links());
     assert_eq!(
-        adapter.parent_links(),
+        adapter.parent_links().unwrap(),
         vec![(
             "cursor:cide-0004".to_string(),
             "cursor:cide-0001".to_string()
@@ -1785,7 +1785,7 @@ fn grok_parse_contract() {
     setup();
     let adapter = GrokAdapter::new().with_custom_root(fixture("grok"));
     adapter.begin_scan();
-    assert!(adapter.parent_links().contains(&(
+    assert!(adapter.parent_links().unwrap().contains(&(
         "grok:aaaaaaaa-aaaa-bbbb-cccc-0000000000aa".into(),
         "grok:77777777-aaaa-bbbb-cccc-000000000007".into(),
     )));
@@ -2445,7 +2445,7 @@ fn hermes_parse_contract() {
     // /branch 分支挂到父会话下(parent_session_id),不当顶层
     assert!(adapter.manages_parent_links());
     assert_eq!(
-        adapter.parent_links(),
+        adapter.parent_links().unwrap(),
         vec![("hermes:hs-0005".to_string(), "hermes:hs-0001".to_string())]
     );
 
@@ -3679,4 +3679,294 @@ fn workbuddy_is_a_codebuddy_twin() {
         wake_core::services::terminal::resume_targets(&meta).is_empty(),
         "没有 CLI 的 agent 不画 Open In"
     );
+}
+
+// ---------------------------------------------------------------- 记忆(只读镜像)
+
+/// Claude auto-memory:projects/<dir>/memory/*.md,挂到同目录里的一条会话上(项目
+/// 路径读库时按它解析,adapter 不填),标题取 frontmatter 的 description、没有就用
+/// 文件名,正文原样;指纹没变第二次列出的是缓存的同一份
+#[test]
+fn claude_lists_project_memories() {
+    setup();
+    let adapter = ClaudeAdapter::new().with_custom_root(fixture("claude/projects"));
+    let docs = adapter.list_memories().unwrap();
+    let titles: Vec<&str> = docs.iter().map(|d| d.title.as_str()).collect();
+    assert_eq!(titles, ["MEMORY", "Wake testing conventions for this repo"]);
+    let session_keys: Vec<String> = adapter
+        .list_session_files()
+        .unwrap()
+        .iter()
+        .map(|r| format!("claude-code:{}", r.native_id))
+        .collect();
+    for d in &docs {
+        assert_eq!(d.agent, AgentId::ClaudeCode);
+        assert_eq!(d.scope, MemoryScope::Project);
+        assert!(
+            d.project_path.is_empty() && d.project_name.is_empty(),
+            "项目在读库时按锚点解析,adapter 不填"
+        );
+        assert!(
+            session_keys.contains(&d.session_key),
+            "锚点是同目录里的一条会话: {} ∉ {session_keys:?}",
+            d.session_key
+        );
+        assert!(
+            d.key.starts_with("claude-code:") && d.key.ends_with(".md"),
+            "{}",
+            d.key
+        );
+        assert!(d.host.is_empty());
+        assert!(d.size_bytes > 0 && d.updated_at > 0);
+    }
+    assert_eq!(
+        docs[1].body.lines().next(),
+        Some("---"),
+        "正文原样含 frontmatter"
+    );
+    assert!(docs[1].body.contains("name: wake-testing"));
+    assert_eq!(adapter.list_memories().unwrap(), docs, "指纹没变走缓存");
+}
+
+/// ZCode:`cli/memories/projects/<slug>-<hash>/memory/*.md`(Claude auto-memory 同款
+/// 格式);目录名的 hash 是 sha256(工作区路径) 前 16 位,按库里会话的 directory 精确
+/// 对上项目、不用锚点;对不上的落 Unknown project;没有 memory/ 子目录的工作区目录
+/// 不算;裸库拷贝(没有 home)一份都不列
+#[test]
+fn zcode_lists_project_memories() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".zcode");
+    let db = root.join("cli/db/db.sqlite");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    common::build_zcode_db(&db);
+    // 3b44ec0d2ccabf78 = sha256("/Users/tester/Github/wakefx")[..16],fixture 会话的
+    // directory。写死而不是调 memory_dir_hash 算——算法漂了这里才会红
+    let wakefx = root.join("cli/memories/projects/wakefx-3b44ec0d2ccabf78/memory");
+    fs::create_dir_all(&wakefx).unwrap();
+    fs::write(
+        wakefx.join("MEMORY.md"),
+        "- [Prefers pnpm](prefers-pnpm.md) — tooling\n",
+    )
+    .unwrap();
+    fs::write(
+        wakefx.join("prefers-pnpm.md"),
+        "---\nname: prefers-pnpm\ndescription: Prefers pnpm over npm\nmetadata:\n  type: feedback\n---\n\nUse pnpm.\n",
+    )
+    .unwrap();
+    // 库里没有会话的工作区:hash 对不上,落 Unknown project
+    let orphan = root.join("cli/memories/projects/other-0000000000000000/memory");
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(orphan.join("note.md"), "# orphan\n").unwrap();
+    fs::create_dir_all(root.join("cli/memories/projects/empty-1111111111111111")).unwrap();
+
+    let adapter = ZcodeAdapter::new().with_custom_root(root.clone());
+    let docs = adapter.list_memories().unwrap();
+    let summary: Vec<(&str, &str, &str)> = docs
+        .iter()
+        .map(|d| {
+            (
+                d.title.as_str(),
+                d.project_path.as_str(),
+                d.project_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("note", "", ""),
+            ("MEMORY", "/Users/tester/Github/wakefx", "wakefx"),
+            (
+                "Prefers pnpm over npm",
+                "/Users/tester/Github/wakefx",
+                "wakefx"
+            ),
+        ]
+    );
+    for d in &docs {
+        assert_eq!(d.agent, AgentId::Zcode);
+        assert_eq!(d.scope, MemoryScope::Project);
+        assert!(d.session_key.is_empty(), "项目由目录名直接对上,不用锚点");
+        assert!(
+            d.key.starts_with("zcode:") && d.key.ends_with(".md"),
+            "{}",
+            d.key
+        );
+        assert!(d.host.is_empty());
+        assert!(d.size_bytes > 0 && d.updated_at > 0);
+    }
+    assert!(
+        docs[2].body.contains("name: prefers-pnpm"),
+        "正文原样含 frontmatter"
+    );
+    assert_eq!(adapter.list_memories().unwrap(), docs, "指纹没变走缓存");
+    assert_eq!(
+        wake_core::adapters::zcode::memory_dir_hash("/Users/tester/Github/wakefx/"),
+        "3b44ec0d2ccabf78",
+        "收尾分隔符不影响(源码先 resolve 再 hash)"
+    );
+
+    // 直接选中 db.sqlite 的裸库拷贝没有 home:不摸父目录,一份都不列
+    let bare = ZcodeAdapter::new().with_custom_root(db.clone());
+    assert!(bare.list_memories().unwrap().is_empty());
+    // 没有记忆目录的 home 也是空,不是错
+    let other = tempfile::tempdir().unwrap();
+    let fresh = ZcodeAdapter::new().with_custom_root(other.path().join(".zcode"));
+    assert!(fresh.list_memories().unwrap().is_empty());
+}
+
+/// 标题来自 frontmatter 的 description:块标量(`description: >` 换行缩进写)折成一行,
+/// 不是一个字面的 ">";超长的按字符封顶(本机有 565 字符的,列表与 MCP 一行放不下)
+#[test]
+fn memory_titles_fold_block_scalars_and_clip() {
+    setup();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("-Users-tester-Github-wakefx");
+    fs::create_dir_all(project.join("memory")).unwrap();
+    fs::write(
+        project.join("11111111-aaaa-bbbb-cccc-000000000001.jsonl"),
+        "{\"type\":\"user\",\"cwd\":\"/Users/tester/Github/wakefx\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("memory").join("folded.md"),
+        "---\nname: folded\ndescription: >\n  Prefers pnpm over npm,\n  and never runs db:push\nmetadata:\n  type: feedback\n---\n\nbody\n",
+    )
+    .unwrap();
+    let long = "x".repeat(300);
+    fs::write(
+        project.join("memory").join("long.md"),
+        format!("---\nname: long\ndescription: {long}\n---\n\nbody\n"),
+    )
+    .unwrap();
+    let adapter = ClaudeAdapter::new().with_custom_root(root.path().to_path_buf());
+    let docs = adapter.list_memories().unwrap();
+    let titles: Vec<&str> = docs.iter().map(|d| d.title.as_str()).collect();
+    assert_eq!(titles[0], "Prefers pnpm over npm, and never runs db:push");
+    assert!(
+        titles[1].chars().count() <= 121 && titles[1].ends_with('…'),
+        "{}",
+        titles[1]
+    );
+}
+
+/// Claude 记忆的锚点是项目目录里最新的**非空**会话:零字节的 jsonl(刚起的会话)
+/// 进不了库,拿它当锚点整组记忆就落 Unknown project
+#[test]
+fn claude_memory_anchor_skips_empty_sessions() {
+    setup();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("-Users-tester-Github-wakefx");
+    fs::create_dir_all(project.join("memory")).unwrap();
+    fs::write(project.join("memory").join("MEMORY.md"), "# notes\n").unwrap();
+    fs::write(
+        project.join("11111111-aaaa-bbbb-cccc-000000000001.jsonl"),
+        "{\"type\":\"user\",\"cwd\":\"/Users/tester/Github/wakefx\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("ffffffff-aaaa-bbbb-cccc-00000000000f.jsonl"),
+        "",
+    )
+    .unwrap();
+    let adapter = ClaudeAdapter::new().with_custom_root(root.path().to_path_buf());
+    let docs = adapter.list_memories().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(
+        docs[0].session_key,
+        "claude-code:11111111-aaaa-bbbb-cccc-000000000001"
+    );
+}
+
+/// Codex:memories/*.md 是用户级;memories_1.sqlite 的 stage1_outputs 逐线程一行,
+/// 挂到 codex:<thread_id>;空摘要的线程不列;没有 home 的裸目录为空
+#[test]
+fn codex_lists_user_and_thread_memories() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("sessions")).unwrap();
+    fs::create_dir_all(home.path().join("memories")).unwrap();
+    fs::write(
+        home.path().join("memories").join("user-preferences.md"),
+        "# User preferences\n\nConcise replies.\n",
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(home.path().join("memories_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE stage1_outputs (
+            thread_id TEXT PRIMARY KEY, source_updated_at INTEGER NOT NULL,
+            raw_memory TEXT, rollout_summary TEXT, rollout_slug TEXT,
+            generated_at INTEGER NOT NULL, usage_count INTEGER, last_usage INTEGER,
+            selected_for_phase2 INTEGER NOT NULL DEFAULT 0,
+            selected_for_phase2_source_updated_at INTEGER);
+         INSERT INTO stage1_outputs VALUES ('t-0001', 1, 'Prefers rustfmt before commits',
+            'Fixed the scanner finale contract', 'scanner-finale', 1786100000, NULL, NULL, 0, NULL);
+         INSERT INTO stage1_outputs VALUES ('t-0002', 1, '', '', NULL, 1786100001, NULL, NULL, 0, NULL);
+         INSERT INTO stage1_outputs VALUES ('t-0003', 1, NULL, 'Only a summary, memory column NULL',
+            'nullable-row', '2026-09-21T10:00:00Z', NULL, NULL, 0, NULL);",
+    )
+    .unwrap();
+    drop(db);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let docs = adapter.list_memories().unwrap();
+    assert_eq!(docs.len(), 3, "空摘要空记忆的线程不列: {docs:?}");
+    // 列的可空性与时间格式是推断的:NULL 正文列与 ISO 文本时间的行照样列,别的行不受影响
+    let nullable = &docs[2];
+    assert_eq!(
+        (nullable.session_key.as_str(), nullable.title.as_str()),
+        ("codex:t-0003", "nullable-row")
+    );
+    assert!(nullable.body.contains("Only a summary") && nullable.updated_at > 1_786_100_000_000);
+    let user = &docs[0];
+    assert_eq!(
+        (user.scope, user.title.as_str()),
+        (MemoryScope::User, "user-preferences")
+    );
+    assert!(user.project_path.is_empty() && user.session_key.is_empty());
+    let thread = &docs[1];
+    assert_eq!(thread.scope, MemoryScope::Thread);
+    assert_eq!(thread.session_key, "codex:t-0001");
+    assert_eq!(thread.title, "scanner-finale");
+    assert!(
+        thread.body.contains("Fixed the scanner finale contract")
+            && thread.body.contains("rustfmt")
+    );
+    assert_eq!(thread.updated_at, 1_786_100_000_000, "秒换算成毫秒");
+    // 非 UTF-8 的文件不是记忆:跳过它,别的照列(指纹变了才重读,新文件即新指纹)
+    fs::write(
+        home.path().join("memories").join("blob.md"),
+        [0xff, 0xfe, 0x00],
+    )
+    .unwrap();
+    let docs_again = adapter.list_memories().unwrap();
+    assert_eq!(docs_again.len(), 3, "{docs_again:?}");
+    // 自定义根只选了 sessions 目录:没有 home,不摸父目录里的 memories
+    let sessions_only = CodexAdapter::new().with_custom_root(home.path().join("sessions"));
+    assert!(
+        sessions_only.list_memories().unwrap().is_empty(),
+        "sessions 目录当根时不得越界读父目录的记忆"
+    );
+    // 库在但读不出(不是 SQLite 文件)= 不知道:整家报 Err、不缓存,scanner 跳过该组;
+    // 缓存成"没有"会把库里的线程记忆整组删掉。库换回好的(戳变了)立刻恢复
+    let db_path = home.path().join("memories_1.sqlite");
+    let good = fs::read(&db_path).unwrap();
+    fs::write(&db_path, b"not a sqlite database").unwrap();
+    assert!(
+        adapter.list_memories().is_err(),
+        "memories_1.sqlite 读不出必须报 Err 而不是当成空"
+    );
+    fs::write(&db_path, good).unwrap();
+    assert_eq!(adapter.list_memories().unwrap().len(), 3);
+    assert!(
+        thread.path.ends_with("memories_1.sqlite#t-0001"),
+        "{}",
+        thread.path
+    );
+    assert_eq!(thread.key, format!("codex:{}", thread.path));
+
+    // 没有 home 证据的目录:memories 自然为空,不报错
+    let bare = CodexAdapter::new().with_custom_root(home.path().join("elsewhere"));
+    assert!(bare.list_memories().unwrap().is_empty());
 }

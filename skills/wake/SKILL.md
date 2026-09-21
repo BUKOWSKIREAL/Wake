@@ -73,6 +73,17 @@ as sessions of their own (Codex `spawn_agent`, Grok) are listed at the end too, 
 wake-cli projects --limit 20
 ```
 
+**What an agent already remembers about this project**
+
+```bash
+wake-cli memories --project "$PWD"
+```
+
+The memory files agents keep for themselves — Claude Code's auto-memory, Codex's
+memories, ZCode's project memory — read-only, grouped by project, user-level ones last.
+Each entry ends with a `wake://memory/…` reference; pass it to `show` to read the file.
+Reach for it before re-deriving a project's conventions or decisions from scratch.
+
 ## Keys, references and paging
 
 `sessions` and `search` print a key for every session — `<agent>:<id>`, or

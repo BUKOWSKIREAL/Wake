@@ -42,7 +42,10 @@ coding agent: what was discussed, decided or tried, why something was done a cer
 where previous work stopped, or whether an error was seen before. Git history and the \
 working tree do not contain that; Wake does. Start with wake_list_sessions (pass the \
 current working directory as `project`) or wake_search, then read the relevant transcript \
-with wake_get_session. Nothing here can modify a session.";
+with wake_get_session; wake_list_projects shows which projects have history. \
+wake_list_memories lists the notes agents keep for themselves about a project (Claude \
+Code and ZCode auto-memory, Codex memories); read one by passing its wake://memory/… \
+reference to wake_get_session. Nothing here can modify a session or a memory file.";
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -292,6 +295,16 @@ pub fn setup_snippets(bin: &Path) -> Vec<SetupSnippet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// initialize 回的 instructions 是 agent 唯一常驻的一段说明:每个工具都得点到名,
+    /// 否则新工具对只读这段的 agent 就是隐形的(2026-09-21 review:加 wake_list_memories
+    /// 时漏了这里)
+    #[test]
+    fn instructions_mention_every_tool() {
+        for name in tools::NAMES {
+            assert!(INSTRUCTIONS.contains(name), "INSTRUCTIONS 没提到 {name}");
+        }
+    }
 
     #[test]
     fn snippets_quote_paths_for_every_client() {

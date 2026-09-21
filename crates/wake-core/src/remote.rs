@@ -68,6 +68,10 @@ pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
             ".codex/archived_sessions",
             ".codex/state_5.sqlite",
             ".codex/state_5.sqlite-wal",
+            // 记忆:用户级 Markdown 与逐线程的整合库(list_memories 读)
+            ".codex/memories",
+            ".codex/memories_1.sqlite",
+            ".codex/memories_1.sqlite-wal",
         ],
         exclude: &[],
     },
@@ -194,15 +198,16 @@ pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
     },
     RemoteAgentLayout {
         agent: AgentId::Zcode,
-        // home 形态:cli/db/db.sqlite 与 v2/tasks-index.sqlite 全相对派生。
-        // 只拉两个库文件——凭证(v2/credentials.json)与网络 CA 私钥(v2/certs/)
-        // 不在白名单里就不会被碰;exclude 只对目录源起作用,文件源留空
+        // home 形态:cli/db/db.sqlite、v2/tasks-index.sqlite 与 cli/memories 全相对
+        // 派生。只拉两个库文件 + 记忆目录(里面只有 Markdown)——凭证
+        // (v2/credentials.json)与网络 CA 私钥(v2/certs/)不在白名单里就不会被碰
         mount: ".zcode",
         sync_paths: &[
             ".zcode/cli/db/db.sqlite",
             ".zcode/cli/db/db.sqlite-wal",
             ".zcode/v2/tasks-index.sqlite",
             ".zcode/v2/tasks-index.sqlite-wal",
+            ".zcode/cli/memories",
         ],
         exclude: &[],
     },

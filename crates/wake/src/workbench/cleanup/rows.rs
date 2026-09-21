@@ -1,6 +1,29 @@
 //! Both availability states use the same two-line row and column layout.
 use super::*;
 
+/// 可选中的列表行热区:圆角、SPACE_SM 侧距、SPACE_MD 列距,选中 list_active、未选中
+/// 悬停 list_hover。外层由调用方给 SPACE_LG 侧距 + 2px 行距
+fn list_row_shell(
+    id: impl Into<ElementId>,
+    height: Pixels,
+    selected: bool,
+    theme: &gpui_component::Theme,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .h(height)
+        .px(SPACE_SM)
+        .rounded(theme.radius)
+        .gap(SPACE_MD)
+        .items_center()
+        .when(selected, |row| row.bg(theme.list_active))
+        .when(!selected, |row| {
+            row.hover(|style| style.bg(theme.list_hover))
+        })
+}
+
 fn reason_label(reason: &str) -> &str {
     match reason {
         "This source does not support independent file cleanup"
@@ -57,191 +80,175 @@ impl Workbench {
             .px(SPACE_LG)
             .py(px(2.))
             .child(
-                h_flex()
-                    .id(SharedString::from(format!("cleanup-{key}")))
-                    .w_full()
-                    .min_w_0()
-                    .h(px(60.))
-                    .px(SPACE_SM)
-                    .rounded(theme.radius)
-                    .gap(SPACE_MD)
-                    .items_center()
-                    .when(selected, |row| row.bg(theme.list_active))
-                    .when(!selected, |row| {
-                        row.hover(|style| style.bg(theme.list_hover))
-                    })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(SPACE_MD)
-                            .items_center()
-                            .child(
-                                Checkbox::new(SharedString::from(format!("select-{key}")))
-                                    .checked(selected)
-                                    .disabled(
-                                        !selectable || self.cleanup.busy || self.cleanup.loading,
-                                    )
-                                    .when_some(reason, |checkbox, reason| {
-                                        checkbox.tooltip(unavailable_reason(reason).to_owned())
-                                    })
-                                    .on_click(move |checked, _, cx| {
-                                        if !selectable {
-                                            return;
+                list_row_shell(
+                    SharedString::from(format!("cleanup-{key}")),
+                    px(60.),
+                    selected,
+                    theme,
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(SPACE_MD)
+                        .items_center()
+                        .child(
+                            Checkbox::new(SharedString::from(format!("select-{key}")))
+                                .checked(selected)
+                                .disabled(!selectable || self.cleanup.busy || self.cleanup.loading)
+                                .when_some(reason, |checkbox, reason| {
+                                    checkbox.tooltip(unavailable_reason(reason).to_owned())
+                                })
+                                .on_click(move |checked, _, cx| {
+                                    if !selectable {
+                                        return;
+                                    }
+                                    entity.update(cx, |this, cx| {
+                                        if *checked {
+                                            this.cleanup.selected.insert(key.clone());
+                                        } else {
+                                            this.cleanup.selected.remove(&key);
                                         }
-                                        entity.update(cx, |this, cx| {
-                                            if *checked {
-                                                this.cleanup.selected.insert(key.clone());
-                                            } else {
-                                                this.cleanup.selected.remove(&key);
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .child(
-                                v_flex()
-                                    .id(("cleanup-preview", ix))
-                                    .focusable()
-                                    .tab_stop(true)
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(theme.primary))
-                                    .focus(|style| {
-                                        style.bg(theme.list_hover).rounded(RADIUS_BUTTON)
-                                    })
-                                    .on_key_down(cx.listener(
-                                        move |this, event: &KeyDownEvent, window, cx| {
-                                            if event.keystroke.key == "enter"
-                                                || event.keystroke.key == "space"
-                                            {
-                                                this.show_cleanup_preview(
-                                                    &keyboard_key,
-                                                    window,
-                                                    cx,
-                                                );
-                                                cx.stop_propagation();
-                                            }
-                                        },
-                                    ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.show_cleanup_preview(&preview_key, window, cx);
-                                    }))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap(SPACE_XS)
-                                    .child(cleanup_session_title(
-                                        meta,
-                                        members.iter().any(|s| s.favorite),
-                                        members.iter().any(|s| s.pinned),
-                                        ("cleanup-title", ix),
-                                        cx,
-                                    ))
-                                    .child(
-                                        h_flex()
-                                            .min_w_0()
-                                            .gap(SPACE_XS)
-                                            .items_center()
-                                            .text_size(FONT_LABEL)
-                                            .text_color(theme.muted_foreground)
-                                            .child(
-                                                img(meta.agent.brand_icon(theme.mode.is_dark()))
-                                                    .size(px(15.))
-                                                    .flex_shrink_0(),
-                                            )
-                                            .child(
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .id(("cleanup-preview", ix))
+                                .focusable()
+                                .tab_stop(true)
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(theme.primary))
+                                .focus(|style| style.bg(theme.list_hover).rounded(RADIUS_BUTTON))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "enter"
+                                            || event.keystroke.key == "space"
+                                        {
+                                            this.show_cleanup_preview(&keyboard_key, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.show_cleanup_preview(&preview_key, window, cx);
+                                }))
+                                .flex_1()
+                                .min_w_0()
+                                .gap(SPACE_XS)
+                                .child(cleanup_session_title(
+                                    meta,
+                                    members.iter().any(|s| s.favorite),
+                                    members.iter().any(|s| s.pinned),
+                                    ("cleanup-title", ix),
+                                    cx,
+                                ))
+                                .child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap(SPACE_XS)
+                                        .items_center()
+                                        .text_size(FONT_LABEL)
+                                        .text_color(theme.muted_foreground)
+                                        .child(
+                                            img(meta.agent.brand_icon(theme.mode.is_dark()))
+                                                .size(px(15.))
+                                                .flex_shrink_0(),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("cleanup-source", ix))
+                                                .min_w_0()
+                                                .max_w(px(128.))
+                                                .child(badge(
+                                                    meta.project_name.clone(),
+                                                    theme.muted,
+                                                    theme.muted_foreground,
+                                                ))
+                                                .tooltip(move |window, cx| {
+                                                    gpui_component::tooltip::Tooltip::new(
+                                                        source.clone(),
+                                                    )
+                                                    .build(window, cx)
+                                                }),
+                                        )
+                                        .when_some(reason, |row, reason| {
+                                            let full_reason = unavailable_reason(reason).to_owned();
+                                            row.child(div().px(SPACE_XS).child("·")).child(
                                                 div()
-                                                    .id(("cleanup-source", ix))
+                                                    .id(("cleanup-reason", ix))
+                                                    .flex_1()
                                                     .min_w_0()
-                                                    .max_w(px(128.))
-                                                    .child(badge(
-                                                        meta.project_name.clone(),
-                                                        theme.muted,
-                                                        theme.muted_foreground,
-                                                    ))
+                                                    .truncate()
+                                                    .child(reason_label(reason).to_owned())
                                                     .tooltip(move |window, cx| {
                                                         gpui_component::tooltip::Tooltip::new(
-                                                            source.clone(),
+                                                            full_reason.clone(),
                                                         )
                                                         .build(window, cx)
                                                     }),
                                             )
-                                            .when_some(reason, |row, reason| {
-                                                let full_reason =
-                                                    unavailable_reason(reason).to_owned();
-                                                row.child(div().px(SPACE_XS).child("·")).child(
-                                                    div()
-                                                        .id(("cleanup-reason", ix))
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .child(reason_label(reason).to_owned())
-                                                        .tooltip(move |window, cx| {
-                                                            gpui_component::tooltip::Tooltip::new(
-                                                                full_reason.clone(),
-                                                            )
-                                                            .build(window, cx)
-                                                        }),
-                                                )
-                                            })
-                                            .when(selectable && members.len() > 1, |row| {
-                                                row.child(crate::tp!(
-                                                    "{} nested session",
-                                                    "{} nested sessions",
-                                                    members.len() - 1
-                                                ))
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("cleanup-date", ix))
-                            .w(CLEANUP_DATE_WIDTH)
-                            .flex_shrink_0()
-                            .text_right()
-                            .text_size(FONT_LABEL)
-                            .text_color(theme.muted_foreground)
-                            .child(if date > 0 {
-                                smart_time(date)
-                            } else {
-                                "—".into()
-                            })
-                            .tooltip({
-                                let dates = format!(
-                                    "{} · {}\n{} · {}",
-                                    t("Date created"),
-                                    abs_date(meta.created_at),
-                                    t("Date updated"),
-                                    abs_date(item.updated_at())
-                                );
-                                move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(dates.clone())
-                                        .build(window, cx)
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id(("cleanup-size", ix))
-                            .w(CLEANUP_SIZE_WIDTH)
-                            .flex_shrink_0()
-                            .text_right()
-                            .text_size(FONT_BODY)
-                            .when(!selectable, |size| {
-                                size.text_color(theme.muted_foreground)
-                                    .tooltip(|window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(t(
-                                            "File size unavailable",
-                                        ))
-                                        .build(window, cx)
-                                    })
-                            })
-                            .child(
-                                candidate
-                                    .map(|c| bytes(c.bytes))
-                                    .unwrap_or_else(|| "—".into()),
-                            ),
-                    ),
+                                        })
+                                        .when(selectable && members.len() > 1, |row| {
+                                            row.child(crate::tp!(
+                                                "{} nested session",
+                                                "{} nested sessions",
+                                                members.len() - 1
+                                            ))
+                                        }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("cleanup-date", ix))
+                        .w(CLEANUP_DATE_WIDTH)
+                        .flex_shrink_0()
+                        .text_right()
+                        .text_size(FONT_LABEL)
+                        .text_color(theme.muted_foreground)
+                        .child(if date > 0 {
+                            smart_time(date)
+                        } else {
+                            "—".into()
+                        })
+                        .tooltip({
+                            let dates = format!(
+                                "{} · {}\n{} · {}",
+                                t("Date created"),
+                                abs_date(meta.created_at),
+                                t("Date updated"),
+                                abs_date(item.updated_at())
+                            );
+                            move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(dates.clone())
+                                    .build(window, cx)
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .id(("cleanup-size", ix))
+                        .w(CLEANUP_SIZE_WIDTH)
+                        .flex_shrink_0()
+                        .text_right()
+                        .text_size(FONT_BODY)
+                        .when(!selectable, |size| {
+                            size.text_color(theme.muted_foreground)
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(t(
+                                        "File size unavailable",
+                                    ))
+                                    .build(window, cx)
+                                })
+                        })
+                        .child(
+                            candidate
+                                .map(|c| bytes(c.bytes))
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                ),
             )
             .into_any_element()
     }

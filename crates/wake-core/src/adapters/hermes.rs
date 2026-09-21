@@ -501,18 +501,20 @@ impl AgentAdapter for HermesAdapter {
         true
     }
 
-    /// (child, parent) 全量快照:跨档案的父指针不成立(各库独立),只在库内配对
-    fn parent_links(&self) -> Vec<(String, String)> {
+    /// (child, parent) 全量快照:跨档案的父指针不成立(各库独立),只在库内配对。
+    /// 某个档案的库读不出就是整家"不知道"(None):跳过它给出的半截快照会让那个档案
+    /// 的关系被当成已解除
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
         let mut links = Vec::new();
         for db in &self.dbs {
-            let Some(rows) = Self::rows(db) else { continue };
+            let rows = Self::rows(db)?;
             let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             links.extend(rows.iter().filter_map(|r| {
                 let parent = r.parent_id.as_deref().filter(|p| ids.contains(p))?;
                 Some((format!("hermes:{}", r.id), format!("hermes:{parent}")))
             }));
         }
-        links
+        Some(links)
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {

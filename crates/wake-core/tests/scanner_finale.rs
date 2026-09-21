@@ -152,6 +152,46 @@ fn finale_fires_on_empty_scan() {
     assert_terminal_event(&rec.0.lock().unwrap(), "空 adapter 列表");
 }
 
+/// 库里有、roster 里已经没有的记忆分组(删掉的远程 host、停用的 agent)在下一轮
+/// 扫描收尾整组清掉——否则会话与缓存都没了之后记忆还能被列出、搜到
+#[test]
+fn memories_of_sources_gone_from_the_roster_are_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let doc = MemoryDoc {
+        key: "codex:devbox:/home/me/.codex/memories/prefs.md".to_string(),
+        agent: AgentId::Codex,
+        host: "devbox".to_string(),
+        scope: MemoryScope::User,
+        project_path: String::new(),
+        project_name: String::new(),
+        session_key: String::new(),
+        path: "/home/me/.codex/memories/prefs.md".to_string(),
+        title: "prefs".to_string(),
+        updated_at: 1,
+        size_bytes: 4,
+        body: "body".to_string(),
+    };
+    store
+        .replace_memories(AgentId::Codex, "devbox", &[doc], &[])
+        .unwrap();
+    assert_eq!(
+        store.list_memories(&MemoryFilter::default()).unwrap().len(),
+        1
+    );
+
+    // roster 里没有 devbox 这台 host(已被删除)
+    let adapters: Vec<Box<dyn AgentAdapter>> = Vec::new();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert!(
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .is_empty(),
+        "不再配置的来源的记忆必须随扫描出库"
+    );
+}
+
 #[test]
 fn finale_fires_when_adapter_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -548,6 +588,8 @@ struct SeedAdapter {
     quick_key: Option<String>,
     manages_links: bool,
     parent_links: Vec<(String, String)>,
+    /// 模拟"这一刻读不出关系"(state DB 打不开):parent_links 交 None
+    links_unknown: bool,
     rank: u8,
 }
 
@@ -585,8 +627,8 @@ impl AgentAdapter for SeedAdapter {
     fn manages_parent_links(&self) -> bool {
         self.manages_links
     }
-    fn parent_links(&self) -> Vec<(String, String)> {
-        self.parent_links.clone()
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        (!self.links_unknown).then(|| self.parent_links.clone())
     }
     fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
         if self.fail_parse {
@@ -614,9 +656,231 @@ impl AgentAdapter for SeedAdapter {
             quick_key: self.quick_key.clone(),
             manages_links: self.manages_links,
             parent_links: self.parent_links.clone(),
+            links_unknown: self.links_unknown,
             rank: self.rank,
         })
     }
+}
+
+/// 只提供记忆的 adapter:同 (agent, host) 多实例、一个坏一个好的对账测试用
+struct MemoryStub {
+    root: std::path::PathBuf,
+    docs: Vec<MemoryDoc>,
+    fail: bool,
+}
+
+impl AgentAdapter for MemoryStub {
+    fn agent(&self) -> AgentId {
+        AgentId::ClaudeCode
+    }
+    fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
+        Ok(Vec::new())
+    }
+    fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
+        bail!("unreachable")
+    }
+    fn parse_transcript(&self, _: &SessionFileRef) -> Result<ParsedTranscript> {
+        bail!("unreachable")
+    }
+    fn data_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.root.clone()]
+    }
+    fn with_custom_root(&self, _: std::path::PathBuf) -> Box<dyn AgentAdapter> {
+        unreachable!("not used in scans")
+    }
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        if self.fail {
+            bail!("simulated unreadable memory directory")
+        }
+        Ok(self.docs.clone())
+    }
+    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.root.join("memory")]
+    }
+}
+
+fn mem_doc(path: &str, title: &str) -> MemoryDoc {
+    MemoryDoc {
+        key: format!("claude-code:{path}"),
+        agent: AgentId::ClaudeCode,
+        host: String::new(),
+        scope: MemoryScope::Project,
+        project_path: String::new(),
+        project_name: String::new(),
+        session_key: String::new(),
+        path: path.to_string(),
+        title: title.to_string(),
+        updated_at: 1,
+        size_bytes: 4,
+        body: "body".to_string(),
+    }
+}
+
+fn memory_stub(root: &str, docs: Vec<MemoryDoc>, fail: bool) -> Box<dyn AgentAdapter> {
+    Box::new(MemoryStub {
+        root: std::path::PathBuf::from(root),
+        docs,
+        fail,
+    })
+}
+
+/// 同 (agent, host) 的两个实例,一个读得出、一个读不出:好的那个照常对账(新增入库、
+/// 消失出库),坏的那个根下的行原样冻结;全部实例都失败才整组不动——原先一个实例失败
+/// 整组不写,默认根的记忆会一直停在上次(2026-09-21 review)
+#[test]
+fn memories_of_a_failing_instance_stay_frozen_while_the_others_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let titles = |store: &Store| -> Vec<String> {
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect()
+    };
+    // 上一轮两边都好:a1 与 b1 入库
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a1.md", "a1")],
+            false,
+        ),
+        memory_stub(
+            "/roots/b",
+            vec![mem_doc("/roots/b/memory/b1.md", "b1")],
+            false,
+        ),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a1", "b1"]);
+    // 这一轮 a 换了文件、b 读不出
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a2.md", "a2")],
+            false,
+        ),
+        memory_stub("/roots/b", Vec::new(), true),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2", "b1"], "a 对账了,b 冻结");
+    // 全部实例都失败:整组不动
+    let adapters = vec![memory_stub("/roots/a", Vec::new(), true)];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2", "b1"]);
+    // b 恢复后按它现在的内容对账
+    let adapters = vec![
+        memory_stub(
+            "/roots/a",
+            vec![mem_doc("/roots/a/memory/a2.md", "a2")],
+            false,
+        ),
+        memory_stub("/roots/b", Vec::new(), false),
+    ];
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["a2"]);
+}
+
+/// 关系这一刻读不出(state DB 打不开)= None:这一家整段跳过,库里的关系原样保留,
+/// 而不是拿空快照当"全部解除"整家清空(2026-09-21 review)
+#[test]
+fn unreadable_parent_links_keep_the_indexed_relationships() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let pair = |unknown: bool| -> Vec<Box<dyn AgentAdapter>> {
+        let mut child = seed(
+            AgentId::Grok,
+            "/tmp/grok-child-location",
+            "/tmp/grok-child-location/group/child/updates.jsonl",
+            "child",
+            20,
+        );
+        child.manages_links = true;
+        child.links_unknown = unknown;
+        let mut parent = seed(
+            AgentId::Grok,
+            "/tmp/grok-parent-location",
+            "/tmp/grok-parent-location/group/parent/updates.jsonl",
+            "parent",
+            10,
+        );
+        parent.manages_links = true;
+        parent.parent_links = vec![("grok:child".into(), "grok:parent".into())];
+        parent.links_unknown = unknown;
+        vec![Box::new(child), Box::new(parent)]
+    };
+    run_scan(&pair(false), &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:child").unwrap(),
+        Some("grok:parent".into())
+    );
+    run_scan(&pair(true), &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:child").unwrap(),
+        Some("grok:parent".into()),
+        "读不出不等于解除"
+    );
+}
+
+/// 两层链:先只有 leaf 与 middle 入库(leaf→middle),root 后来才被索引——这一轮算得出
+/// leaf→root 就以它为准;原先 asserted 守卫会把先入库的直接边 leaf→middle 保留回去,
+/// 链永远钉在中间层(2026-09-21 review)
+#[test]
+fn nested_chain_reflattens_once_the_root_is_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let leaf = || {
+        let mut leaf = seed(
+            AgentId::Grok,
+            "/tmp/grok-leaf-location",
+            "/tmp/grok-leaf-location/group/leaf/updates.jsonl",
+            "leaf",
+            30,
+        );
+        leaf.manages_links = true;
+        leaf
+    };
+    let middle = || {
+        let mut middle = seed(
+            AgentId::Grok,
+            "/tmp/grok-middle-location",
+            "/tmp/grok-middle-location/group/middle/updates.jsonl",
+            "middle",
+            20,
+        );
+        middle.manages_links = true;
+        middle.parent_links = vec![("grok:leaf".into(), "grok:middle".into())];
+        middle
+    };
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(leaf()), Box::new(middle())];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:leaf").unwrap(),
+        Some("grok:middle".into())
+    );
+
+    let mut root = seed(
+        AgentId::Grok,
+        "/tmp/grok-root-location",
+        "/tmp/grok-root-location/group/root/updates.jsonl",
+        "root",
+        10,
+    );
+    root.manages_links = true;
+    root.parent_links = vec![("grok:middle".into(), "grok:root".into())];
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![Box::new(leaf()), Box::new(middle()), Box::new(root)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("grok:middle").unwrap(),
+        Some("grok:root".into())
+    );
+    assert_eq!(
+        store.parent_key_of("grok:leaf").unwrap(),
+        Some("grok:root".into()),
+        "root 入库后 leaf 要重新扁平到 root,而不是钉在 middle"
+    );
 }
 
 /// SeedAdapter 三件套:根/路径/mtime 齐配的最小会话
@@ -656,6 +920,7 @@ fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> 
         quick_key: None,
         manages_links: false,
         parent_links: Vec::new(),
+        links_unknown: false,
         rank: 0,
     }
 }
@@ -703,6 +968,7 @@ fn tombstoned_session_does_not_resurrect_on_rescan() {
         quick_key: None,
         manages_links: false,
         parent_links: Vec::new(),
+        links_unknown: false,
         rank: 0,
     })];
     let rec = Recorder::new();
@@ -1124,7 +1390,7 @@ fn codex_guardian_rescan_prunes_stale_index_and_all_mcp_views() {
         &json!({ "query": "guardianartifact7429", "agents": ["codex"] }),
     )
     .unwrap();
-    assert!(searched.contains("No matches"), "{searched}");
+    assert!(searched.contains("No session matches"), "{searched}");
 
     let listed = tools::invoke(
         store.as_ref(),

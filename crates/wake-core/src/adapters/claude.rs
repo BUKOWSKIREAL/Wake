@@ -27,6 +27,15 @@ const KNOWN_SKIP_TYPES: &[&str] = &[
 
 pub struct ClaudeAdapter {
     root: PathBuf,
+    /// 默认根(本机自己的 ~/.claude):项目目录名才能在本机文件系统上反推——目录名
+    /// 指的是写下会话的那台机器上的路径,自定义根(别处拷来的、远程镜像)反推不得
+    local: bool,
+    /// auto-memory 文档,按目录指纹缓存(每轮扫描都会列,指纹没变不重读)
+    memories: MtimeCache<Vec<MemoryDoc>>,
+    /// 目录名 → 反推出的项目路径,进程内记住(含反推失败):反推要从 `/` 逐层
+    /// read_dir + stat,答案又几乎不变,每轮扫描重走一遍是白费;目录后来才出现的
+    /// 极少数情况重启即可
+    decoded: std::sync::Mutex<HashMap<String, Option<String>>>,
 }
 
 impl ClaudeAdapter {
@@ -35,8 +44,67 @@ impl ClaudeAdapter {
             .unwrap_or_default()
             .join(".claude")
             .join("projects");
-        Self { root }
+        Self {
+            root,
+            local: true,
+            memories: MtimeCache::new(),
+            decoded: std::sync::Mutex::new(HashMap::new()),
+        }
     }
+
+    /// `decode_project_dir` 的记忆版
+    fn project_path_of_dir(&self, name: &str) -> Option<String> {
+        let mut cache = self.decoded.lock().unwrap();
+        cache
+            .entry(name.to_string())
+            .or_insert_with(|| decode_project_dir(name))
+            .clone()
+    }
+}
+
+/// projects/<目录名> → 项目路径:Claude 把 cwd 里所有非字母数字字符都替成 `-`
+/// (`/Users/x/.claude/worktrees/a-b` → `-Users-x--claude-worktrees-a-b`),反推只能
+/// 靠磁盘:从 `/` 起逐层列目录,取编码后与剩余串前缀相符的子目录(同一层多个候选
+/// 先试最长的),整串吃完即命中。只在没有会话可当锚点的目录上用(每轮几个目录、
+/// 每层一次 read_dir);目录已不在磁盘上就认不出,落 Unknown project
+fn decode_project_dir(name: &str) -> Option<String> {
+    fn encode(raw: &str) -> String {
+        raw.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    }
+    fn walk(dir: PathBuf, rest: &str) -> Option<PathBuf> {
+        if rest.is_empty() {
+            return Some(dir);
+        }
+        let mut candidates: Vec<(String, PathBuf)> = fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| {
+                let encoded = encode(&e.file_name().to_string_lossy());
+                let matches = !encoded.is_empty()
+                    && rest.starts_with(&encoded)
+                    && matches!(rest.as_bytes().get(encoded.len()), None | Some(b'-'));
+                matches.then(|| (encoded, e.path()))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        for (encoded, path) in candidates {
+            let next = &rest[encoded.len()..];
+            let next = next.strip_prefix('-').unwrap_or(next);
+            if let Some(hit) = walk(path, next) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    // 只认 POSIX 绝对路径(首字符 `/` → `-`);Windows 的 `C--Users-…` 形态不做
+    let rest = name.strip_prefix('-')?;
+    if rest.is_empty() {
+        return None;
+    }
+    walk(PathBuf::from("/"), rest).map(|p| p.to_string_lossy().to_string())
 }
 
 struct ParseResult {
@@ -507,6 +575,24 @@ fn list_sidechains(r: &SessionFileRef) -> Vec<SidechainInfo> {
     out
 }
 
+/// projects/<有损编码目录>/ 里最新的一份会话(按 mtime,平局取 id 字典序靠后的)
+/// 的 key:目录名反推不了项目路径,而目录里的会话都是同一个 cwd 起的——记忆挂到
+/// 这条会话上,项目路径读库时按它从 sessions 表解析(索引已经算过,不再翻文件)。
+/// 候选与会话枚举同一个判据(`default_file_ref`:.jsonl、非隐藏、非零字节),否则
+/// 锚点会指向一条进不了库的会话、整组记忆落 Unknown project。没有会话给 None
+fn newest_session_key(dir: &Path) -> Option<String> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| default_file_ref(AgentId::ClaudeCode, &e.path()))
+        .max_by(|a, b| {
+            a.mtime_ms
+                .cmp(&b.mtime_ms)
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        })
+        .map(|r| session_key(AgentId::ClaudeCode, "", &r.native_id))
+}
+
 impl AgentAdapter for ClaudeAdapter {
     fn agent(&self) -> AgentId {
         AgentId::ClaudeCode
@@ -616,6 +702,48 @@ impl AgentAdapter for ClaudeAdapter {
         Some(self.session_paths(meta))
     }
 
+    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+        // auto-memory:projects/<dir>/memory/*.md(MEMORY.md 索引 + 逐条主题文件)。
+        // 每个项目目录的记忆挂到该目录最新的会话上(见 newest_session_key);目录里
+        // 没有会话(Claude 按 cleanupPeriodDays 清过)就从目录名在本机磁盘上反推
+        // 项目路径(decode_project_dir,只对默认根),反推不出才落 Unknown project
+        // projects/ 不在 = 没有记忆;列不出来(权限、I/O、fd 耗尽)是"不知道",报 Err
+        // 让 scanner 冻结这一组——折成空会把库里 Claude 的记忆整组删光(2026-09-21 review)
+        let projects = match fs::read_dir(&self.root) {
+            Ok(projects) => projects,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::Error::new(e).context(self.root.display().to_string())),
+        };
+        let mut dirs: Vec<super::MemoryDir> = projects
+            .flatten()
+            .filter_map(|project| {
+                let dir = project.path().join("memory");
+                if !dir.is_dir() {
+                    return None;
+                }
+                let session_key = newest_session_key(&project.path()).unwrap_or_default();
+                let project_path = if session_key.is_empty() && self.local {
+                    self.project_path_of_dir(&project.file_name().to_string_lossy())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Some(super::MemoryDir {
+                    scope: MemoryScope::Project,
+                    session_key,
+                    project_path,
+                    dir,
+                })
+            })
+            .collect();
+        dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
+        super::cached_memory_docs(&self.memories, AgentId::ClaudeCode, &dirs)
+    }
+
+    fn memory_roots(&self) -> Vec<PathBuf> {
+        vec![self.root.clone()]
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 选中 `~/.claude` 形态(含 projects/)或直接选中 projects 目录都认
         let root = if dir.join("projects").is_dir() {
@@ -623,10 +751,47 @@ impl AgentAdapter for ClaudeAdapter {
         } else {
             dir
         };
-        Box::new(Self { root })
+        Box::new(Self {
+            root,
+            local: false,
+            memories: MtimeCache::new(),
+            decoded: std::sync::Mutex::new(HashMap::new()),
+        })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 目录名反推项目路径:`.`、`_`、空格都被编成 `-`,同一层多个候选按最长优先,
+    /// 磁盘上不存在的认不出
+    #[test]
+    fn project_dir_name_decodes_against_the_filesystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp
+            .path()
+            .join(".claude")
+            .join("work trees")
+            .join("my-app_v2");
+        fs::create_dir_all(&project).unwrap();
+        // 干扰项:同一层还有一个前缀相同但更短的目录
+        fs::create_dir_all(tmp.path().join(".claude").join("work")).unwrap();
+        let encoded: String = project
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        assert!(encoded.starts_with('-'), "{encoded}");
+        assert_eq!(
+            decode_project_dir(&encoded).as_deref(),
+            Some(project.to_string_lossy().as_ref())
+        );
+        assert_eq!(decode_project_dir(&format!("{encoded}-nope")), None);
+        assert_eq!(decode_project_dir("Users-x"), None, "不是绝对路径形态");
     }
 }

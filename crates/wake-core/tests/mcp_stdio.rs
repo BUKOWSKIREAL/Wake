@@ -206,7 +206,8 @@ fn stdio_contract_end_to_end() {
             "wake_search",
             "wake_list_sessions",
             "wake_get_session",
-            "wake_list_projects"
+            "wake_list_projects",
+            "wake_list_memories"
         ]
     );
 
@@ -384,6 +385,44 @@ fn stdio_contract_end_to_end() {
     );
     let (projects, _) = c.call("wake_list_projects", json!({}));
     assert!(projects.contains(CLAUDE_PROJECT));
+
+    // 5b. 记忆:Claude 的 auto-memory 按项目列出,Codex 的用户级不受项目筛选影响;
+    // wake://memory 引用交给 wake_get_session 读;wake_search 末尾附带记忆命中
+    let (memories, _) = c.call("wake_list_memories", json!({ "project": CLAUDE_PROJECT }));
+    assert!(
+        memories.contains("Wake testing conventions for this repo"),
+        "{memories}"
+    );
+    assert!(
+        memories.contains("user-preferences"),
+        "Codex 的用户级记忆不受项目筛选影响:\n{memories}"
+    );
+    let mem_ref = memories
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ref: "))
+        .expect("a wake://memory ref")
+        .to_string();
+    assert!(mem_ref.starts_with("wake://memory/"), "{mem_ref}");
+    let (memory, is_err) = c.call("wake_get_session", json!({ "key": mem_ref }));
+    assert!(!is_err, "{memory}");
+    assert!(
+        memory.starts_with("# ") && memory.contains("source: "),
+        "{memory}"
+    );
+    let (found, _) = c.call("wake_search", json!({ "query": "synthetic" }));
+    assert!(found.contains("Memory files that mention"), "{found}");
+    // 项目没匹配上:会话一条都没有,但用户级记忆对每个项目都成立,照样查
+    let (unmatched, is_err) = c.call(
+        "wake_search",
+        json!({ "query": "concise", "project": "/nope/nope" }),
+    );
+    assert!(!is_err);
+    assert!(
+        unmatched.contains("No indexed project matches")
+            && unmatched.contains("Memory files that mention")
+            && unmatched.contains("user-preferences"),
+        "{unmatched}"
+    );
     // 用不可能到达的绝对日期,不用 "1m":fixture 的 updated_at 有的取自文件 mtime,
     // Linux 的 fs::copy 不保留 mtime(macOS 走 APFS clone 会保留),staged 的
     // fixture 在 Linux 上就是"刚刚"——2026-09-08 CI 只红 ubuntu 那路

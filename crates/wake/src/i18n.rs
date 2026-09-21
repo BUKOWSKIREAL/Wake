@@ -621,6 +621,7 @@ mod tests {
             include_str!("workbench/cleanup/filter.rs"),
             include_str!("workbench/cleanup/history.rs"),
             include_str!("workbench/cleanup/rows.rs"),
+            include_str!("workbench/memory.rs"),
             include_str!("settings.rs"),
             include_str!("main.rs"),
             include_str!("markdown_links.rs"),

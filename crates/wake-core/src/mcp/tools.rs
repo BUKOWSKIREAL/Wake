@@ -94,12 +94,22 @@ pub const SEARCH: &str = "wake_search";
 pub const LIST_SESSIONS: &str = "wake_list_sessions";
 pub const GET_SESSION: &str = "wake_get_session";
 pub const LIST_PROJECTS: &str = "wake_list_projects";
-/// 四个工具名的清单:自指回声过滤(`adapters::is_wake_lookup`)与 definitions 的
-/// 稳定性测试都读它,加第五家改这里与 `definitions()` 两处即可
-pub const NAMES: [&str; 4] = [SEARCH, LIST_SESSIONS, GET_SESSION, LIST_PROJECTS];
+pub const LIST_MEMORIES: &str = "wake_list_memories";
+/// 工具名的清单:自指回声过滤(`adapters::is_wake_lookup`)与 definitions 的
+/// 稳定性测试都读它,加一家改这里与 `definitions()` 两处即可
+pub const NAMES: [&str; 5] = [
+    SEARCH,
+    LIST_SESSIONS,
+    GET_SESSION,
+    LIST_PROJECTS,
+    LIST_MEMORIES,
+];
 
 const MAX_SEARCH_SESSIONS: i64 = 30;
 const MAX_LIST_SESSIONS: i64 = 100;
+const MAX_LIST_MEMORIES: i64 = 100;
+/// wake_search 末尾附带的记忆命中数
+const MEMORY_HITS_IN_SEARCH: i64 = 5;
 const MAX_LIST_PROJECTS: i64 = 200;
 const SNIPPETS_PER_SESSION: usize = 3;
 
@@ -173,11 +183,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": GET_SESSION,
             "title": "Read a session transcript",
-            "description": "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted. Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it.",
+            "description": "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted. Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it. Also reads memory files: pass a `wake://memory/<key>` reference from wake_list_memories or wake_search to get that file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "Session key such as `claude-code:1b2c…`, or a wake://session/… reference." },
+                    "key": { "type": "string", "description": "Session key such as `claude-code:1b2c…`, a wake://session/… reference, or a wake://memory/… reference to read a memory file." },
                     "from_seq": { "type": "integer", "minimum": 0, "description": "Start at this message seq (inclusive). Default: the beginning." },
                     "max_messages": { "type": "integer", "minimum": 1, "maximum": 200, "default": 60, "description": "Messages per page." },
                     "max_chars": { "type": "integer", "minimum": 200, "maximum": 100000, "default": 20000, "description": "Character budget per page." },
@@ -203,6 +213,20 @@ pub fn definitions() -> Vec<Value> {
             },
             "annotations": read_only_annotations(),
         }),
+        json!({
+            "name": LIST_MEMORIES,
+            "title": "List agent memory files",
+            "description": "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files) and Codex's memories — read-only, grouped by project, user-level ones last. Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas. Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": project_param(),
+                    "agents": agents_param(),
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_MEMORIES, "default": 50 },
+                },
+            },
+            "annotations": read_only_annotations(),
+        }),
     ]
 }
 
@@ -212,6 +236,7 @@ fn call(ctx: &ToolContext, name: &str, args: &Value) -> ToolResult {
         LIST_SESSIONS => list_sessions(ctx, args),
         GET_SESSION => get_session(ctx, args),
         LIST_PROJECTS => list_projects(ctx, args),
+        LIST_MEMORIES => list_memories(ctx, args),
         other => Err(ToolError::InvalidParams(format!("Unknown tool: {other}"))),
     }
 }
@@ -408,7 +433,24 @@ fn project_arg(ctx: &ToolContext, args: &Value) -> Result<ProjectScope, ToolErro
     Ok(ProjectScope::NoMatch(text))
 }
 
-/// 两个列表工具共用的 project 解包:没匹配上时直接把提示文本当结果返回
+/// 记忆面的 project 解包:没匹配上索引里的项目**不早退**——用户级记忆对每个项目都
+/// 成立,筛选串按原样传下去(项目级本来就一份都不会匹配、用户级照列),提示文本
+/// 另外带回给调用方决定怎么说
+fn memory_project_scope(
+    ctx: &ToolContext,
+    args: &Value,
+) -> Result<(Option<Vec<String>>, Option<String>), ToolError> {
+    Ok(match project_arg(ctx, args)? {
+        ProjectScope::All => (None, None),
+        ProjectScope::Paths(p) => (Some(p), None),
+        ProjectScope::NoMatch(text) => {
+            let arg = text_arg(args, "project")?.unwrap_or_default().to_string();
+            (Some(vec![arg]), Some(text))
+        }
+    })
+}
+
+/// 会话列表工具的 project 解包:没匹配上时直接把提示文本当结果返回
 macro_rules! project_scope {
     ($ctx:expr, $args:expr) => {
         match project_arg($ctx, $args)? {
@@ -524,6 +566,42 @@ fn session_ref(key: &str, seq: i64) -> String {
     format!("wake://session/{key}#{seq}")
 }
 
+fn memory_ref(key: &str) -> String {
+    format!("wake://memory/{key}")
+}
+
+/// `wake_get_session` 的 `key` 参数认的三种形态:裸会话 key、`wake://session/<key>#<seq>`
+/// (seq 成为默认起点)、`wake://memory/<key>`(记忆文件,另一条读法)。写引用的
+/// `session_ref` / `memory_ref` 与读引用的 `parse` 放在一起,两边一起改。记忆 key
+/// 自身可含 `#`(SQLite 型虚拟路径 `<db>#<id>`),所以先认 scheme 再拆 seq
+#[derive(Debug, PartialEq, Eq)]
+enum WakeRef {
+    Session { key: String, seq: Option<i64> },
+    Memory { key: String },
+}
+
+impl WakeRef {
+    fn parse(raw: &str) -> Self {
+        let s = raw.trim();
+        if let Some(key) = s.strip_prefix("wake://memory/") {
+            return Self::Memory {
+                key: key.trim().to_string(),
+            };
+        }
+        let s = s.strip_prefix("wake://session/").unwrap_or(s);
+        match s.rsplit_once('#') {
+            Some((key, seq)) if seq.parse::<i64>().is_ok() => Self::Session {
+                key: key.to_string(),
+                seq: seq.parse().ok(),
+            },
+            _ => Self::Session {
+                key: s.to_string(),
+                seq: None,
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 工具实现
 
 fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
@@ -532,7 +610,18 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
     let agents = agents_arg(args)?;
     let since = since_arg(ctx, args)?;
     let limit = int_arg(args, "limit", 10, 1, MAX_SEARCH_SESSIONS)?;
-    let project = project_scope!(ctx, args);
+    let (project, unmatched) = memory_project_scope(ctx, args)?;
+    if let Some(text) = unmatched {
+        // 会话没有这个项目,但用户级记忆对每个项目都成立——提示之余照样查一遍
+        let memory = memory_hits_section(ctx, query, &agents, &project)?;
+        let mut out = text;
+        if !memory.is_empty() {
+            // 提示文本不带收尾换行,记忆段自带前导空行;没命中就一字不加
+            out.push('\n');
+            out.push_str(memory.trim_end());
+        }
+        return Ok(out);
+    }
     // 命中是消息级、按 bm25 排;一个会话能占掉前几十行,多取一些再按会话归组
     let fetch = (limit * 8).clamp(60, 400);
     let (hits, degraded) = ctx.store.search_with(
@@ -556,13 +645,18 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
         }
     }
     let scope = scope_note(&project, &agents, since, false);
+    // 记忆命中是另一类数据,不与会话命中混排,作为尾巴附在两种结果后面
+    let memory = memory_hits_section(ctx, query, &agents, &project)?;
     let mut out = String::new();
     if order.is_empty() {
-        out.push_str(&format!("No matches for `{query}`{scope}.\n"));
+        out.push_str(&format!("No session matches `{query}`{scope}.\n"));
         if degraded {
             out.push_str("Note: terms shorter than 3 characters use a substring scan; try a longer or more specific term.\n");
         }
-        out.push_str("Try fewer or different terms, drop the project/agent/since filters, or list sessions with wake_list_sessions.\n\n");
+        if memory.is_empty() {
+            out.push_str("Try fewer or different terms, drop the project/agent/since filters, or list sessions with wake_list_sessions.\n\n");
+        }
+        out.push_str(&memory);
         out.push_str(&index_note(ctx.store));
         return Ok(out);
     }
@@ -613,7 +707,184 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str(
         "Read a session with wake_get_session (pass the key, or a ref to start at that message).\n",
     );
+    out.push_str(&memory);
     out.push_str(&index_note(ctx.store));
+    Ok(out)
+}
+
+/// wake_search 末尾附带的记忆命中:agent 自己写的记忆里提到这个词的几份,带
+/// `wake://memory/…` 引用。整段前后各一个空行,调用方直接拼、不用管分隔;没有就是空串
+fn memory_hits_section(
+    ctx: &ToolContext,
+    query: &str,
+    agents: &[AgentId],
+    project: &Option<Vec<String>>,
+) -> Result<String, ToolError> {
+    let hits = ctx.store.search_memories(
+        query,
+        &MemoryFilter {
+            agents: agents.to_vec(),
+            project_paths: project.clone().unwrap_or_default(),
+            unattributed: false,
+            limit: MEMORY_HITS_IN_SEARCH,
+        },
+    )?;
+    if hits.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = format!("\nMemory files that mention `{query}`:\n");
+    for h in &hits {
+        out.push_str(&format!(
+            "- {}{} · {}: {}\n  ref: {}\n",
+            memory_label(&h.doc),
+            memory_session_note(&h.doc),
+            memory_group(&h.doc),
+            clean_snippet(&h.snippet),
+            memory_ref(&h.doc.key)
+        ));
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+/// `<标题> · <agent> · <层级>[ · @host]`
+fn memory_label(d: &MemoryDoc) -> String {
+    // 标题入库时已按 MEMORY_TITLE_MAX 折行封顶;老库里的行要等文件变了才重读,这里再兜一道
+    let mut s = format!(
+        "{} · {} · {}",
+        one_line(&d.title, crate::adapters::MEMORY_TITLE_MAX),
+        d.agent.display_name(),
+        d.scope.label()
+    );
+    if !d.host.is_empty() {
+        s.push_str(&format!(" · @{}", d.host));
+    }
+    s
+}
+
+/// 记忆归属哪一组(列表的组头、搜索命中的归属都用它);分组判据在 `MemoryDoc::group`
+fn memory_group(d: &MemoryDoc) -> String {
+    match d.group() {
+        MemoryGroup::User => "User-level (applies to every project)".to_string(),
+        MemoryGroup::Unknown => "Unknown project".to_string(),
+        MemoryGroup::Project { path, name } => format!("{path} — {name}"),
+    }
+}
+
+/// 线程级记忆才标它所属的会话;项目级的 session_key 只是解析项目用的锚点,不露出
+fn memory_session_note(d: &MemoryDoc) -> String {
+    if d.scope == MemoryScope::Thread && !d.session_key.is_empty() {
+        format!(" · session `{}`", d.session_key)
+    } else {
+        String::new()
+    }
+}
+
+fn list_memories(ctx: &ToolContext, args: &Value) -> ToolResult {
+    let agents = agents_arg(args)?;
+    let limit = int_arg(args, "limit", 50, 1, MAX_LIST_MEMORIES)?;
+    let (project, unmatched) = memory_project_scope(ctx, args)?;
+    let docs = ctx.store.list_memories(&MemoryFilter {
+        agents: agents.clone(),
+        project_paths: project.clone().unwrap_or_default(),
+        unattributed: false,
+        limit,
+    })?;
+    let scope = scope_note(&project, &agents, None, false);
+    let mut out = String::new();
+    if let Some(text) = unmatched {
+        let first_line = text.lines().next().unwrap_or_default();
+        out.push_str(&format!(
+            "{first_line} Only user-level memory files, which apply everywhere, are listed below.\n\n"
+        ));
+    }
+    if docs.is_empty() {
+        out.push_str(&format!(
+            "No memory files{scope}. Claude Code writes them under ~/.claude/projects/<project>/memory/ once it has saved something about a project; Codex keeps its own under ~/.codex/memories/; ZCode under ~/.zcode/cli/memories/projects/. Wake only lists what is there.\n\n"
+        ));
+        out.push_str(&index_note(ctx.store));
+        return Ok(out);
+    }
+    out.push_str(&format!(
+        "{} memory file{}{scope}, grouped by project (user-level last; the limit applies to project-level files, user-level ones are always included).\n",
+        docs.len(),
+        plural(docs.len() as i64)
+    ));
+    // store 已按 (用户级最后, 项目路径, 新到旧) 排好,这里只在组变化时打组头
+    let mut current: Option<String> = None;
+    for d in &docs {
+        let group = memory_group(d);
+        if current.as_deref() != Some(group.as_str()) {
+            out.push_str(&format!("\n## {group}\n"));
+            current = Some(group);
+        }
+        out.push_str(&format!(
+            "- {}{} · updated {}\n  ref: {}\n",
+            memory_label(d),
+            memory_session_note(d),
+            fmt_time(Some(d.updated_at)),
+            memory_ref(&d.key)
+        ));
+    }
+    out.push_str("\nRead one with wake_get_session using its wake://memory/… reference.\n");
+    out.push_str(&index_note(ctx.store));
+    Ok(out)
+}
+
+/// `wake_get_session` 收到 `wake://memory/<key>` 引用时的读法:标题行 + 归属 + 来源
+/// 路径,然后是正文。文件型现场读磁盘(agent 刚改过也能看到),读不到退库里那份;
+/// SQLite 型只有库里那份。同一个 `max_chars` 预算,超了截断并说明
+/// `wake_get_session` 读记忆时一页的字符上限(与会话页同数);`int_arg` 静默封顶
+const MAX_GET_CHARS: usize = 100_000;
+
+fn get_memory(ctx: &ToolContext, key: &str, args: &Value) -> ToolResult {
+    let max_chars = int_arg(args, "max_chars", 20_000, 200, MAX_GET_CHARS as i64)? as usize;
+    let Some(doc) = ctx.store.get_memory(key)? else {
+        return Err(ToolError::Failed(format!(
+            "No memory file with key `{key}`; get a wake://memory/… reference from wake_list_memories or wake_search."
+        )));
+    };
+    let body = crate::adapters::memory_body(&doc);
+    let mut out = format!(
+        "# {}\nkey: `{}` · {} · {} memory",
+        doc.title,
+        doc.key,
+        doc.agent.display_name(),
+        doc.scope.label()
+    );
+    if !doc.project_path.is_empty() {
+        out.push_str(&format!(" · project {}", doc.project_path));
+    }
+    out.push_str(&memory_session_note(&doc));
+    if !doc.host.is_empty() {
+        out.push_str(&format!(" · @{}", doc.host));
+    }
+    out.push_str(&format!(
+        " · updated {}\nsource: {}\n\n",
+        fmt_time(Some(doc.updated_at)),
+        doc.path
+    ));
+    let (text, truncated) = crate::adapters::parse_utils::clip(&body, max_chars);
+    out.push_str(&text);
+    if !text.ends_with('\n') {
+        out.push('\n');
+    }
+    if truncated {
+        // 说实话:max_chars 静默封顶在 MAX_GET_CHARS,超过它没有翻页可言,只能指向
+        // 文件本身——原先一律劝"传更大的 max_chars",顶格的调用方会原地打转
+        if max_chars < MAX_GET_CHARS {
+            out.push_str(&format!(
+                "\n[truncated at {max_chars} of {} characters — pass a larger max_chars (up to {MAX_GET_CHARS}) for the rest]\n",
+                body.chars().count()
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n[truncated at {max_chars} characters; the file is {} characters and that is the largest page this tool reads — open {} for the rest]\n",
+                body.chars().count(),
+                doc.path
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -707,16 +978,6 @@ fn list_projects(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str("\nUse a path as `project` in wake_list_sessions or wake_search.\n");
     out.push_str(&index_note(ctx.store));
     Ok(out)
-}
-
-/// `key` 也接受 `wake://session/<key>#<seq>` 引用(seq 成为默认起点)
-fn parse_key_arg(raw: &str) -> (String, Option<i64>) {
-    let s = raw.trim();
-    let s = s.strip_prefix("wake://session/").unwrap_or(s);
-    match s.rsplit_once('#') {
-        Some((key, seq)) if seq.parse::<i64>().is_ok() => (key.to_string(), seq.parse().ok()),
-        _ => (s.to_string(), None),
-    }
 }
 
 fn find_session(store: &Store, key: &str) -> Result<Result<SessionMeta, String>, ToolError> {
@@ -844,7 +1105,11 @@ fn subagent_listing(title: &str, meta: &SessionMeta, sidechains: &[SidechainInfo
 fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     let raw_key = text_arg(args, "key")?
         .ok_or_else(|| ToolError::InvalidParams("`key` is required".into()))?;
-    let (key, ref_seq) = parse_key_arg(raw_key);
+    // 记忆引用走另一条读法;不另开工具,agent 拿到什么引用都交给同一个入口
+    let (key, ref_seq) = match WakeRef::parse(raw_key) {
+        WakeRef::Memory { key } => return get_memory(ctx, &key, args),
+        WakeRef::Session { key, seq } => (key, seq),
+    };
     let from_seq = int_arg(args, "from_seq", ref_seq.unwrap_or(0), 0, i64::MAX)?;
     let opts = CompactOptions {
         from_seq,
@@ -1090,17 +1355,29 @@ mod tests {
 
     #[test]
     fn key_arg_accepts_wake_refs() {
+        let session = |key: &str, seq: Option<i64>| WakeRef::Session {
+            key: key.to_string(),
+            seq,
+        };
         assert_eq!(
-            parse_key_arg("wake://session/claude-code:abc#12"),
-            ("claude-code:abc".to_string(), Some(12))
+            WakeRef::parse(&session_ref("claude-code:abc", 12)),
+            session("claude-code:abc", Some(12))
         );
         assert_eq!(
-            parse_key_arg("codex:devbox:0195-xyz"),
-            ("codex:devbox:0195-xyz".to_string(), None)
+            WakeRef::parse("codex:devbox:0195-xyz"),
+            session("codex:devbox:0195-xyz", None)
         );
         assert_eq!(
-            parse_key_arg(" claude-code:abc "),
-            ("claude-code:abc".to_string(), None)
+            WakeRef::parse(" claude-code:abc "),
+            session("claude-code:abc", None)
+        );
+        // 记忆 key 自身带 `#`(SQLite 型虚拟路径)也不能被当成 seq 拆掉
+        let memory_key = "codex:/home/me/.codex/memories_1.sqlite#t-0001";
+        assert_eq!(
+            WakeRef::parse(&memory_ref(memory_key)),
+            WakeRef::Memory {
+                key: memory_key.to_string()
+            }
         );
     }
 
