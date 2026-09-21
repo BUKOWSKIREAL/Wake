@@ -57,19 +57,14 @@ struct HermesSchema {
 
 impl HermesSchema {
     fn probe(conn: &rusqlite::Connection) -> Self {
-        let has = |table: &str, col: &str| {
-            conn.prepare(&format!(
-                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
-            ))
-            .and_then(|mut s| s.exists([col]))
-            .unwrap_or(false)
-        };
+        let sessions = super::sqlite_ro::table_columns(conn, "sessions");
+        let messages = super::sqlite_ro::table_columns(conn, "messages");
         Self {
-            title: has("sessions", "title"),
-            cache_read: has("sessions", "cache_read_tokens"),
-            cache_write: has("sessions", "cache_write_tokens"),
-            reasoning_tokens: has("sessions", "reasoning_tokens"),
-            msg_reasoning: has("messages", "reasoning"),
+            title: sessions.contains("title"),
+            cache_read: sessions.contains("cache_read_tokens"),
+            cache_write: sessions.contains("cache_write_tokens"),
+            reasoning_tokens: sessions.contains("reasoning_tokens"),
+            msg_reasoning: messages.contains("reasoning"),
         }
     }
 }

@@ -299,7 +299,13 @@ impl OpencodeAdapter {
             .ok_or_else(|| anyhow!("opencode session {} not in db", r.native_id))?;
         let (messages, unknown) = match row.v2_messages {
             true => parse_v2_messages(&ro, &r.native_id, decode_images)?,
-            false => parse_v1_messages(&ro, &r.native_id, decode_images)?,
+            false => parse_v1_messages(
+                &ro,
+                &r.native_id,
+                decode_images,
+                &V1Order::OPENCODE,
+                |_, _, _| {},
+            )?,
         };
         let count = messages
             .iter()
@@ -310,23 +316,49 @@ impl OpencodeAdapter {
     }
 }
 
-/// v1 正文:message 表(角色/时间)+ part 表(内容块)按 message_id 分组
-fn parse_v1_messages(
+/// v1 两表路径的排序子句。OpenCode 按 id(前缀时间有序);ZCode 的两张表另有
+/// autofill 的 sequence 列,优先按它
+pub(crate) struct V1Order {
+    pub(crate) part: &'static str,
+    pub(crate) message: &'static str,
+}
+
+impl V1Order {
+    pub(crate) const OPENCODE: V1Order = V1Order {
+        part: "message_id, id",
+        message: "time_created, id",
+    };
+}
+
+/// JSON 列直接从 SQLite 的缓冲区解析,不先拷成 String:part 载荷(工具输出)
+/// 动辄几十 KB、一条会话几百个。非文本 / 坏 JSON 给 None,调用方计 unknown
+fn json_at(r: &rusqlite::Row<'_>, ix: usize) -> rusqlite::Result<Option<Value>> {
+    Ok(r.get_ref(ix)?
+        .as_str()
+        .ok()
+        .and_then(|s| serde_json::from_str(s).ok()))
+}
+
+/// v1 正文:message 表(角色/时间)+ part 表(内容块)按 message_id 分组。
+/// `on_message` 对每一行 message 都调一次——带上已判好的角色,第三个参数是这一行拼出的消息,
+/// 全空(如只有 error 的失败 turn)时为 None;ZCode 用它拿 model / token /
+/// semantics,OpenCode 传空闭包。两家的差异只在这里和排序子句
+pub(crate) fn parse_v1_messages(
     ro: &SqliteRo,
     sid: &str,
     decode_images: bool,
+    order: &V1Order,
+    mut on_message: impl FnMut(&Value, Role, Option<&mut TranscriptMessage>),
 ) -> Result<(Vec<TranscriptMessage>, u32)> {
-    // part 按 (message_id, id) 排序分组;id 前缀时间有序
     let mut parts_by_msg: HashMap<String, Vec<Value>> = HashMap::new();
     {
-        let mut stmt = ro.conn.prepare(
-            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY message_id, id",
-        )?;
-        let rows = stmt.query_map([sid], |p| {
-            Ok((p.get::<_, String>(0)?, p.get::<_, String>(1)?))
-        })?;
+        let mut stmt = ro.conn.prepare(&format!(
+            "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY {}",
+            order.part
+        ))?;
+        let rows = stmt.query_map([sid], |p| Ok((p.get::<_, String>(0)?, json_at(p, 1)?)))?;
         for (mid, data) in rows.flatten() {
-            if let Ok(v) = serde_json::from_str::<Value>(&data) {
+            if let Some(v) = data {
                 parts_by_msg.entry(mid).or_default().push(v);
             }
         }
@@ -334,14 +366,13 @@ fn parse_v1_messages(
 
     let mut messages: Vec<TranscriptMessage> = Vec::new();
     let mut unknown = 0u32;
-    let mut stmt = ro
-        .conn
-        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
-    let msg_rows = stmt.query_map([sid], |m| {
-        Ok((m.get::<_, String>(0)?, m.get::<_, String>(1)?))
-    })?;
+    let mut stmt = ro.conn.prepare(&format!(
+        "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY {}",
+        order.message
+    ))?;
+    let msg_rows = stmt.query_map([sid], |m| Ok((m.get::<_, String>(0)?, json_at(m, 1)?)))?;
     for (mid, data) in msg_rows.flatten() {
-        let Ok(md) = serde_json::from_str::<Value>(&data) else {
+        let Some(md) = data else {
             unknown += 1;
             continue;
         };
@@ -357,28 +388,13 @@ fn parse_v1_messages(
             .unwrap_or(0);
         let mut acc = BlockAcc::default();
         for p in parts_by_msg.remove(&mid).unwrap_or_default() {
-            match p.get("type").and_then(|v| v.as_str()) {
-                Some("text") => {
-                    let t = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if t.trim().is_empty() {
-                        continue;
-                    }
-                    if p.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
-                        acc.synthetic.push(t.trim().to_string());
-                    } else {
-                        acc.content.push_text(t);
-                    }
-                }
-                Some("reasoning") => acc.push_reasoning(&p),
-                Some("tool") => acc.push_tool(&p, decode_images),
-                Some("image") => acc.push_image(&p, decode_images),
-                Some("step-start") | Some("step-finish") | Some("snapshot") | Some("patch") => {}
-                Some("file") if is_image_part(&p) => acc.push_image(&p, decode_images),
-                Some("file") => {}
-                _ => unknown += 1,
+            if !acc.push_part(&p, decode_images) {
+                unknown += 1;
             }
         }
-        if let Some(m) = acc.into_message(role, ts, None) {
+        let mut built = acc.into_message(role, ts, None);
+        on_message(&md, role, built.as_mut());
+        if let Some(m) = built {
             messages.push(m);
         }
     }
@@ -486,22 +502,9 @@ fn parse_v2_messages(
                     .into_iter()
                     .flatten()
                 {
-                    match b.get("type").and_then(|v| v.as_str()) {
-                        Some("text") => {
-                            if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                                if !t.trim().is_empty() {
-                                    acc.content.push_text(t);
-                                }
-                            }
-                        }
-                        Some("reasoning") => acc.push_reasoning(b),
-                        Some("tool") => acc.push_tool(b, decode_images),
-                        Some("image") => acc.push_image(b, decode_images),
-                        Some("step-start") | Some("step-finish") | Some("snapshot")
-                        | Some("patch") => {}
-                        Some("file") if is_image_part(b) => acc.push_image(b, decode_images),
-                        Some("file") => {}
-                        _ => unknown += 1,
+                    // v2 的助手块从不带 synthetic,分派与 v1 同一份
+                    if !acc.push_part(b, decode_images) {
+                        unknown += 1;
                     }
                 }
                 if let Some(m) = acc.into_message(Role::Assistant, ts, model) {
@@ -539,6 +542,32 @@ struct BlockAcc {
 }
 
 impl BlockAcc {
+    /// 一个 part 块 → 累加器;返回 false = 表外类型(调用方计 unknown)。
+    /// ZCode 的 part 与这里同形(它的运行时是 OpenCode 衍生物),两家共用这一个分派
+    fn push_part(&mut self, p: &Value, decode_images: bool) -> bool {
+        match p.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                let t = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if t.trim().is_empty() {
+                    return true;
+                }
+                if p.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
+                    self.synthetic.push(t.trim().to_string());
+                } else {
+                    self.content.push_text(t);
+                }
+            }
+            Some("reasoning") => self.push_reasoning(p),
+            Some("tool") => self.push_tool(p, decode_images),
+            Some("image") => self.push_image(p, decode_images),
+            Some("step-start") | Some("step-finish") | Some("snapshot") | Some("patch") => {}
+            Some("file") if is_image_part(p) => self.push_image(p, decode_images),
+            Some("file") => {}
+            _ => return false,
+        }
+        true
+    }
+
     fn push_reasoning(&mut self, b: &Value) {
         if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
             if !t.trim().is_empty() {

@@ -30,6 +30,7 @@ use wake_core::adapters::openclaw::OpenclawAdapter;
 use wake_core::adapters::opencode::OpencodeAdapter;
 use wake_core::adapters::pi::PiAdapter;
 use wake_core::adapters::qoder::QoderAdapter;
+use wake_core::adapters::zcode::ZcodeAdapter;
 use wake_core::adapters::AgentAdapter;
 use wake_core::models::*;
 
@@ -47,6 +48,7 @@ struct TestEnv {
     hermes_db: PathBuf,
     openclaw_db: PathBuf,
     cursor_ide_db: PathBuf,
+    zcode_db: PathBuf,
     /// 假 HOME 目录本体,持有 TempDir 保证整个测试进程期间不被清理
     _home: tempfile::TempDir,
 }
@@ -76,6 +78,7 @@ fn setup() -> &'static TestEnv {
             hermes_db: sc.hermes_db,
             openclaw_db: sc.openclaw_db,
             cursor_ide_db: sc.cursor_ide_db,
+            zcode_db: sc.zcode_db,
             _home: home,
         }
     })
@@ -1955,6 +1958,10 @@ fn seq_contract_holds_for_all_agents() {
             Box::new(CodebuddyAdapter::workbuddy()),
             codebuddy_ref(AgentId::Workbuddy),
         ),
+        (
+            Box::new(ZcodeAdapter::new()),
+            db_ref(AgentId::Zcode, &env.zcode_db, "zc-0001"),
+        ),
     ];
     for (adapter, r) in &checks {
         assert_seq_contract(adapter.as_ref(), r);
@@ -1974,6 +1981,173 @@ fn openclaw_legacy_ref(env: &TestEnv) -> SessionFileRef {
         &sessions.join("cccccccc-aaaa-bbbb-cccc-000000000017.jsonl"),
         "cccccccc-aaaa-bbbb-cccc-000000000017",
     )
+}
+
+/// ZCode:cli/db/db.sqlite 是 OpenCode 形状的转录源,v2/tasks-index.sqlite 只借
+/// deleted / migration_source 两个过滤位;parent_id 非空不列;semantics.origin
+/// 白名单归 Meta、缺席放行;title_source=default 是占位;model 逐消息、token 按调用累加
+#[test]
+fn zcode_parse_contract() {
+    let env = setup();
+    let adapter = ZcodeAdapter::new();
+    let mut ids: Vec<String> = adapter
+        .list_session_files()
+        .expect("zcode list")
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort();
+    // zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的、zc-0005 是
+    // subagent_child;zc-0008 是 fork——带 parent_id 但是用户自己的对话,要列
+    assert_eq!(
+        ids,
+        vec!["zc-0001", "zc-0002", "zc-0006", "zc-0007", "zc-0008"]
+    );
+
+    let r = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0001");
+    let s = adapter.parse_session(&r).expect("zcode parse_session");
+    let t = adapter
+        .parse_transcript(&r)
+        .expect("zcode parse_transcript");
+    assert_eq!(s.meta.key, "zcode:zc-0001");
+    assert_eq!(s.meta.title, "ZCode QR fix");
+    assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
+    // 中途换过模型,取最后用的;token 按调用累加(120 + 30)
+    assert_eq!(s.meta.model.as_deref(), Some("GLM-5.3-Flash"));
+    assert_eq!(s.meta.tokens_used, Some(150));
+    assert_eq!(s.meta.created_at, 1789000000000);
+    assert_eq!(s.meta.updated_at, 1789000060000);
+    assert_eq!(s.meta.message_count, 4);
+    assert!(!s.meta.archived);
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            // compaction 摘要:user 角色、hidden、kind=compact_summary → 折成一条
+            (Role::User, MessageKind::CompactSummary),
+        ]
+    );
+    let a = &t.mainline[1];
+    assert_eq!(a.text, "是依赖数组问题,我给出了修复补丁。");
+    assert_eq!(a.thinking.as_deref(), Some("先读一下组件源码"));
+    assert_eq!(a.model.as_deref(), Some("GLM-5.3"));
+    assert_eq!(a.timestamp, Some(1789000005000));
+    assert_eq!(a.tool_calls.len(), 1);
+    assert_eq!(a.tool_calls[0].name, "Bash");
+    assert!(a.tool_calls[0].input_preview.contains("QrScanner"));
+    assert_eq!(
+        a.tool_calls[0].output.as_deref(),
+        Some("src/QrScanner.tsx:12: useEffect(() => {")
+    );
+    assert!(!a.tool_calls[0].is_error);
+    assert_eq!(t.mainline[3].model.as_deref(), Some("GLM-5.3-Flash"));
+    // seq 契约:FTS 单元的 seq 等于详情页序号(Meta / CompactSummary 不进 FTS)
+    assert_eq!(
+        s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
+        t.mainline
+            .iter()
+            .filter(|m| m.kind == MessageKind::Text)
+            .map(|m| m.seq)
+            .collect::<Vec<_>>()
+    );
+
+    // 占位标题退回首条真人消息;注入上下文归 Meta、不计数
+    let r2 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0002");
+    let s2 = adapter.parse_session(&r2).unwrap();
+    let t2 = adapter.parse_transcript(&r2).unwrap();
+    assert_eq!(s2.meta.title, "空标题会话取这句");
+    assert_eq!(s2.meta.message_count, 2);
+    assert_eq!(
+        roles_kinds(&t2.mainline),
+        vec![
+            (Role::User, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+
+    // 老写端没有 semantics:按真人放行,不能整条会话归 Meta
+    let r6 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0006");
+    let s6 = adapter.parse_session(&r6).unwrap();
+    assert_eq!(s6.meta.title, "老写端没有 semantics");
+    assert_eq!(s6.meta.message_count, 2);
+
+    let r7 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0007");
+    assert!(adapter.parse_session(&r7).unwrap().meta.archived);
+}
+
+/// 老库缺列(title_source / task_type / sequence 是 ALTER 追加的;parent_id 在
+/// 初始 schema 里,老库退回 parent_id IS NULL)与没装桌面端(没有 tasks-index)
+/// 都不能让整家消失
+#[test]
+fn zcode_degrades_on_old_schema_and_missing_task_index() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let db_dir = home.path().join(".zcode/cli/db");
+    fs::create_dir_all(&db_dir).unwrap();
+    let conn = rusqlite::Connection::open(db_dir.join("db.sqlite")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT,
+                              title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER,
+                              time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                              time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                           time_created INTEGER, time_updated INTEGER, data TEXT);
+        INSERT INTO session VALUES ('old-1','p',NULL,'/work/old','old schema','0.15.2',1789000000000,1789000001000,NULL);
+        INSERT INTO session VALUES ('old-2','p','old-1','/work/old','old child','0.15.2',1789000002000,1789000003000,NULL);
+        INSERT INTO message VALUES ('m1','old-1',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000}}');
+        INSERT INTO part VALUES ('p1','m1','old-1',1789000000000,1789000000000,'{"type":"text","text":"老库也要能读"}');
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let adapter = ZcodeAdapter::new().with_custom_root(home.path().join(".zcode"));
+    let refs = adapter.list_session_files().unwrap();
+    assert_eq!(
+        refs.len(),
+        1,
+        "老 schema 不得整家消失;没有 task_type 时子会话按 parent_id 不列"
+    );
+    let s = adapter.parse_session(&refs[0]).unwrap();
+    assert_eq!(s.meta.title, "old schema");
+    assert_eq!(s.meta.project_path, "/work/old");
+    assert_eq!(s.meta.message_count, 1);
+    assert!(!s.meta.archived);
+}
+
+/// 自定义 location:构造器只认 home 与孤立的库文件两种形状,且只按路径整形不看
+/// 存在性(远程 mount 契约);中间层 cli/、cli/db/ 由 normalize_custom_root 在入库
+/// 前按纯路径形状上提到 home——父链不长那个样的库拷贝原样保留、tasks-index 也
+/// 不去别处找
+#[test]
+fn zcode_custom_root_lifts_to_home_before_storing() {
+    setup();
+    let home = Path::new("/nowhere/.zcode");
+    let expect = home.join("cli/db/db.sqlite");
+    for dir in [
+        home.to_path_buf(),
+        home.join("cli"),
+        home.join("cli/db"),
+        expect.clone(),
+    ] {
+        let stored = wake_core::adapters::normalize_custom_root(AgentId::Zcode, dir.clone());
+        assert_eq!(stored, home, "{}", dir.display());
+    }
+    let adapter = ZcodeAdapter::new().with_custom_root(home.to_path_buf());
+    assert_eq!(adapter.data_roots(), vec![expect]);
+    let lone = PathBuf::from("/backup/db.sqlite");
+    assert_eq!(
+        wake_core::adapters::normalize_custom_root(AgentId::Zcode, lone.clone()),
+        lone
+    );
+    let adapter = ZcodeAdapter::new().with_custom_root(lone.clone());
+    assert_eq!(adapter.data_roots(), vec![lone]);
 }
 
 #[test]

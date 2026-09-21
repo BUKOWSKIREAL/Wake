@@ -16,7 +16,7 @@
 //! ①openrsync(macOS 15+ 的 /usr/bin/rsync)做发送端时,某个源连父目录
 //! 都不存在会让它中止整份文件列表,排在后面的源全部静默不传,退出码却
 //! 只是 23;②rsync 家族只要发送端遇到任何 I/O 错误(缺源即算)就整体跳过
-//! 删除阶段——没有哪台机器十八家全装,`--delete` 就永远不会生效。
+//! 删除阶段——没有哪台机器十九家全装,`--delete` 就永远不会生效。
 //!
 //! 同步跑在**独立于扫描的线程**(Workbench::spawn_remote_sync):本地扫描
 //! 不等网络,不可达 host 只拖慢自己;缓存落盘由 watcher 增量收编,同步
@@ -49,7 +49,7 @@ pub struct RemoteAgentLayout {
     pub exclude: &'static [&'static str],
 }
 
-/// 十八家的远程布局。远程主机按 Linux/macOS 默认路径假设(两平台一致,
+/// 十九家的远程布局。远程主机按 Linux/macOS 默认路径假设(两平台一致,
 /// 均为 home 相对;OpenCode 的 XDG 变体、CODEX_HOME 这类 env 覆盖在远端
 /// 探测不到,阶段 1 不支持非默认远程布局)。
 pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
@@ -190,6 +190,20 @@ pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
         agent: AgentId::Workbuddy,
         mount: ".workbuddy/projects",
         sync_paths: &[".workbuddy/projects"],
+        exclude: &[],
+    },
+    RemoteAgentLayout {
+        agent: AgentId::Zcode,
+        // home 形态:cli/db/db.sqlite 与 v2/tasks-index.sqlite 全相对派生。
+        // 只拉两个库文件——凭证(v2/credentials.json)与网络 CA 私钥(v2/certs/)
+        // 不在白名单里就不会被碰;exclude 只对目录源起作用,文件源留空
+        mount: ".zcode",
+        sync_paths: &[
+            ".zcode/cli/db/db.sqlite",
+            ".zcode/cli/db/db.sqlite-wal",
+            ".zcode/v2/tasks-index.sqlite",
+            ".zcode/v2/tasks-index.sqlite-wal",
+        ],
         exclude: &[],
     },
 ];

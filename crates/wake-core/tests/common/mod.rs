@@ -58,6 +58,7 @@ pub struct Sidecars {
     pub hermes_db: PathBuf,
     pub openclaw_db: PathBuf,
     pub cursor_ide_db: PathBuf,
+    pub zcode_db: PathBuf,
 }
 
 /// 侧档与 SQLite 型 fixture 库:copilot/opencode(两代)/antigravity 现建库,
@@ -154,6 +155,13 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     let cursor_ide_db = cursor_ide_dir.join("state.vscdb");
     build_cursor_ide_db(&cursor_ide_db);
 
+    let zcode_db = home.join(".zcode/cli/db/db.sqlite");
+    fs::create_dir_all(zcode_db.parent().unwrap()).expect("mkdir .zcode/cli/db");
+    build_zcode_db(&zcode_db);
+    let zcode_tasks_db = home.join(".zcode/v2/tasks-index.sqlite");
+    fs::create_dir_all(zcode_tasks_db.parent().unwrap()).expect("mkdir .zcode/v2");
+    build_zcode_tasks_db(&zcode_tasks_db);
+
     Sidecars {
         copilot_db,
         opencode_db,
@@ -163,6 +171,7 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
         hermes_db,
         openclaw_db,
         cursor_ide_db,
+        zcode_db,
     }
 }
 
@@ -609,7 +618,104 @@ pub fn clear_agent_env_overrides() {
         "OPENCLAW_STATE_DIR",
         "CODEBUDDY_CONFIG_DIR",
         "WORKBUDDY_CONFIG_DIR",
+        "ZCODE_STORAGE_DIR",
     ] {
         std::env::remove_var(var);
     }
+}
+
+/// ZCode `~/.zcode` 最小同构:cli/db/db.sqlite(OpenCode 形状,session 表按真机
+/// 3.14.0 / 运行时 0.16.9 的列)+ v2/tasks-index.sqlite(只有过滤要看的列)。
+/// zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的、zc-0005 是
+/// subagent_child,三条都不该列;zc-0008 是 fork(带 parent_id 但是用户自己的
+/// 对话)要列;zc-0002 的标题是占位(title_source=default)且首条是注入上下文;
+/// zc-0001 末尾有一条 compaction 摘要(user 角色、hidden);zc-0006 是没有
+/// semantics 的老写端;zc-0007 已归档
+pub fn build_zcode_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create zcode fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+            slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL,
+            version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_archived INTEGER, task_type TEXT NOT NULL DEFAULT 'interactive',
+            title_source TEXT NOT NULL DEFAULT 'first_input'
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL, sequence INTEGER
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+            sequence INTEGER
+        );
+        INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title,
+                             version, time_created, time_updated, time_archived, task_type, title_source) VALUES
+            ('zc-0001','proj-wakefx',NULL,NULL,'zc-0001','/Users/tester/Github/wakefx','/Users/tester/Github/wakefx','ZCode QR fix','0.16.9',1789000000000,1789000060000,NULL,'interactive','generated'),
+            ('zc-0002','proj-wakefx',NULL,NULL,'zc-0002','/Users/tester/Github/wakefx','/Users/tester/Github/wakefx','New task','0.16.9',1789000100000,1789000110000,NULL,'interactive','default'),
+            ('zc-0003','proj-wakefx',NULL,NULL,'zc-0003','/Users/tester/Github/wakefx',NULL,'deleted in desktop','0.16.9',1789000200000,1789000210000,NULL,'interactive','first_input'),
+            ('zc-0004','proj-wakefx',NULL,NULL,'zc-0004','/Users/tester/Github/wakefx',NULL,'imported from claude','0.16.9',1789000300000,1789000310000,NULL,'interactive','first_input'),
+            ('zc-0005','proj-wakefx',NULL,'zc-0001','zc-0005','/Users/tester/Github/wakefx',NULL,'child task','0.16.9',1789000400000,1789000410000,NULL,'subagent_child','first_input'),
+            ('zc-0008','proj-wakefx',NULL,'zc-0001','zc-0008','/Users/tester/Github/wakefx',NULL,'Fork of ZCode QR fix','0.16.9',1789000800000,1789000810000,NULL,'fork','generated'),
+            ('zc-0006','proj-wakefx',NULL,NULL,'zc-0006','/Users/tester/Github/wakefx',NULL,'老写端没有 semantics','0.15.2',1789000500000,1789000510000,NULL,'interactive','first_input'),
+            ('zc-0007','proj-wakefx',NULL,NULL,'zc-0007','/Users/tester/Github/wakefx',NULL,'archived one','0.16.9',1789000600000,1789000610000,1789000700000,'interactive','first_input');
+        INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES
+            ('m-0001-0','zc-0001',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"agent":"zcode-agent","modelSelection":{"providerId":"account:zai","modelId":"GLM-5.3"},"semantics":{"origin":"real_user","kind":"user_prompt","transcriptVisibility":"visible"}}',0),
+            ('m-0001-1','zc-0001',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000,"completed":1789000012000},"parentID":"m-0001-0","modelId":"GLM-5.3","providerId":"account:zai","tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop","semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',1),
+            ('m-0001-2','zc-0001',1789000050000,1789000050000,'{"role":"user","time":{"created":1789000050000},"modelSelection":{"providerId":"account:zai","modelId":"GLM-5.3-Flash"},"semantics":{"origin":"real_user","kind":"user_prompt"}}',2),
+            ('m-0001-3','zc-0001',1789000055000,1789000060000,'{"role":"assistant","time":{"created":1789000055000,"completed":1789000060000},"modelId":"GLM-5.3-Flash","tokens":{"total":30,"input":25,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop","semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',3),
+            ('m-0001-4','zc-0001',1789000058000,1789000058000,'{"role":"user","time":{"created":1789000058000},"semantics":{"origin":"agent_runtime","kind":"compact_summary","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',4),
+            ('m-0008-0','zc-0008',1789000800000,1789000800000,'{"role":"user","time":{"created":1789000800000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',0),
+            ('m-0002-0','zc-0002',1789000100000,1789000100000,'{"role":"user","time":{"created":1789000100000},"semantics":{"origin":"system_injected","kind":"context","transcriptVisibility":"hidden"}}',0),
+            ('m-0002-1','zc-0002',1789000101000,1789000101000,'{"role":"user","time":{"created":1789000101000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',1),
+            ('m-0002-2','zc-0002',1789000105000,1789000110000,'{"role":"assistant","time":{"created":1789000105000},"modelId":"GLM-5.3","tokens":{"total":10},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',2),
+            ('m-0003-0','zc-0003',1789000200000,1789000200000,'{"role":"user","time":{"created":1789000200000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0004-0','zc-0004',1789000300000,1789000300000,'{"role":"user","time":{"created":1789000300000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0005-0','zc-0005',1789000400000,1789000400000,'{"role":"user","time":{"created":1789000400000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0006-0','zc-0006',1789000500000,1789000500000,'{"role":"user","time":{"created":1789000500000}}',0),
+            ('m-0006-1','zc-0006',1789000505000,1789000510000,'{"role":"assistant","time":{"created":1789000505000},"modelId":"GLM-5.3","tokens":{"total":5}}',1),
+            ('m-0007-0','zc-0007',1789000600000,1789000600000,'{"role":"user","time":{"created":1789000600000},"semantics":{"origin":"real_user"}}',0);
+        INSERT INTO part (id, message_id, session_id, time_created, time_updated, data, sequence) VALUES
+            ('p-0001-0-0','m-0001-0','zc-0001',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题","time":{"start":1789000000000,"end":1789000000000}}',0),
+            ('p-0001-1-0','m-0001-1','zc-0001',1789000005000,1789000005000,'{"type":"step-start"}',0),
+            ('p-0001-1-1','m-0001-1','zc-0001',1789000005500,1789000006000,'{"type":"reasoning","text":"先读一下组件源码","metadata":{"anthropic":{"signature":"abc"}},"time":{"start":1789000005500,"end":1789000006000}}',1),
+            ('p-0001-1-2','m-0001-1','zc-0001',1789000006000,1789000007000,'{"type":"tool","callID":"call_0001","declarationIndex":0,"tool":"Bash","state":{"status":"completed","input":{"command":"rg useEffect src/QrScanner.tsx","description":"Find the hook"},"output":"src/QrScanner.tsx:12: useEffect(() => {","title":"Bash","time":{"start":1789000006000,"end":1789000007000}}}',2),
+            ('p-0001-1-3','m-0001-1','zc-0001',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。","time":{"start":1789000008000,"end":1789000012000}}',3),
+            ('p-0001-1-4','m-0001-1','zc-0001',1789000012000,1789000012000,'{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}',4),
+            ('p-0001-2-0','m-0001-2','zc-0001',1789000050000,1789000050000,'{"type":"text","text":"谢谢,合并了"}',0),
+            ('p-0001-3-0','m-0001-3','zc-0001',1789000055000,1789000060000,'{"type":"text","text":"不客气。"}',0),
+            ('p-0001-4-0','m-0001-4','zc-0001',1789000058000,1789000058000,'{"type":"text","text":"Summary of the conversation so far: fixed the qr login bug."}',0),
+            ('p-0008-0-0','m-0008-0','zc-0008',1789000800000,1789000800000,'{"type":"text","text":"forked follow-up"}',0),
+            ('p-0002-0-0','m-0002-0','zc-0002',1789000100000,1789000100000,'{"type":"text","text":"<workspace><root>/Users/tester/Github/wakefx</root></workspace>"}',0),
+            ('p-0002-1-0','m-0002-1','zc-0002',1789000101000,1789000101000,'{"type":"text","text":"空标题会话取这句"}',0),
+            ('p-0002-2-0','m-0002-2','zc-0002',1789000105000,1789000110000,'{"type":"text","text":"好的。"}',0),
+            ('p-0003-0-0','m-0003-0','zc-0003',1789000200000,1789000200000,'{"type":"text","text":"deleted"}',0),
+            ('p-0004-0-0','m-0004-0','zc-0004',1789000300000,1789000300000,'{"type":"text","text":"imported"}',0),
+            ('p-0005-0-0','m-0005-0','zc-0005',1789000400000,1789000400000,'{"type":"text","text":"child"}',0),
+            ('p-0006-0-0','m-0006-0','zc-0006',1789000500000,1789000500000,'{"type":"text","text":"老写端没有 semantics"}',0),
+            ('p-0006-1-0','m-0006-1','zc-0006',1789000505000,1789000510000,'{"type":"text","text":"在。"}',0),
+            ('p-0007-0-0','m-0007-0','zc-0007',1789000600000,1789000600000,'{"type":"text","text":"archived"}',0);
+        "#,
+    )
+    .expect("populate zcode fixture db");
+}
+
+/// tasks-index:只有过滤要看的列
+pub fn build_zcode_tasks_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create zcode tasks fixture db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, migration_source TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO tasks (task_id, migration_source, deleted) VALUES
+            ('zc-0001',NULL,0),
+            ('zc-0003',NULL,1),
+            ('zc-0004','claudeCode',0);
+        "#,
+    )
+    .expect("populate zcode tasks fixture db");
 }

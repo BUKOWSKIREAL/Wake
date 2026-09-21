@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,18 @@ pub fn open_sqlite_ro(db: &Path, tag: &str) -> Option<SqliteRo> {
         conn,
         _tmp: Some(guard),
     })
+}
+
+/// 某张表现有的列名;表不存在或读不出给空集。逐版 ALTER 的别家库靠它做列级
+/// 降级——缺列给默认值,老库不得整家消失(ZCode 按库 mtime 缓存探测结果;
+/// Hermes 的 `HermesSchema` 是同一件事的 OnceLock 版)
+pub fn table_columns(conn: &Connection, table: &str) -> HashSet<String> {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return HashSet::new();
+    };
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
 }
 
 /// SQLite 型数据源没有每会话独立文件,用 `<db路径>#<会话id>` 作虚拟 file_path。

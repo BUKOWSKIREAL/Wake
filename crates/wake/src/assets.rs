@@ -61,6 +61,7 @@ brands!(
     "openclaw",
     "codebuddy",
     "workbuddy",
+    "zcode",
 );
 
 fn lookup_product(path: &str) -> Option<&'static [u8]> {

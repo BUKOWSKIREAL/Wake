@@ -142,6 +142,9 @@ pub fn agent_bin(agent: AgentId) -> Option<&'static str> {
         AgentId::Codebuddy => Some("codebuddy"),
         // WorkBuddy 是桌面 app,没有 CLI
         AgentId::Workbuddy => None,
+        // ZCode 同样是桌面 app;app 内的 zcode.cjs 是常驻运行时的一部分、
+        // 持有 db.sqlite 的写锁,外面再起一个不安全
+        AgentId::Zcode => None,
     }
 }
 
@@ -189,6 +192,8 @@ fn resume_args(meta: &SessionMeta) -> Option<(Vec<String>, bool)> {
         AgentId::Codebuddy => Some((vec!["--resume".into(), id.into()], true)),
         // WorkBuddy 只有桌面端、没有 CLI,没有可拼的 resume 命令——不画 Open In
         AgentId::Workbuddy => None,
+        // ZCode:没有 CLI,`zcode://` scheme 的参数未公开——不画 Open In
+        AgentId::Zcode => None,
         // Kiro / Gemini CLI 没有按会话 id 续会话的形制
         AgentId::Kiro | AgentId::Gemini => None,
     }

@@ -106,6 +106,8 @@ pub fn agent_series_color(agent: wake_core::models::AgentId) -> u32 {
         Openclaw => 0xE04A4A,
         Codebuddy => 0x6C4DFF,
         Workbuddy => 0x0EC8A9,
+        // 品牌是黑白的,趋势图里给一档中性石板灰
+        Zcode => 0x8B95A5,
     }
 }
 

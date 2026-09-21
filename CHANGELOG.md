@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: ZCode (Z.ai's GLM-5.3 desktop harness) sessions are indexed from its local database — titles, models, tool calls and token counts included. Forks and side chats are listed like any other conversation; sub-agent runs and conversations imported from Claude Code are left out so nothing appears twice. Read-only, and no Open In: the app has no command line to resume from
+
 ## [0.7.0] — 2026-09-16
 
 - New: session cleanup from the sidebar — filter by date, agent or project, sort by size, and preview before moving session files to the system trash. Includes cleanup history.
