@@ -691,10 +691,12 @@ impl AgentAdapter for MemoryStub {
         unreachable!("not used in scans")
     }
     fn memory_sources(&self) -> Vec<MemorySource> {
+        // 来源 id 要与 mem_doc 从 "/roots/x/memory/y.md" 取的父目录逐字节相同:桩的根是
+        // 字面 POSIX 串,Windows 上 `Path::join` 会接成 "/roots/x\memory",按串拼才一致
         vec![MemorySource {
             agent: AgentId::ClaudeCode,
             kind: MemorySourceKind::Dir { ext: "md" },
-            path: self.root.join("memory"),
+            path: std::path::PathBuf::from(format!("{}/memory", self.root.display())),
         }]
     }
     fn list_memories(
