@@ -5,6 +5,9 @@
 - New: Memory page — the notes coding agents keep for themselves (Claude Code's auto-memory, Codex's memories and per-session summaries, ZCode's project memory) and the instruction files you write for them (CLAUDE.md, AGENTS.md, GEMINI.md, `.cursor/rules`, `.kiro/steering`, `copilot-instructions.md`, global and per project) in one read-only place, searchable, filtered by agent, project or user memory
 - New: Settings → Memory locations shows every source the Memory page reads, with a switch per source, your own folders or files, and Restore defaults
 - New: `wake_list_memories` and `wake-cli memories` list those files for other agents; `wake_get_session` reads one by its `wake://memory/…` reference and `wake_search` also surfaces memory files that mention the query
+- New: Insights ends with an "Agents asking Wake" board — how often each agent used Wake's MCP tools or `wake-cli` in the last 7 days, switchable between All / MCP / CLI
+- New: Copy Handoff in the session detail's more menu — a ready-to-paste note with the session id and both ways to read it (MCP and `wake-cli`), for handing a conversation to another agent
+- Update: docs/cli.md shows a Claude Code SessionStart hook that puts the project's recent sessions into context at startup
 - Update: the sidebar switches between Sessions, Memory, Insights and Clean Up from an icon strip at the bottom; Refresh moved into each page header, and on the Memory page it re-reads only the memory locations
 - Update: sidebar polish — a spinner and progress bar while a refresh runs, collapse arrows in front of the Agents and Projects headers, and one consistent gap between icons and labels throughout the app
 - Fix: a search term of one or two characters no longer crashes Wake when a matching message contains characters such as Ω, İ or K before the match
