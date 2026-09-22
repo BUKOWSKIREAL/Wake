@@ -780,7 +780,10 @@ mod tests {
     use super::*;
 
     /// 目录名反推项目路径:`.`、`_`、空格都被编成 `-`,同一层多个候选按最长优先,
-    /// 磁盘上不存在的认不出
+    /// 磁盘上不存在的认不出。只在 unix 跑:Windows 的临时目录编码出来是 `C--Users-…`
+    /// 形态,函数对它直接给 None(文档里写明不做),测试里 `starts_with('-')` 必红
+    /// (2026-09-22 Windows CI)
+    #[cfg(unix)]
     #[test]
     fn project_dir_name_decodes_against_the_filesystem() {
         let tmp = tempfile::tempdir().unwrap();
