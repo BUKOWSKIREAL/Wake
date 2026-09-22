@@ -3885,7 +3885,8 @@ fn instruction_files_join_the_memory_layer() {
                     "CLAUDE.md",
                     MemoryScope::User,
                     home.path()
-                        .join(".claude/CLAUDE.md")
+                        .join(".claude")
+                        .join("CLAUDE.md")
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -3903,7 +3904,8 @@ fn instruction_files_join_the_memory_layer() {
                     "AGENTS.md",
                     MemoryScope::User,
                     home.path()
-                        .join(".codex/AGENTS.md")
+                        .join(".codex")
+                        .join("AGENTS.md")
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -3911,7 +3913,8 @@ fn instruction_files_join_the_memory_layer() {
                     "safety.rules",
                     MemoryScope::User,
                     home.path()
-                        .join(".codex/rules")
+                        .join(".codex")
+                        .join("rules")
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -3929,7 +3932,8 @@ fn instruction_files_join_the_memory_layer() {
                     "GEMINI.md",
                     MemoryScope::User,
                     home.path()
-                        .join(".gemini/GEMINI.md")
+                        .join(".gemini")
+                        .join("GEMINI.md")
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -4005,7 +4009,7 @@ fn instruction_files_join_the_memory_layer() {
     sources.extend(wake_core::adapters::project_instruction_sources(
         AgentId::Codex,
     ));
-    let agents_md = home.path().join(".codex/AGENTS.md");
+    let agents_md = home.path().join(".codex").join("AGENTS.md");
     let docs = codex
         .list_memories(
             &sources,

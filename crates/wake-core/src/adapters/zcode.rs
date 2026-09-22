@@ -522,7 +522,9 @@ impl AgentAdapter for ZcodeAdapter {
 
 /// 记忆目录名 `<slug>-<hash>` 里的 hash:sha256(工作区路径) 的十六进制前 16 位
 /// (源码 memory/project-root.ts:路径先 `resolve`——这里只剥收尾分隔符——win32 再
-/// 小写)。库里 session.directory 就是那条工作区路径,算一遍就能对上
+/// 小写)。库里 session.directory 就是那条工作区路径,算一遍就能对上。"win32 小写"按
+/// **路径形态**判(盘符 / UNC 开头)而不按运行平台:远程镜像里 Linux 主机的 POSIX 路径
+/// 在 Windows 上照样不能小写,反过来亦然(2026-09-22 Windows CI)
 pub fn memory_dir_hash(workspace: &str) -> String {
     let trimmed = workspace.trim_end_matches(std::path::is_separator);
     let key = if trimmed.is_empty() {
@@ -530,7 +532,9 @@ pub fn memory_dir_hash(workspace: &str) -> String {
     } else {
         trimmed
     };
-    let key = if cfg!(windows) {
+    let windows_shaped = key.starts_with("\\\\")
+        || matches!(key.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
+    let key = if windows_shaped {
         key.to_lowercase()
     } else {
         key.to_string()
