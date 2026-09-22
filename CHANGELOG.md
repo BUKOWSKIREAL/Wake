@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0] — 2026-09-22
 
 - New: Memory page — the notes coding agents keep for themselves (Claude Code's auto-memory, Codex's memories and per-session summaries, ZCode's project memory) and the instruction files you write for them (CLAUDE.md, AGENTS.md, GEMINI.md, `.cursor/rules`, `.kiro/steering`, `copilot-instructions.md`, global and per project) in one read-only place, searchable, filtered by agent, project or user memory
 - New: Settings → Memory locations shows every source the Memory page reads, with a switch per source, your own folders or files, and Restore defaults
