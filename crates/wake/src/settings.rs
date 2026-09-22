@@ -14,12 +14,16 @@ use wake_core::models::AgentId;
 use crate::format::tilde_path;
 use crate::ui::{
     action_button, overlay_layers, show_in_fm, BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY,
-    FONT_HEADING, FONT_LABEL, FONT_TITLE, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL,
-    SPACE_XS, SPACE_XXL,
+    FONT_HEADING, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP, RADIUS_BUTTON, SPACE_LG, SPACE_MD,
+    SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
-use crate::workbench::{DataSourceRow, OpenAbout, OpenSettings, OpenUpdates, Workbench};
+use crate::workbench::{
+    DataSourceRow, LocationSettingsSnapshot, MemoryLocationRow, MemoryLocationSettingsSnapshot,
+    OpenAbout, OpenSettings, OpenUpdates, Workbench,
+};
 use crate::{theme, theme::AppearancePreference};
+use std::rc::Rc;
 
 const SETTINGS_SIDEBAR_W: Pixels = px(180.);
 const SETTINGS_PAGE_TOP: Pixels = px(38.);
@@ -51,6 +55,7 @@ fn format_storage_size(bytes: u64) -> String {
 pub(crate) enum SettingsPage {
     General,
     Locations,
+    MemoryLocations,
     Remotes,
     Connect,
     Data,
@@ -228,7 +233,62 @@ pub(crate) struct SettingsView {
     copied: Option<SharedString>,
     /// 连点时只有最后一次的定时器能清掉 copied
     copied_generation: u64,
+    /// Session locations / Memory locations 两页的快照:各是三条 SQL + 每路径一次 stat,
+    /// 在 observe Workbench 的回调里取一次(配置变更、扫描进度、记忆同步收尾都会
+    /// notify),不在 render 里每帧算——原先 hover 一下就重查一遍库(2026-09-22 /simplify)
+    locations: LocationSettingsSnapshot,
+    memory_locations: MemoryLocationSettingsSnapshot,
     _workbench_observer: Option<Subscription>,
+}
+
+/// location 行菜单里的一个动作(Edit… / Remove):Settings 只转发给 Workbench
+type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// 行末的 `…` 菜单(两页共用):Edit…(可编辑的行)、Show in Finder(路径存在时)、分隔线 +
+/// Remove(可删的自定义行);每项都是 Option,两页按自己的规则给
+fn row_menu(
+    ix: usize,
+    edit: Option<RowAction>,
+    reveal: Option<SharedString>,
+    remove: Option<RowAction>,
+) -> impl IntoElement {
+    Button::new(("settings-location-menu", ix))
+        .ghost()
+        .small()
+        .rounded(RADIUS_BUTTON)
+        .icon(icon("icons/more-horizontal.svg").with_size(px(14.)))
+        .dropdown_menu(move |menu, _, _| {
+            let mut menu = menu.min_w(px(180.));
+            if let Some(edit) = edit.clone() {
+                menu = menu.item(
+                    PopupMenuItem::new(t("Edit…")).on_click(move |_, window, cx| edit(window, cx)),
+                );
+            }
+            if let Some(path) = reveal.clone() {
+                menu = menu.item(PopupMenuItem::new(show_in_fm()).on_click(move |_, _, _| {
+                    wake_core::services::terminal::open_in_file_manager(path.as_ref())
+                }));
+            }
+            if let Some(remove) = remove.clone() {
+                menu = menu.separator().item(
+                    PopupMenuItem::new(t("Remove"))
+                        .on_click(move |_, window, cx| remove(window, cx)),
+                );
+            }
+            menu
+        })
+}
+
+/// 快照的行按 agent 成组(快照已按 AgentId 声明序排好,相邻同家即一组)
+fn group_by_agent<R>(rows: Vec<R>, agent: impl Fn(&R) -> AgentId) -> Vec<(AgentId, Vec<R>)> {
+    let mut groups: Vec<(AgentId, Vec<R>)> = Vec::new();
+    for row in rows {
+        match groups.last_mut() {
+            Some((a, rows)) if *a == agent(&row) => rows.push(row),
+            _ => groups.push((agent(&row), vec![row])),
+        }
+    }
+    groups
 }
 
 impl SettingsView {
@@ -242,7 +302,12 @@ impl SettingsView {
         // 立即 observe 会尝试反读仍被独占借用的 Workbench，触发 double lease。
         // 下一帧注册时外层 update 已退出。
         cx.on_next_frame(window, move |this, _, cx| {
-            this._workbench_observer = Some(cx.observe(&observed, |_, _, cx| cx.notify()));
+            this.refresh_snapshots(observed.read(cx));
+            this._workbench_observer = Some(cx.observe(&observed, |this, workbench, cx| {
+                this.refresh_snapshots(workbench.read(cx));
+                cx.notify()
+            }));
+            cx.notify();
         });
         Self {
             focus_handle: cx.focus_handle(),
@@ -253,6 +318,14 @@ impl SettingsView {
             connect_shown: Default::default(),
             copied: None,
             copied_generation: 0,
+            locations: LocationSettingsSnapshot {
+                rows: Vec::new(),
+                diverged: false,
+            },
+            memory_locations: MemoryLocationSettingsSnapshot {
+                rows: Vec::new(),
+                diverged: false,
+            },
             _workbench_observer: None,
         }
     }
@@ -330,9 +403,16 @@ impl SettingsView {
                     ))
                     .child(self.render_nav_item(
                         "settings-locations-nav",
-                        t("Locations"),
+                        t("Session locations"),
                         "icons/hard-drive.svg",
                         SettingsPage::Locations,
+                        cx,
+                    ))
+                    .child(self.render_nav_item(
+                        "settings-memory-locations-nav",
+                        t("Memory locations"),
+                        "icons/brain.svg",
+                        SettingsPage::MemoryLocations,
                         cx,
                     ))
                     .child(self.render_nav_item(
@@ -751,7 +831,7 @@ impl SettingsView {
                             .min_h(px(52.))
                             .px(SPACE_LG)
                             .py(SPACE_SM)
-                            .gap(SPACE_MD)
+                            .gap(ICON_TEXT_GAP)
                             .items_center()
                             .child(img(s.agent.brand_icon(dark)).size(px(17.)).flex_shrink_0())
                             .child(
@@ -1172,60 +1252,129 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// 两页 location 面板的快照重读(见字段注释):只刷当前显示的那页——切页走 Workbench
+    /// 的 select_settings_page、本身就 notify,目标页在那一次刷到;设置窗开着时主窗的每次
+    /// notify(敲一个搜索字)都会到这里,两页都刷是白付两遍 SQL + stat
+    fn refresh_snapshots(&mut self, workbench: &Workbench) {
+        match workbench.settings_page() {
+            SettingsPage::Locations => self.locations = workbench.location_settings_snapshot(),
+            SettingsPage::MemoryLocations => {
+                self.memory_locations = workbench.memory_location_settings_snapshot()
+            }
+            _ => {}
+        }
+    }
+
+    /// Session locations 的一行:Edit… 恒有,Show in Finder 挂存在的路径,Remove 只给自定义行
     fn render_location_row(&self, row: DataSourceRow, ix: usize, cx: &Context<Self>) -> AnyElement {
+        let workbench = self.workbench.clone();
+        let edit: RowAction = {
+            let workbench = workbench.clone();
+            let row = row.clone();
+            Rc::new(move |window, cx| {
+                let row = row.clone();
+                workbench.update(cx, |this, cx| this.open_edit_location_form(row, window, cx));
+            })
+        };
+        let reveal = row.exists.then(|| row.raw.clone());
+        let remove: Option<RowAction> = row.custom.clone().map(|stored| {
+            let workbench = workbench.clone();
+            let agent = row.agent;
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let stored = stored.clone();
+                workbench.update(cx, |this, cx| {
+                    this.delete_location(agent, stored, window, cx)
+                });
+            }) as RowAction
+        });
+        let toggle = {
+            let (agent, path) = (row.agent, row.raw.clone());
+            move |enabled: &bool, window: &mut Window, cx: &mut App| {
+                let path = path.clone();
+                workbench.update(cx, |this, cx| {
+                    this.set_location_enabled(agent, path, *enabled, window, cx)
+                });
+            }
+        };
+        self.location_row(
+            ix,
+            row.display,
+            row.tally,
+            row.enabled,
+            row.exists,
+            row_menu(ix, Some(edit), reveal, remove),
+            toggle,
+            cx,
+        )
+    }
+
+    /// Memory locations 的一行:默认来源只有开关与 Show in Finder,自定义来源多 Edit /
+    /// Remove;项目模式行(`<project>/CLAUDE.md`)没有 Finder
+    fn render_memory_location_row(
+        &self,
+        row: MemoryLocationRow,
+        ix: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let workbench = self.workbench.clone();
+        let edit: Option<RowAction> = row.custom.then(|| {
+            let workbench = workbench.clone();
+            let row = row.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let row = row.clone();
+                workbench.update(cx, |this, cx| {
+                    this.open_edit_memory_location_form(row, window, cx)
+                });
+            }) as RowAction
+        });
+        let reveal = (!row.pattern && row.exists).then(|| row.raw.clone());
+        let remove: Option<RowAction> = row.custom.then(|| {
+            let workbench = workbench.clone();
+            let (agent, stored) = (row.agent, row.raw.clone());
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let stored = stored.clone();
+                workbench.update(cx, |this, cx| {
+                    this.delete_memory_source(agent, stored, window, cx)
+                });
+            }) as RowAction
+        });
+        let toggle = {
+            let (agent, id) = (row.agent, row.raw.clone());
+            move |enabled: &bool, window: &mut Window, cx: &mut App| {
+                let id = id.clone();
+                workbench.update(cx, |this, cx| {
+                    this.set_memory_source_enabled(agent, id, *enabled, window, cx)
+                });
+            }
+        };
+        self.location_row(
+            ix,
+            row.display,
+            row.tally,
+            row.enabled,
+            row.exists,
+            row_menu(ix, edit, reveal, remove),
+            toggle,
+            cx,
+        )
+    }
+
+    /// location 行的壳(Session locations 与 Memory locations 共用):路径 + 计数 / 状态词、
+    /// `…` 菜单、开关;停用的行文字降为 muted,路径不在时状态词用 warning 色。两页从不
+    /// 同时渲染,元素 id 共用一套
+    #[allow(clippy::too_many_arguments)]
+    fn location_row(
+        &self,
+        ix: usize,
+        display: SharedString,
+        tally: SharedString,
+        enabled: bool,
+        exists: bool,
+        menu: impl IntoElement,
+        on_toggle: impl Fn(&bool, &mut Window, &mut App) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
-        let enabled = row.enabled;
-        let exists = row.exists;
-        let raw = row.raw.clone();
-
-        let edit_workbench = self.workbench.clone();
-        let edit_row = row.clone();
-        let reveal_path = row.raw.clone();
-        let remove_target = row.custom.clone();
-        let remove_agent = row.agent;
-        let menu = Button::new(("settings-location-menu", ix))
-            .ghost()
-            .small()
-            .rounded(RADIUS_BUTTON)
-            .icon(icon("icons/more-horizontal.svg").with_size(px(14.)))
-            .dropdown_menu(move |menu, _, _| {
-                let workbench = edit_workbench.clone();
-                let edit_row = edit_row.clone();
-                let mut menu = menu
-                    .min_w(px(180.))
-                    .item(
-                        PopupMenuItem::new(t("Edit…")).on_click(move |_, window, cx| {
-                            let row = edit_row.clone();
-                            workbench.update(cx, |this, cx| {
-                                this.open_edit_location_form(row, window, cx)
-                            });
-                        }),
-                    );
-                if exists {
-                    let path = reveal_path.clone();
-                    menu = menu.item(PopupMenuItem::new(show_in_fm()).on_click(move |_, _, _| {
-                        wake_core::services::terminal::open_in_file_manager(path.as_ref())
-                    }));
-                }
-                if let Some(stored) = remove_target.clone() {
-                    let workbench = edit_workbench.clone();
-                    menu = menu
-                        .separator()
-                        .item(
-                            PopupMenuItem::new(t("Remove")).on_click(move |_, window, cx| {
-                                let stored = stored.clone();
-                                workbench.update(cx, |this, cx| {
-                                    this.delete_location(remove_agent, stored, window, cx)
-                                });
-                            }),
-                        );
-                }
-                menu
-            });
-
-        let toggle_workbench = self.workbench.clone();
-        let toggle_path = raw;
-        let toggle_agent = row.agent;
         h_flex()
             .id(("settings-location-row", ix))
             .min_h(px(60.))
@@ -1248,7 +1397,7 @@ impl SettingsView {
                             } else {
                                 theme.muted_foreground
                             })
-                            .child(row.display),
+                            .child(display),
                     )
                     .child(
                         div()
@@ -1258,7 +1407,7 @@ impl SettingsView {
                             } else {
                                 theme.warning
                             })
-                            .child(row.tally),
+                            .child(tally),
                     ),
             )
             .child(menu)
@@ -1271,21 +1420,17 @@ impl SettingsView {
                     } else {
                         t("Enable location")
                     })
-                    .on_click(move |enabled, window, cx| {
-                        let path = toggle_path.clone();
-                        toggle_workbench.update(cx, |this, cx| {
-                            this.set_location_enabled(toggle_agent, path, *enabled, window, cx)
-                        });
-                    }),
+                    .on_click(on_toggle),
             )
             .into_any_element()
     }
 
+    /// 一家的一组行(Session locations 与 Memory locations 共用):品牌图 + 名字的组头,
+    /// 下面一张圆角卡,行与行之间一条 hairline
     fn render_agent_group(
         &self,
         agent: AgentId,
-        rows: Vec<DataSourceRow>,
-        row_offset: usize,
+        rows: Vec<AnyElement>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -1295,7 +1440,7 @@ impl SettingsView {
             .child(
                 h_flex()
                     .h(px(24.))
-                    .gap(SPACE_SM)
+                    .gap(ICON_TEXT_GAP)
                     .items_center()
                     .child(img(agent.brand_icon(dark)).size(px(17.)).flex_shrink_0())
                     .child(
@@ -1318,52 +1463,158 @@ impl SettingsView {
                         div()
                             .w_full()
                             .when(ix > 0, |this| this.border_t_1().border_color(theme.border))
-                            .child(self.render_location_row(row, row_offset + ix, cx))
+                            .child(row)
                     })),
             )
             .into_any_element()
     }
 
+    /// Settings → Memory locations:Session locations 同形制的页(页壳 `locations_page`)
+    fn render_memory_locations(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.memory_locations.clone();
+        let mut row_offset = 0usize;
+        let list = self.render_agent_groups(
+            group_by_agent(snapshot.rows, |row| row.agent),
+            &mut row_offset,
+            Self::render_memory_location_row,
+            cx,
+        );
+        self.locations_page(
+            t("Memory locations"),
+            t("Choose which memory and instruction files Wake indexes."),
+            snapshot.diverged,
+            Workbench::open_add_memory_location_form,
+            Workbench::restore_default_memory_locations,
+            list,
+            cx,
+        )
+    }
+
     fn render_locations(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let snapshot = self.workbench.read(cx).location_settings_snapshot();
-        let mut groups: Vec<(AgentId, Vec<DataSourceRow>)> = Vec::new();
-        for row in snapshot.rows {
-            match groups.last_mut() {
-                Some((agent, rows)) if *agent == row.agent => rows.push(row),
-                _ => groups.push((row.agent, vec![row])),
-            }
-        }
-        let (available, unavailable): (Vec<_>, Vec<_>) = groups
-            .into_iter()
-            .partition(|(_, rows)| rows.iter().any(|row| row.exists || row.custom.is_some()));
+        let snapshot = self.locations.clone();
+        let (available, unavailable): (Vec<_>, Vec<_>) =
+            group_by_agent(snapshot.rows, |row| row.agent)
+                .into_iter()
+                .partition(|(_, rows)| rows.iter().any(|row| row.exists || row.custom.is_some()));
         let unavailable_count = unavailable.len();
-        let add_workbench = self.workbench.clone();
-        let restore_workbench = self.workbench.clone();
-        let diverged = snapshot.diverged;
-
         let mut row_offset = 0usize;
-        let available_elements: Vec<AnyElement> = available
+        let mut list =
+            self.render_agent_groups(available, &mut row_offset, Self::render_location_row, cx);
+        if unavailable_count > 0 {
+            let unavailable_elements = if self.show_unavailable {
+                self.render_agent_groups(
+                    unavailable,
+                    &mut row_offset,
+                    Self::render_location_row,
+                    cx,
+                )
+            } else {
+                Vec::new()
+            };
+            list.push(
+                v_flex()
+                    .gap(SPACE_LG)
+                    .child(
+                        h_flex()
+                            .id("settings-unavailable-locations")
+                            .h(px(36.))
+                            .w_full()
+                            .pr(SPACE_SM)
+                            .gap(SPACE_SM)
+                            .items_center()
+                            .rounded(theme.radius)
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|style| style.bg(theme.secondary_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_unavailable = !this.show_unavailable;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .w(px(17.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        icon(if self.show_unavailable {
+                                            "icons/chevron-down.svg"
+                                        } else {
+                                            "icons/chevron-right.svg"
+                                        })
+                                        .with_size(px(13.)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(FONT_CAPTION)
+                                    .font_medium()
+                                    .child(t("Not detected")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(FONT_LABEL)
+                                    .child(unavailable_count.to_string()),
+                            ),
+                    )
+                    .children(unavailable_elements)
+                    .into_any_element(),
+            );
+        }
+        self.locations_page(
+            t("Session locations"),
+            t("Choose where Wake looks for local agent sessions."),
+            snapshot.diverged,
+            Workbench::open_add_location_form,
+            Workbench::restore_default_locations,
+            list,
+            cx,
+        )
+    }
+
+    /// 按 agent 成组渲染(两页共用):行号在整页内连续,各组的元素 id 不重叠
+    fn render_agent_groups<R>(
+        &self,
+        groups: Vec<(AgentId, Vec<R>)>,
+        row_offset: &mut usize,
+        render_row: impl Fn(&Self, R, usize, &Context<Self>) -> AnyElement,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        groups
             .into_iter()
             .map(|(agent, rows)| {
-                let start = row_offset;
-                row_offset += rows.len();
-                self.render_agent_group(agent, rows, start, cx)
+                let start = *row_offset;
+                *row_offset += rows.len();
+                let rendered = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, row)| render_row(self, row, start + ix, cx))
+                    .collect();
+                self.render_agent_group(agent, rendered, cx)
             })
-            .collect();
-        let unavailable_elements: Vec<AnyElement> = if self.show_unavailable {
-            unavailable
-                .into_iter()
-                .map(|(agent, rows)| {
-                    let start = row_offset;
-                    row_offset += rows.len();
-                    self.render_agent_group(agent, rows, start, cx)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            .collect()
+    }
 
+    /// location 页的壳(Session locations 与 Memory locations 共用):页头 = 标题 + 一句
+    /// 说明 + Add location + `…` 里的 Restore defaults(没有偏离时禁用),下面是可滚动的
+    /// 分组列表。两页从不同时渲染,元素 id 共用一套
+    #[allow(clippy::too_many_arguments)]
+    fn locations_page(
+        &self,
+        title: &'static str,
+        caption: &'static str,
+        diverged: bool,
+        on_add: fn(&mut Workbench, &mut Window, &mut Context<Workbench>),
+        on_restore: fn(&mut Workbench, &mut Window, &mut Context<Workbench>),
+        list: Vec<AnyElement>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let add_workbench = self.workbench.clone();
+        let restore_workbench = self.workbench.clone();
         v_flex()
             .flex_1()
             .min_w_0()
@@ -1387,13 +1638,13 @@ impl SettingsView {
                                     .text_size(FONT_TITLE)
                                     .font_semibold()
                                     .text_color(theme.foreground)
-                                    .child(t("Session locations")),
+                                    .child(title),
                             )
                             .child(
                                 div()
                                     .text_size(FONT_CAPTION)
                                     .text_color(theme.muted_foreground)
-                                    .child(t("Choose where Wake looks for local agent sessions.")),
+                                    .child(caption),
                             ),
                     )
                     .child(
@@ -1404,8 +1655,7 @@ impl SettingsView {
                             cx,
                         )
                         .on_click(move |_, window, cx| {
-                            add_workbench
-                                .update(cx, |this, cx| this.open_add_location_form(window, cx));
+                            add_workbench.update(cx, |this, cx| on_add(this, window, cx));
                         }),
                     )
                     .child(
@@ -1421,7 +1671,7 @@ impl SettingsView {
                                         .disabled(!diverged)
                                         .on_click(move |_, window, cx| {
                                             workbench.update(cx, |this, cx| {
-                                                this.restore_default_locations(window, cx)
+                                                on_restore(this, window, cx)
                                             });
                                         }),
                                 )
@@ -1437,59 +1687,7 @@ impl SettingsView {
                     .px(SPACE_XXL)
                     .pb(px(40.))
                     .gap(SPACE_XL)
-                    .children(available_elements)
-                    .when(unavailable_count > 0, |this| {
-                        this.child(
-                            v_flex()
-                                .gap(SPACE_LG)
-                                .child(
-                                    h_flex()
-                                        .id("settings-unavailable-locations")
-                                        .h(px(36.))
-                                        .w_full()
-                                        .pr(SPACE_SM)
-                                        .gap(SPACE_SM)
-                                        .items_center()
-                                        .rounded(theme.radius)
-                                        .cursor_pointer()
-                                        .text_color(theme.muted_foreground)
-                                        .hover(|style| style.bg(theme.secondary_hover))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_unavailable = !this.show_unavailable;
-                                            cx.notify();
-                                        }))
-                                        .child(
-                                            div()
-                                                .w(px(17.))
-                                                .flex_shrink_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    icon(if self.show_unavailable {
-                                                        "icons/chevron-down.svg"
-                                                    } else {
-                                                        "icons/chevron-right.svg"
-                                                    })
-                                                    .with_size(px(13.)),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_size(FONT_CAPTION)
-                                                .font_medium()
-                                                .child(t("Not detected")),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(FONT_LABEL)
-                                                .child(unavailable_count.to_string()),
-                                        ),
-                                )
-                                .children(unavailable_elements),
-                        )
-                    }),
+                    .children(list),
             )
     }
 
@@ -1729,6 +1927,7 @@ impl Render for SettingsView {
         let content = match selected_page {
             SettingsPage::General => self.render_general(cx),
             SettingsPage::Locations => self.render_locations(cx).into_any_element(),
+            SettingsPage::MemoryLocations => self.render_memory_locations(cx).into_any_element(),
             SettingsPage::Remotes => self.render_remotes(cx),
             SettingsPage::Connect => self.render_connect(cx),
             SettingsPage::Data => self.render_data(cx),

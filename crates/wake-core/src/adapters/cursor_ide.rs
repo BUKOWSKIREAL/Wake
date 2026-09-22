@@ -336,7 +336,24 @@ const BUBBLE_ASSISTANT: i64 = 2;
 /// `composerHeaders.isSubagent=1` 的行带 `subagentInfo.parentComposerId`。
 /// 这张表只覆盖较新的会话,老会话查不到父子关系——不是错误,照常列为顶层。
 fn parent_links_from(db: &std::path::Path) -> Option<Vec<(String, String)>> {
+    // 没装 Cursor(库不在)、老版本没有 composerHeaders 表 = 确定没有关系;库在、表在但读
+    // 不出才是"不知道"——原先三种都给 None,没装 Cursor 的机器每轮都把 Cursor 的父子
+    // 关系冻住、子代理会话永远进不了根列表(2026-09-22 review)
+    if !db.is_file() {
+        return Some(Vec::new());
+    }
     let ro = open_sqlite_ro(db, "cursor-ide")?;
+    let has_table: bool = ro
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'composerHeaders')",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if !has_table {
+        return Some(Vec::new());
+    }
     let mut stmt = ro
         .conn
         .prepare(

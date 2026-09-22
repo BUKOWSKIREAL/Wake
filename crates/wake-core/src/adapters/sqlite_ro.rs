@@ -29,7 +29,19 @@ pub fn open_sqlite_ro(db: &Path, tag: &str) -> Option<SqliteRo> {
             return Some(SqliteRo { conn, _tmp: None });
         }
     }
-    let tmp = std::env::temp_dir().join(format!("wake-{tag}-{}", std::process::id()));
+    // 目录名带库路径的哈希:同一 tag 的两个实例(Hermes 多档案、Codex 默认 + 自定义根、
+    // 多 host 镜像)并发走到这里时不能共用一个目录,否则互相覆盖 db.sqlite、先退出的
+    // 一方 remove_dir_all 把另一方的连接从脚下抽走(2026-09-22 review)
+    let path_hash = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        db.hash(&mut h);
+        h.finish()
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "wake-{tag}-{}-{path_hash:016x}",
+        std::process::id()
+    ));
     fs::create_dir_all(&tmp).ok()?;
     let guard = TempDirGuard(tmp.clone());
     let db_copy = tmp.join("db.sqlite");

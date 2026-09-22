@@ -144,9 +144,19 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.session_paths(meta)
     }
 
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
-        // 记忆的 key 与会话 key 同规矩:agent 段之后插 host;线程级挂的会话 key 同改
-        let mut docs = self.inner.list_memories()?;
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        // inner 按缓存挂载点构造,它报的路径已经是缓存内的
+        self.inner.memory_sources()
+    }
+
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        _projects: &[std::path::PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        // 项目根是本机路径,远程实例不展开项目模式(传空);记忆的 key 与会话 key
+        // 同规矩:agent 段之后插 host,线程级挂的会话 key 同改
+        let mut docs = self.inner.list_memories(sources, &[])?;
         for d in &mut docs {
             d.key = self.rewrite_key(&d.key);
             d.host = self.host.clone();
@@ -175,11 +185,6 @@ impl AgentAdapter for RemoteAdapter {
         )
     }
 
-    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
-        // inner 是按缓存挂载点构造的实例,它报的根已经是缓存内路径
-        self.inner.memory_roots()
-    }
-
     fn is_parent_link_event(&self, path: &Path) -> bool {
         self.inner.is_parent_link_event(path)
     }
@@ -206,6 +211,10 @@ impl AgentAdapter for RemoteAdapter {
 
     fn dedup_rank(&self) -> u8 {
         self.inner.dedup_rank()
+    }
+
+    fn parent_links_global(&self) -> bool {
+        self.inner.parent_links_global()
     }
 
     fn excluding_data_roots(&self, roots: &[std::path::PathBuf]) -> Option<Box<dyn AgentAdapter>> {

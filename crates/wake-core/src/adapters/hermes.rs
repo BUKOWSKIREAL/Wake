@@ -507,6 +507,12 @@ impl AgentAdapter for HermesAdapter {
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         let mut links = Vec::new();
         for db in &self.dbs {
+            // 库文件不在 = 确定没有关系(远程镜像每台 host 都挂 .hermes,多数没装);库在但
+            // 读不出才是"不知道"——原先一律 None,没装 Hermes 的机器每轮都把本地真实的
+            // /branch 关系冻住(2026-09-22 review)
+            if !db.path.is_file() {
+                continue;
+            }
             let rows = Self::rows(db)?;
             let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             links.extend(rows.iter().filter_map(|r| {

@@ -102,14 +102,14 @@ Working directories that have session history, most recently active first, with 
 
 ### `memories`
 
-The memory files agents keep for themselves — Claude Code's per-project auto-memory (`~/.claude/projects/<project>/memory/`), Codex's memories (`~/.codex/memories/`, plus its per-session summaries), ZCode's per-project memory (`~/.zcode/cli/memories/projects/<project>/memory/`) — read-only, grouped by project with user-level files last. User-level files are listed under any `--project` because they apply everywhere, even one that matches no indexed project. Each entry ends with a `wake://memory/…` reference; pass it to `show` to read the file, which is read live from disk. Options: `--project`, `--agent`, `--limit` (default 50, max 100; it caps the project-level files — user-level ones are always included).
+The memory files agents keep for themselves — Claude Code's per-project auto-memory (`~/.claude/projects/<project>/memory/`), Codex's memories (`~/.codex/memories/`, plus its per-session summaries), ZCode's per-project memory (`~/.zcode/cli/memories/projects/<project>/memory/`) — read-only, grouped by project with *user memory* (the notes that apply to every project) last. User memory is listed under any `--project` because it applies everywhere, even one that matches no indexed project. Each entry ends with a `wake://memory/…` reference; pass it to `show` to read the file, which is read live from disk. Instruction files (CLAUDE.md, AGENTS.md, GEMINI.md, `.cursor/rules`, `.kiro/steering`, `copilot-instructions.md`, from the agents' homes and from every indexed project root) are listed alongside; Settings → Memory locations decides which sources are read. Options: `--project`, `--agent`, `--limit` (default 50, max 100; it caps the project memory — user memory is always included).
 
 ```bash
 wake-cli memories --project "$PWD"
 wake-cli show 'wake://memory/claude-code:/Users/me/.claude/projects/-Users-me-app/memory/MEMORY.md'
 ```
 
-`search` appends up to five memory files that mention the query, with the same references.
+`search` appends up to five memory files that mention the query, with the same references; `--project`, `--agent` and `--since` apply to them too.
 
 ### `setup`
 

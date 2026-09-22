@@ -162,6 +162,19 @@ pub fn run_scan(
     result
 }
 
+/// 只同步记忆、不碰会话:Memory 页的 Refresh 与 Settings → Memory locations 变更的
+/// 收尾(用户 2026-09-22 定"memory 的只刷 memory、session 的只刷 session,不然设置里
+/// 分开的 locations 就没意义")。读的是当下的 Memory locations 配置(停用 / 自定义 /
+/// 项目模式),与扫描收尾那一步是同一个函数;过同一把 `SCAN_GATE` 与进行中的扫描
+/// 串行——它收尾也对 memories 对账,两边别同时写同一组。阻塞执行,调用方放后台;
+/// 返回库里有没有改动
+pub fn run_memory_sync(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool {
+    let _gate = SCAN_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sync_memories(adapters, store)
+}
+
 /// 写事务内副本裁决(`Store::write_session_guarded`)用的位次查询:按 file_path
 /// 找拥有它的实例取 `dedup_rank`;无实例认领的路径落到该家首个实例——与枚举
 /// 时的候选排序同一把尺子,全量与增量两条写库路径才给出同一个胜者
@@ -491,38 +504,92 @@ fn run_scan_inner(
 /// 整组清掉——否则它们的记忆在会话与缓存都没了之后还能被列出、搜到(Codex review
 /// 2026-09-17)
 fn sync_memories(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool {
-    /// 一组的收集结果:读成功的实例给文档,读失败的实例给它的根(那些根下的行冻结)
+    /// 一组的收集结果:读成功的实例给文档,读失败的实例给它的来源 id(那些来源的行冻结)
     #[derive(Default)]
     struct Group {
         docs: Vec<MemoryDoc>,
-        frozen: Vec<std::path::PathBuf>,
+        frozen: Vec<String>,
         succeeded: usize,
         failed: usize,
     }
+    // 三样配置都从库里读:读不出就整轮不动——这一步的本质是"按缺席删",把读失败折成
+    // "什么都没配置"会删光项目指令文件、把停用的来源重新索引进来(2026-09-22 review)
+    let projects = match store.local_project_roots() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[scanner] memory sync skipped: project roots unreadable: {e}");
+            return false;
+        }
+    };
+    let (customs, disabled) = match store.memory_source_overrides() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[scanner] memory sync skipped: memory locations unreadable: {e}");
+            return false;
+        }
+    };
+    let stored: std::collections::HashSet<(AgentId, String)> = match store.memory_groups() {
+        Ok(v) => v.into_iter().collect(),
+        Err(e) => {
+            eprintln!("[scanner] memory sync skipped: memory groups unreadable: {e}");
+            return false;
+        }
+    };
+    // 项目模式(`<project>/CLAUDE.md`)在已索引的本地项目根上展开;停用与自定义来源来自
+    // Settings → Memory locations,按实例裁决只在 `memory_source_plan`(Settings 面板与
+    // 表单查重看的是同一份)
+    let plan = crate::adapters::memory_source_plan(adapters, &customs, &disabled);
     let mut groups: std::collections::BTreeMap<(AgentId, String), Group> =
         std::collections::BTreeMap::new();
-    for (agent, host) in store.memory_groups().unwrap_or_default() {
-        groups.entry((agent, host)).or_default();
+    for key in &stored {
+        groups.entry(key.clone()).or_default();
     }
-    for adapter in adapters {
+    for planned in plan {
         let group = groups
-            .entry((adapter.agent(), adapter.host().to_string()))
+            .entry((planned.agent, planned.host.clone()))
             .or_default();
-        match adapter.list_memories() {
-            Ok(docs) => {
-                group.docs.extend(docs);
-                group.succeeded += 1;
-            }
-            Err(e) => {
-                // 同 (agent, host) 的别的实例(默认根 + 自定义根)照常对账,只冻结这个
-                // 实例根下的行——原先一个实例失败就整组不写,一个坏 location 会让默认
-                // 实例的记忆永远停在上次(2026-09-21 review)
-                eprintln!(
-                    "[scanner] memories of {} failed: {e}",
-                    adapter.agent().as_str()
-                );
-                group.frozen.extend(adapter.memory_roots());
-                group.failed += 1;
+        let enabled: Vec<MemorySource> = planned
+            .sources
+            .into_iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.source)
+            .collect();
+        if enabled.is_empty() {
+            // 没有来源(或全停用)的实例什么都不贡献,但这一组照常对账——停用的来源
+            // 的行要随之出库
+            group.succeeded += 1;
+            continue;
+        }
+        // 逐来源读:一个来源读失败只冻结它自己的行——挂空的符号链接、TCC 挡住的项目根
+        // 不该让整家的记忆停更(2026-09-22 review);缓存按来源分槽,逐个调不比整批贵。
+        // 远程实例不展开项目模式(项目根是本机路径):RemoteAdapter 自己给 inner 传空
+        for source in enabled {
+            let one = std::slice::from_ref(&source);
+            let read = match planned.adapter {
+                Some(ix) => adapters[ix].list_memories(one, &projects),
+                // 该家没有本地实例(会话 location 全停用):项目指令文件与自定义路径照读;
+                // 没有实例就没处放缓存,这种配置少见、每轮重读
+                None => crate::adapters::generic_memory_docs(
+                    &crate::adapters::MemoryCache::new(),
+                    planned.agent,
+                    one,
+                    &projects,
+                ),
+            };
+            match read {
+                Ok(docs) => {
+                    group.docs.extend(docs);
+                    group.succeeded += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[scanner] memories of {} ({}) failed: {e}",
+                        planned.agent.as_str(),
+                        source.id()
+                    );
+                    group.frozen.push(source.id());
+                    group.failed += 1;
+                }
             }
         }
     }
@@ -530,6 +597,14 @@ fn sync_memories(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool
     for ((agent, host), group) in groups {
         // 这一组的实例全失败:整组原样保留(roster 里没有实例的组是 0/0,照常清空)
         if group.succeeded == 0 && group.failed > 0 {
+            continue;
+        }
+        // 没读到文档、没有冻结、库里也没有这一组:没有账可对,别为二十个实例各开一个
+        // 写事务(2026-09-22 /simplify)
+        if group.docs.is_empty()
+            && group.frozen.is_empty()
+            && !stored.contains(&(agent, host.clone()))
+        {
             continue;
         }
         match store.replace_memories(agent, &host, &group.docs, &group.frozen) {
@@ -622,7 +697,10 @@ fn sync_parent_links(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> 
         // 上一轮没认领的 child,只要 parent 确实在库里就接受——先来后到按
         // roster 顺序,权威那一轮的结论不会被这一轮盖掉
         for (adapter_ix, links) in links_by_adapter.iter().enumerate() {
-            if adapters[adapter_ix].agent() != agent {
+            // 只对全局总表(Codex)放开:location 级边车(Grok)仍只认"报边者拥有 parent",
+            // 否则备份目录里过期的边车会把用户已解除的关系每轮重新挂上(2026-09-22 review)
+            if adapters[adapter_ix].agent() != agent || !adapters[adapter_ix].parent_links_global()
+            {
                 continue;
             }
             for (child, parent) in links {

@@ -170,6 +170,7 @@ fn memories_of_sources_gone_from_the_roster_are_pruned() {
         title: "prefs".to_string(),
         updated_at: 1,
         size_bytes: 4,
+        source: String::new(),
         body: "body".to_string(),
     };
     store
@@ -688,18 +689,31 @@ impl AgentAdapter for MemoryStub {
     fn with_custom_root(&self, _: std::path::PathBuf) -> Box<dyn AgentAdapter> {
         unreachable!("not used in scans")
     }
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        vec![MemorySource {
+            agent: AgentId::ClaudeCode,
+            kind: MemorySourceKind::Dir { ext: "md" },
+            path: self.root.join("memory"),
+        }]
+    }
+    fn list_memories(
+        &self,
+        _sources: &[MemorySource],
+        _projects: &[std::path::PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
         if self.fail {
             bail!("simulated unreadable memory directory")
         }
         Ok(self.docs.clone())
     }
-    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
-        vec![self.root.join("memory")]
-    }
 }
 
+/// 来源 id = 文件所在目录(与 MemoryStub::memory_sources 报的 `<root>/memory` 一致)
 fn mem_doc(path: &str, title: &str) -> MemoryDoc {
+    let source = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     MemoryDoc {
         key: format!("claude-code:{path}"),
         agent: AgentId::ClaudeCode,
@@ -712,6 +726,7 @@ fn mem_doc(path: &str, title: &str) -> MemoryDoc {
         title: title.to_string(),
         updated_at: 1,
         size_bytes: 4,
+        source,
         body: "body".to_string(),
     }
 }
@@ -780,6 +795,131 @@ fn memories_of_a_failing_instance_stay_frozen_while_the_others_reconcile() {
     ];
     run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
     assert_eq!(titles(&store), ["a2"]);
+}
+
+/// Settings → Memory locations 的两种偏离:停用一个默认来源(它的行随下一轮出库),
+/// 添加一个自定义目录(它的 *.md 以 agent 记的、用户级列进来);Restore defaults 后
+/// 两边都回来 / 走掉
+#[test]
+fn memory_source_overrides_drive_what_gets_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let claude_home = home.path().join(".claude");
+    let memory = claude_home.join("projects/-Users-tester-Github-wakefx/memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "- notes\n").unwrap();
+    std::fs::write(claude_home.join("CLAUDE.md"), "# global\n").unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("team.md"), "# team conventions\n").unwrap();
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().join(".nope")),
+        wake_core::adapters::claude::ClaudeAdapter::new().with_custom_root(claude_home.clone()),
+    ];
+    let titles = |store: &Store| -> Vec<String> {
+        store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect()
+    };
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md", "CLAUDE.md"]);
+
+    // 停用全局 CLAUDE.md 这个来源
+    let claude_md = claude_home.join("CLAUDE.md").to_string_lossy().to_string();
+    store
+        .set_memory_source_enabled("claude-code", &claude_md, false)
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md"]);
+
+    // 加一个自定义目录
+    store
+        .add_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let docs = store.list_memories(&MemoryFilter::default()).unwrap();
+    let custom = docs
+        .iter()
+        .find(|d| d.title == "team.md")
+        .expect("自定义目录的文件");
+    assert_eq!(
+        (custom.scope, custom.source.as_str()),
+        (MemoryScope::User, notes.to_string_lossy().as_ref())
+    );
+    let counts = store.memory_source_counts().unwrap();
+    assert_eq!(
+        counts.get(&(
+            "claude-code".to_string(),
+            notes.to_string_lossy().to_string()
+        )),
+        Some(&1)
+    );
+
+    // Restore defaults:自定义走掉、停用的回来
+    store.clear_memory_source_overrides().unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["MEMORY.md", "CLAUDE.md"]);
+}
+
+/// 会话 location 全停用(roster 里没有这一家的实例)之后,agent 级的记忆来源——用户加的
+/// 自定义目录、项目根下的指令文件——照读:它们不在被停用的 location 里,不该随它消失;
+/// 停掉的只是从那个根派生的默认来源(记忆树、全局 CLAUDE.md)。原先这一家直接从计划里
+/// 消失,scanner 把它整组删光、Settings 里连自定义行都看不见(2026-09-22 review)
+#[test]
+fn agent_level_memory_sources_outlive_a_disabled_session_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let home = tempfile::tempdir().unwrap();
+    let claude_home = home.path().join(".claude");
+    let memory = claude_home.join("projects/-Users-tester-Github-wakefx/memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("MEMORY.md"), "- notes\n").unwrap();
+    std::fs::write(claude_home.join("CLAUDE.md"), "# global\n").unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("team.md"), "# team conventions\n").unwrap();
+    store
+        .add_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    let titles = |store: &Store| -> Vec<String> {
+        let mut v: Vec<String> = store
+            .list_memories(&MemoryFilter::default())
+            .unwrap()
+            .iter()
+            .map(|d| d.title.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    let with_claude: Vec<Box<dyn AgentAdapter>> = vec![
+        CodexAdapter::new().with_custom_root(home.path().join(".nope")),
+        wake_core::adapters::claude::ClaudeAdapter::new().with_custom_root(claude_home.clone()),
+    ];
+    run_scan(&with_claude, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(titles(&store), ["CLAUDE.md", "MEMORY.md", "team.md"]);
+
+    // Claude 的会话 location 停用 = roster 里没有它的实例
+    let without_claude: Vec<Box<dyn AgentAdapter>> =
+        vec![CodexAdapter::new().with_custom_root(home.path().join(".nope"))];
+    run_scan(&without_claude, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        titles(&store),
+        ["team.md"],
+        "默认来源随根消失,自定义目录留下"
+    );
+    let custom = &store.list_memories(&MemoryFilter::default()).unwrap()[0];
+    assert_eq!(custom.agent, AgentId::ClaudeCode);
+
+    // 删掉自定义来源才真的走掉
+    store
+        .remove_memory_source("claude-code", &notes.to_string_lossy())
+        .unwrap();
+    run_scan(&without_claude, &store, &Recorder::new(), false).unwrap();
+    assert!(titles(&store).is_empty());
 }
 
 /// 关系这一刻读不出(state DB 打不开)= None:这一家整段跳过,库里的关系原样保留,

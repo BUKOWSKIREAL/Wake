@@ -57,6 +57,12 @@ static ENV: OnceLock<TestEnv> = OnceLock::new();
 
 /// 所有测试的第一步:建假 HOME(含 SQLite fixture 库与 gemini 的
 /// projects.json)并把 HOME 指过去。必须先于任何 Adapter::new()。
+/// 读一个 adapter 的全部默认来源(项目模式除外——那要项目根);契约测试里的
+/// "list_memories()" 就是它
+fn all_memories(adapter: &Box<dyn AgentAdapter>) -> anyhow::Result<Vec<MemoryDoc>> {
+    adapter.list_memories(&adapter.memory_sources(), &[])
+}
+
 fn setup() -> &'static TestEnv {
     ENV.get_or_init(|| {
         let home = tempfile::Builder::new()
@@ -3690,9 +3696,12 @@ fn workbuddy_is_a_codebuddy_twin() {
 fn claude_lists_project_memories() {
     setup();
     let adapter = ClaudeAdapter::new().with_custom_root(fixture("claude/projects"));
-    let docs = adapter.list_memories().unwrap();
+    let docs = all_memories(&adapter).unwrap();
     let titles: Vec<&str> = docs.iter().map(|d| d.title.as_str()).collect();
-    assert_eq!(titles, ["MEMORY", "Wake testing conventions for this repo"]);
+    assert_eq!(
+        titles,
+        ["MEMORY.md", "Wake testing conventions for this repo"]
+    );
     let session_keys: Vec<String> = adapter
         .list_session_files()
         .unwrap()
@@ -3725,7 +3734,7 @@ fn claude_lists_project_memories() {
         "正文原样含 frontmatter"
     );
     assert!(docs[1].body.contains("name: wake-testing"));
-    assert_eq!(adapter.list_memories().unwrap(), docs, "指纹没变走缓存");
+    assert_eq!(all_memories(&adapter).unwrap(), docs, "指纹没变走缓存");
 }
 
 /// ZCode:`cli/memories/projects/<slug>-<hash>/memory/*.md`(Claude auto-memory 同款
@@ -3761,7 +3770,7 @@ fn zcode_lists_project_memories() {
     fs::create_dir_all(root.join("cli/memories/projects/empty-1111111111111111")).unwrap();
 
     let adapter = ZcodeAdapter::new().with_custom_root(root.clone());
-    let docs = adapter.list_memories().unwrap();
+    let docs = all_memories(&adapter).unwrap();
     let summary: Vec<(&str, &str, &str)> = docs
         .iter()
         .map(|d| {
@@ -3775,8 +3784,8 @@ fn zcode_lists_project_memories() {
     assert_eq!(
         summary,
         [
-            ("note", "", ""),
-            ("MEMORY", "/Users/tester/Github/wakefx", "wakefx"),
+            ("note.md", "", ""),
+            ("MEMORY.md", "/Users/tester/Github/wakefx", "wakefx"),
             (
                 "Prefers pnpm over npm",
                 "/Users/tester/Github/wakefx",
@@ -3800,7 +3809,7 @@ fn zcode_lists_project_memories() {
         docs[2].body.contains("name: prefers-pnpm"),
         "正文原样含 frontmatter"
     );
-    assert_eq!(adapter.list_memories().unwrap(), docs, "指纹没变走缓存");
+    assert_eq!(all_memories(&adapter).unwrap(), docs, "指纹没变走缓存");
     assert_eq!(
         wake_core::adapters::zcode::memory_dir_hash("/Users/tester/Github/wakefx/"),
         "3b44ec0d2ccabf78",
@@ -3809,11 +3818,221 @@ fn zcode_lists_project_memories() {
 
     // 直接选中 db.sqlite 的裸库拷贝没有 home:不摸父目录,一份都不列
     let bare = ZcodeAdapter::new().with_custom_root(db.clone());
-    assert!(bare.list_memories().unwrap().is_empty());
+    assert!(all_memories(&bare).unwrap().is_empty());
     // 没有记忆目录的 home 也是空,不是错
     let other = tempfile::tempdir().unwrap();
     let fresh = ZcodeAdapter::new().with_custom_root(other.path().join(".zcode"));
-    assert!(fresh.list_memories().unwrap().is_empty());
+    assert!(all_memories(&fresh).unwrap().is_empty());
+}
+
+/// 记忆可见层二期:用户写给 agent 的指令文件也进记忆层——各家 home 里的全局文件
+/// (`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md` + `rules/*.rules`、`~/.gemini/GEMINI.md`)
+/// 由各家 `memory_sources` 报,项目根下的(CLAUDE.md / AGENTS.md / GEMINI.md /
+/// `.cursor/rules/*.mdc` / `.cursorrules` / `.kiro/steering/*.md` /
+/// `.github/copilot-instructions.md`)由 `project_instruction_sources` 按 agent 给、
+/// 按已索引的项目根展开。标题是文件名(mdc 有 frontmatter 的取 description),
+/// 项目级的 project_path 直接填项目根,来源 id 带 `<project>/` 前缀
+#[test]
+fn instruction_files_join_the_memory_layer() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let write_under = |root: &std::path::Path, rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    };
+    let w = |rel: &str, body: &str| write_under(home.path(), rel, body);
+    let pw = |rel: &str, body: &str| write_under(project.path(), rel, body);
+    w(".claude/CLAUDE.md", "# global claude\n");
+    fs::create_dir_all(home.path().join(".claude/projects")).unwrap();
+    w(".codex/AGENTS.md", "# global agents\n");
+    w(
+        ".codex/rules/safety.rules",
+        "prefix_rule(prefix=[\"rm\"], decision=\"forbidden\")\n",
+    );
+    fs::create_dir_all(home.path().join(".codex/sessions")).unwrap();
+    w(
+        ".gemini/GEMINI.md",
+        "## Gemini Added Memories\n- uses supastarter\n",
+    );
+    fs::create_dir_all(home.path().join(".gemini/tmp")).unwrap();
+    pw("CLAUDE.md", "# project claude\n");
+    pw("AGENTS.md", "# project agents\n");
+    pw("GEMINI.md", "# project gemini\n");
+    pw(
+        ".cursor/rules/style.mdc",
+        "---\ndescription: Use tabs, never spaces\nglobs: *.ts\nalwaysApply: false\n---\n\nTabs.\n",
+    );
+    pw(".cursorrules", "legacy rules\n");
+    pw(".kiro/steering/product.md", "# product\n");
+    pw(".github/copilot-instructions.md", "# copilot\n");
+    let projects = vec![project.path().to_path_buf()];
+    let project_str = project.path().to_string_lossy().to_string();
+
+    // (adapter, 期望的 (标题, scope, 来源 id) 列表——项目级的来源 id 带 <project>/ 前缀)
+    let claude = ClaudeAdapter::new().with_custom_root(home.path().join(".claude"));
+    let codex = CodexAdapter::new().with_custom_root(home.path().join(".codex"));
+    let gemini = GeminiAdapter::new().with_custom_root(home.path().join(".gemini"));
+    let cursor = CursorAdapter::new().with_custom_root(project.path().join("nowhere"));
+    let kiro = KiroAdapter::new().with_custom_root(project.path().join("nowhere"));
+    let copilot = CopilotAdapter::new().with_custom_root(project.path().join("nowhere"));
+    let cases: Vec<(&Box<dyn AgentAdapter>, Vec<(&str, MemoryScope, String)>)> = vec![
+        (
+            &claude,
+            vec![
+                (
+                    "CLAUDE.md",
+                    MemoryScope::User,
+                    home.path()
+                        .join(".claude/CLAUDE.md")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "CLAUDE.md",
+                    MemoryScope::Project,
+                    "<project>/CLAUDE.md".into(),
+                ),
+            ],
+        ),
+        (
+            &codex,
+            vec![
+                (
+                    "AGENTS.md",
+                    MemoryScope::User,
+                    home.path()
+                        .join(".codex/AGENTS.md")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "safety.rules",
+                    MemoryScope::User,
+                    home.path()
+                        .join(".codex/rules")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "AGENTS.md",
+                    MemoryScope::Project,
+                    "<project>/AGENTS.md".into(),
+                ),
+            ],
+        ),
+        (
+            &gemini,
+            vec![
+                (
+                    "GEMINI.md",
+                    MemoryScope::User,
+                    home.path()
+                        .join(".gemini/GEMINI.md")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "GEMINI.md",
+                    MemoryScope::Project,
+                    "<project>/GEMINI.md".into(),
+                ),
+            ],
+        ),
+        (
+            &cursor,
+            vec![
+                (
+                    "Use tabs, never spaces",
+                    MemoryScope::Project,
+                    "<project>/.cursor/rules".into(),
+                ),
+                (
+                    ".cursorrules",
+                    MemoryScope::Project,
+                    "<project>/.cursorrules".into(),
+                ),
+            ],
+        ),
+        (
+            &kiro,
+            vec![(
+                "product.md",
+                MemoryScope::Project,
+                "<project>/.kiro/steering".into(),
+            )],
+        ),
+        (
+            &copilot,
+            vec![(
+                "copilot-instructions.md",
+                MemoryScope::Project,
+                "<project>/.github/copilot-instructions.md".into(),
+            )],
+        ),
+    ];
+    for (adapter, expected) in cases {
+        let agent = adapter.agent();
+        let mut sources = adapter.memory_sources();
+        sources.extend(wake_core::adapters::project_instruction_sources(agent));
+        // 这些临时 home 里没有 agent 自己记的记忆,列出来的全是指令文件
+        let docs: Vec<MemoryDoc> = adapter.list_memories(&sources, &projects).unwrap();
+        let got: Vec<(&str, MemoryScope, String)> = docs
+            .iter()
+            .map(|d| (d.title.as_str(), d.scope, d.source.clone()))
+            .collect();
+        assert_eq!(got, expected, "{}", agent.as_str());
+        for d in &docs {
+            assert_eq!(d.agent, agent);
+            assert!(
+                d.key.starts_with(&format!("{}:", agent.as_str())),
+                "{}",
+                d.key
+            );
+            assert!(d.session_key.is_empty(), "指令文件不用锚点");
+            if d.scope == MemoryScope::Project {
+                assert_eq!(d.project_path, project_str, "项目根直接填进归属");
+                assert!(!d.project_name.is_empty());
+            } else {
+                assert!(d.project_path.is_empty());
+            }
+        }
+    }
+    // 项目根就是某家的 home(用户在 ~/.codex 里跑过 codex):`<project>/AGENTS.md` 展开成
+    // 全局那份同一个文件,不能把用户级顶成 ".codex" 项目的——具体来源优先,模式跳过
+    let mut sources = codex.memory_sources();
+    sources.extend(wake_core::adapters::project_instruction_sources(
+        AgentId::Codex,
+    ));
+    let agents_md = home.path().join(".codex/AGENTS.md");
+    let docs = codex
+        .list_memories(
+            &sources,
+            &[home.path().join(".codex"), project.path().to_path_buf()],
+        )
+        .unwrap();
+    let same_file: Vec<&MemoryDoc> = docs
+        .iter()
+        .filter(|d| d.path == agents_md.to_string_lossy())
+        .collect();
+    assert_eq!(same_file.len(), 1, "{same_file:?}");
+    assert_eq!(same_file[0].scope, MemoryScope::User);
+    assert_eq!(same_file[0].source, agents_md.to_string_lossy());
+
+    // 项目根传空(远程实例、自定义根)时项目模式什么都不展开,全局的照列
+    let mut sources = claude.memory_sources();
+    sources.extend(wake_core::adapters::project_instruction_sources(
+        AgentId::ClaudeCode,
+    ));
+    let global_only = claude.list_memories(&sources, &[]).unwrap();
+    assert_eq!(global_only.len(), 1);
+    // 裸 projects 目录当根:没有 home,全局 CLAUDE.md 不摸父目录
+    let bare = ClaudeAdapter::new().with_custom_root(home.path().join(".claude/projects"));
+    assert!(bare
+        .memory_sources()
+        .iter()
+        .all(|s| s.kind == MemorySourceKind::ProjectTree));
 }
 
 /// 标题来自 frontmatter 的 description:块标量(`description: >` 换行缩进写)折成一行,
@@ -3841,7 +4060,7 @@ fn memory_titles_fold_block_scalars_and_clip() {
     )
     .unwrap();
     let adapter = ClaudeAdapter::new().with_custom_root(root.path().to_path_buf());
-    let docs = adapter.list_memories().unwrap();
+    let docs = all_memories(&adapter).unwrap();
     let titles: Vec<&str> = docs.iter().map(|d| d.title.as_str()).collect();
     assert_eq!(titles[0], "Prefers pnpm over npm, and never runs db:push");
     assert!(
@@ -3871,7 +4090,7 @@ fn claude_memory_anchor_skips_empty_sessions() {
     )
     .unwrap();
     let adapter = ClaudeAdapter::new().with_custom_root(root.path().to_path_buf());
-    let docs = adapter.list_memories().unwrap();
+    let docs = all_memories(&adapter).unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(
         docs[0].session_key,
@@ -3910,7 +4129,7 @@ fn codex_lists_user_and_thread_memories() {
     drop(db);
 
     let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
-    let docs = adapter.list_memories().unwrap();
+    let docs = all_memories(&adapter).unwrap();
     assert_eq!(docs.len(), 3, "空摘要空记忆的线程不列: {docs:?}");
     // 列的可空性与时间格式是推断的:NULL 正文列与 ISO 文本时间的行照样列,别的行不受影响
     let nullable = &docs[2];
@@ -3922,7 +4141,7 @@ fn codex_lists_user_and_thread_memories() {
     let user = &docs[0];
     assert_eq!(
         (user.scope, user.title.as_str()),
-        (MemoryScope::User, "user-preferences")
+        (MemoryScope::User, "user-preferences.md")
     );
     assert!(user.project_path.is_empty() && user.session_key.is_empty());
     let thread = &docs[1];
@@ -3940,12 +4159,12 @@ fn codex_lists_user_and_thread_memories() {
         [0xff, 0xfe, 0x00],
     )
     .unwrap();
-    let docs_again = adapter.list_memories().unwrap();
+    let docs_again = all_memories(&adapter).unwrap();
     assert_eq!(docs_again.len(), 3, "{docs_again:?}");
     // 自定义根只选了 sessions 目录:没有 home,不摸父目录里的 memories
     let sessions_only = CodexAdapter::new().with_custom_root(home.path().join("sessions"));
     assert!(
-        sessions_only.list_memories().unwrap().is_empty(),
+        all_memories(&sessions_only).unwrap().is_empty(),
         "sessions 目录当根时不得越界读父目录的记忆"
     );
     // 库在但读不出(不是 SQLite 文件)= 不知道:整家报 Err、不缓存,scanner 跳过该组;
@@ -3954,11 +4173,11 @@ fn codex_lists_user_and_thread_memories() {
     let good = fs::read(&db_path).unwrap();
     fs::write(&db_path, b"not a sqlite database").unwrap();
     assert!(
-        adapter.list_memories().is_err(),
+        all_memories(&adapter).is_err(),
         "memories_1.sqlite 读不出必须报 Err 而不是当成空"
     );
     fs::write(&db_path, good).unwrap();
-    assert_eq!(adapter.list_memories().unwrap().len(), 3);
+    assert_eq!(all_memories(&adapter).unwrap().len(), 3);
     assert!(
         thread.path.ends_with("memories_1.sqlite#t-0001"),
         "{}",
@@ -3968,5 +4187,17 @@ fn codex_lists_user_and_thread_memories() {
 
     // 没有 home 证据的目录:memories 自然为空,不报错
     let bare = CodexAdapter::new().with_custom_root(home.path().join("elsewhere"));
-    assert!(bare.list_memories().unwrap().is_empty());
+    assert!(all_memories(&bare).unwrap().is_empty());
+}
+
+/// 没装 Hermes / Cursor(库不在、表不在)= **确定没有**父子关系(Some 空);只有库在但读不出
+/// 才是"不知道"(None)。原先一律 None,没装这两家的机器每轮都把它们(本地真实的 /branch、
+/// 子代理)的关系冻住、永不自愈(2026-09-22 review)
+#[test]
+fn missing_parent_link_stores_mean_no_links_not_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let hermes = HermesAdapter::new().with_custom_root(dir.path().join("nope"));
+    assert_eq!(hermes.parent_links(), Some(Vec::new()));
+    let cursor = CursorIdeAdapter::new().with_custom_root(dir.path().join("cursor-nope"));
+    assert_eq!(cursor.parent_links(), Some(Vec::new()));
 }

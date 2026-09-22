@@ -1236,6 +1236,7 @@ fn memory_limit_keeps_user_level_and_counts_and_snippets_agree() {
         title: key.to_string(),
         updated_at: updated,
         size_bytes: body.len() as i64,
+        source: String::new(),
         body: body.to_string(),
     };
     let docs = vec![
@@ -1302,18 +1303,21 @@ fn memory_limit_keeps_user_level_and_counts_and_snippets_agree() {
 
     let counts = store.memory_counts().unwrap();
     assert_eq!(counts.total, 4);
+    assert_eq!(counts.user, 1);
     assert_eq!(
         counts
             .projects
             .iter()
             .map(|p| (p.path.as_str(), p.count))
             .collect::<Vec<_>>(),
-        [("/work/app", 4)],
-        "项目行的计数含用户级"
+        [("/work/app", 3)],
+        "项目行只数项目记忆,用户记忆有自己的一行"
     );
+    // GUI 的项目行:用户记忆不混进来,徽章 == 点开的行数
     let opened = store
         .list_memories(&MemoryFilter {
             project_paths: vec!["/work/app".into()],
+            user: UserMemories::Excluded,
             ..Default::default()
         })
         .unwrap();
@@ -1322,6 +1326,15 @@ fn memory_limit_keeps_user_level_and_counts_and_snippets_agree() {
         counts.projects[0].count,
         "徽章 == 点开的行数"
     );
+    // GUI 的 User memory 行:只列用户记忆,徽章同样 == 行数
+    let user_only = store
+        .list_memories(&MemoryFilter {
+            user: UserMemories::Only,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(keys(&user_only), ["claude-code:/m/u.md"]);
+    assert_eq!(user_only.len() as i64, counts.user);
 
     // 2 个码点走 LIKE 降级;Ω 小写成 ω 后字节数变了,原先拿小写串的字节偏移切原文会 panic
     let hits = store
@@ -1329,6 +1342,82 @@ fn memory_limit_keeps_user_level_and_counts_and_snippets_agree() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].snippet.contains("二维"), "{}", hits[0].snippet);
+
+    // since 也约束记忆命中(wake_search 说了 "in the last …" 就不能跟着旧笔记):p2 的
+    // updated_at 是 2
+    let since = |t: i64| MemoryFilter {
+        updated_since: Some(t),
+        ..Default::default()
+    };
+    assert!(store
+        .search_memories("second", &since(3))
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.search_memories("second", &since(2)).unwrap().len(), 1);
+}
+
+/// 记忆来源配置(Settings → Memory locations)往返:自定义增删改、停用开关、
+/// Restore defaults;`local_project_roots` 只给本地会话的项目根
+#[test]
+fn memory_source_overrides_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("t.db")).unwrap();
+    store.add_memory_source("claude-code", "/notes/a").unwrap();
+    store.add_memory_source("claude-code", "/notes/a").unwrap();
+    store.add_memory_source("codex", "/notes/b.md").unwrap();
+    store
+        .set_memory_source_enabled("claude-code", "<project>/CLAUDE.md", false)
+        .unwrap();
+    store
+        .set_memory_source_enabled("claude-code", "<project>/CLAUDE.md", false)
+        .unwrap();
+    let (customs, disabled) = store.memory_source_overrides().unwrap();
+    assert_eq!(
+        customs,
+        [
+            (AgentId::ClaudeCode, std::path::PathBuf::from("/notes/a")),
+            (AgentId::Codex, std::path::PathBuf::from("/notes/b.md"))
+        ]
+    );
+    assert_eq!(
+        disabled,
+        std::collections::HashSet::from([(AgentId::ClaudeCode, "<project>/CLAUDE.md".to_string())])
+    );
+    store
+        .replace_memory_source("claude-code", "/notes/a", "gemini", "/notes/c")
+        .unwrap();
+    store.remove_memory_source("codex", "/notes/b.md").unwrap();
+    store
+        .set_memory_source_enabled("claude-code", "<project>/CLAUDE.md", true)
+        .unwrap();
+    let (customs, disabled) = store.memory_source_overrides().unwrap();
+    assert_eq!(
+        customs,
+        [(AgentId::Gemini, std::path::PathBuf::from("/notes/c"))]
+    );
+    assert!(disabled.is_empty());
+    store.clear_memory_source_overrides().unwrap();
+    assert!(store.memory_source_overrides().unwrap().0.is_empty());
+
+    // 本地项目根:远程会话与没有项目的会话不算
+    let mut local = meta("claude-code:local-1", "local");
+    local.project_path = "/work/app".into();
+    let mut remote = meta("codex:devbox:r-1", "remote");
+    remote.agent = AgentId::Codex;
+    remote.host = "devbox".into();
+    remote.project_path = "/home/me/app".into();
+    let mut orphan = meta("codex:o-1", "orphan");
+    orphan.agent = AgentId::Codex;
+    orphan.project_path = String::new();
+    for s in [&local, &remote, &orphan] {
+        store
+            .write_session_guarded(s, 1, &[], &|_| 0, None)
+            .unwrap();
+    }
+    assert_eq!(
+        store.local_project_roots().unwrap(),
+        [std::path::PathBuf::from("/work/app")]
+    );
 }
 
 #[test]
@@ -1348,6 +1437,7 @@ fn memories_replace_list_and_search() {
                 title: title.to_string(),
                 updated_at: updated,
                 size_bytes: body.len() as i64,
+                source: String::new(),
                 body: body.to_string(),
             }
         };
@@ -1475,6 +1565,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
         title: "Anchored".to_string(),
         updated_at: 10,
         size_bytes: 4,
+        source: String::new(),
         body: "body".to_string(),
     };
     let orphan = MemoryDoc {
@@ -1534,6 +1625,7 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     // 侧栏计数与列表同一口径:总数、按 agent、按解析出的项目(没归属的垫底)
     let counts = store.memory_counts().unwrap();
     assert_eq!(counts.total, 2);
+    assert_eq!(counts.user, 0);
     assert_eq!(counts.agents, vec![(AgentId::ClaudeCode, 2)]);
     assert_eq!(
         counts
@@ -1553,14 +1645,15 @@ fn memories_resolve_their_project_through_the_anchor_session() {
     assert_eq!(project_of(&anchored.key), "/work/app-renamed");
 
     // 锚点换了(目录里来了更新的会话)是改动,同 key 重写;正文与时间没变也要写。
-    // 同 key 重复(同家两个实例的根重叠)后者胜——前面那份与库里相同也不算数
+    // 同 key 重复(同家两个实例的根重叠、自定义目录盖住默认文件)**前者胜**——docs 按
+    // 来源计划的顺序读入,先到的是默认那份;后面那份与库里相同也不算数
     let mut moved = anchored.clone();
     moved.session_key = "claude-code:s2".to_string();
     assert!(store
         .replace_memories(
             AgentId::ClaudeCode,
             "",
-            &[anchored.clone(), moved.clone()],
+            &[moved.clone(), anchored.clone()],
             &[]
         )
         .unwrap());

@@ -7,9 +7,11 @@
 
 use super::*;
 use wake_core::adapters::memory_body;
-use wake_core::models::{MemoryCounts, MemoryDoc, MemoryFilter, MemoryGroup, MemoryScope};
+use wake_core::models::{
+    MemoryCounts, MemoryDoc, MemoryFilter, MemoryGroup, MemoryScope, UserMemories,
+};
 
-/// 左列的一行:分组头(带该组第一份文档的下标,标签从它算)或一份文档
+/// 左列的一行:时间分组头(带该组第一份文档的下标,标签从它的时间算)或一份文档
 #[derive(Clone, Copy)]
 enum MemoryRow {
     Group(usize),
@@ -24,9 +26,20 @@ struct LoadedMemory {
     source_path: String,
 }
 
+/// 侧栏导航的筛选(单选互斥,与会话侧栏同一模型:再点当前项回到 All)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryNav {
+    All,
+    /// All Memory 下的 User memory 行(会话侧栏 Starred 的同位):只列用户记忆
+    User,
+    Agent(AgentId),
+    /// 空串是没归属的一组(侧栏的 Unknown project 行)
+    Project(String),
+}
+
 pub(super) struct MemoryState {
-    /// store 已排好序:项目路径分组、组内新到旧、用户级最后;行里**不带正文**(列表列
-    /// 给的是空串),选中时按 key 另取
+    /// 按更新时间倒序(GUI 自己排;store 给 MCP 的序是按项目、用户级最后);行里**不带
+    /// 正文**(列表列给的是空串),选中时按 key 另取
     docs: Vec<MemoryDoc>,
     /// 组头 + 文档扁平成行,交 gpui::list 虚拟化——只画看得见的几行,行文案在画
     /// 的时候现算(译文与相对时间都不缓存,换语言不会留旧串)
@@ -36,17 +49,21 @@ pub(super) struct MemoryState {
     selected: Option<String>,
     /// 选中后后台读,读到前是 None(转圈)
     loaded: Option<LoadedMemory>,
-    /// 侧栏导航的计数(All Memory / Agents / Projects),与 docs 同一次查询刷新
+    /// 侧栏导航的计数(All Memory / User memory / Agents / Projects),与 docs 同一次
+    /// 查询刷新
     counts: MemoryCounts,
-    /// 侧栏筛选(单选,与会话侧栏同一模型):agent 或项目,`Some("")` 是没归属的一组
-    agent: Option<AgentId>,
-    project: Option<String>,
+    nav: MemoryNav,
     /// 筛选刚换过(进页归零、点了导航行):下一次重载必须查(扫描进行中也不按住)并把
     /// 列表拉回顶部、不恢复旧滚动位置
     scope_changed: bool,
     /// 进行中的列表/正文任务;新任务覆盖旧值即取消
     load_task: Option<Task<()>>,
     body_task: Option<Task<()>>,
+    /// 页头 Refresh 起的记忆同步(只同步记忆,不重扫会话)进行中;期间再来的请求
+    /// (Settings 改了 Memory locations)记 `sync_pending`,跑完补一次。任务本身 detach:
+    /// 有 `syncing` 守着就不会重叠,不必再攥着句柄
+    pub(super) syncing: bool,
+    sync_pending: bool,
 }
 
 impl Default for MemoryState {
@@ -59,34 +76,100 @@ impl Default for MemoryState {
             selected: None,
             loaded: None,
             counts: MemoryCounts::default(),
-            agent: None,
-            project: None,
+            nav: MemoryNav::All,
             scope_changed: false,
             load_task: None,
             body_task: None,
+            syncing: false,
+            sync_pending: false,
         }
     }
 }
 
 impl Workbench {
+    /// 用户记忆要不要置顶单列一组:侧栏选了 User memory 行时整页都是它,组头没意义、照时间分
+    fn memory_pins_user(&self) -> bool {
+        self.memory.nav != MemoryNav::User
+    }
+
     /// 进 Memory 页时从"全部"开始
     pub(super) fn reset_memory_scope(&mut self) {
-        self.memory.agent = None;
-        self.memory.project = None;
+        self.memory.nav = MemoryNav::All;
         self.memory.scope_changed = true;
     }
 
-    /// 侧栏导航行的唯一写入点(agent 与项目互斥,与会话侧栏的 set_scope 同形)
-    fn set_memory_scope(
-        &mut self,
-        agent: Option<AgentId>,
-        project: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.memory.agent = agent;
-        self.memory.project = project;
+    /// 侧栏导航行的唯一写入点(与会话侧栏的 set_scope 同形)
+    fn set_memory_scope(&mut self, nav: MemoryNav, cx: &mut Context<Self>) {
+        self.memory.nav = nav;
         self.memory.scope_changed = true;
         self.reload_memories(cx);
+    }
+
+    /// Memory 页页头的 Refresh:只同步记忆来源——读设置里当下的 Memory locations,不重扫
+    /// 会话、不碰远程、不弹进度框;会话页的 Refresh 是整库重扫(用户 2026-09-22 定各刷
+    /// 各的)。进行中侧栏状态行转圈 + 不定值进度条,跑完弹 "Memory refreshed"(会话那边是
+    /// "Sessions refreshed")——同步只要几十毫秒,没有这两样就是"点了没反应"
+    pub(super) fn refresh_memories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_memory_sync(
+            Some((
+                window.window_handle(),
+                Notification::success(t("Memory refreshed")),
+            )),
+            cx,
+        );
+    }
+
+    /// Settings → Memory locations 变更的收尾:同一条同步,不另弹通知(变更本身已提示)
+    pub(super) fn sync_memories_quietly(&mut self, cx: &mut Context<Self>) {
+        self.start_memory_sync(None, cx);
+    }
+
+    /// 扫描终态:扫描期间排队的记忆同步补上(`on_bg_event` 的终态分支调)
+    pub(super) fn drain_pending_memory_sync(&mut self, cx: &mut Context<Self>) {
+        if !self.memory.syncing && std::mem::take(&mut self.memory.sync_pending) {
+            self.sync_memories_quietly(cx);
+        }
+    }
+
+    /// 同步或扫描进行中都排队(`sync_pending`),跑完 / 扫描终态再补一次:扫描收尾的
+    /// sync_memories 跑完到 UI 收到终态事件之间有空档,那时落库的 Memory locations 变更
+    /// 会被漏掉(2026-09-22 review);按钮那时是禁用的,能撞上的只有 Settings 变更。
+    /// 跑完重载列表并 notify,Settings 的 Memory locations 页据此重读计数;`done` 的通知
+    /// 经窗口句柄投递——同步本身不依赖窗口,终态补跑那条路手里没有窗口
+    fn start_memory_sync(
+        &mut self,
+        done: Option<(gpui::AnyWindowHandle, Notification)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.memory.syncing || self.scan.scanning {
+            self.memory.sync_pending = true;
+            return;
+        }
+        self.memory.syncing = true;
+        cx.notify();
+        let adapters = self.adapters.clone();
+        let store = self.store.clone();
+        let task =
+            cx.background_spawn(
+                async move { wake_core::scanner::run_memory_sync(&adapters, &store) },
+            );
+        cx.spawn(async move |this, cx| {
+            task.await;
+            this.update(cx, |this, cx| {
+                this.memory.syncing = false;
+                if std::mem::take(&mut this.memory.sync_pending) {
+                    this.sync_memories_quietly(cx);
+                }
+                this.reload_memories(cx);
+                cx.notify();
+            })
+            .ok();
+            if let Some((window, note)) = done {
+                cx.update_window(window, |_, window, cx| window.push_notification(note, cx))
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     /// refresh 顺带重载(与 reload_insights 同规矩):扫描进行中且已有数据就按住,
@@ -102,18 +185,29 @@ impl Workbench {
         }
         self.memory.loading = self.memory.docs.is_empty();
         let store = self.store.clone();
-        // 侧栏的 "Unknown project" 行是 `Some("")`:筛的是没归属的一组,不是路径为空串的项目
-        let filter = MemoryFilter {
-            agents: self.memory.agent.into_iter().collect(),
-            project_paths: self
-                .memory
-                .project
-                .iter()
-                .filter(|p| !p.is_empty())
-                .cloned()
-                .collect(),
-            unattributed: self.memory.project.as_deref() == Some(""),
-            limit: 0,
+        // 侧栏的 "Unknown project" 行是 `Project("")`:筛的是没归属的一组,不是路径为空串
+        // 的项目。项目行只列项目记忆——用户记忆有自己的 User memory 行(用户 2026-09-22
+        // 定);MCP 问一个项目仍连用户记忆一起给(`UserMemories` 的默认值 Alongside)
+        let filter = match &self.memory.nav {
+            MemoryNav::All => MemoryFilter::default(),
+            MemoryNav::User => MemoryFilter {
+                user: UserMemories::Only,
+                ..Default::default()
+            },
+            MemoryNav::Agent(agent) => MemoryFilter {
+                agents: vec![*agent],
+                ..Default::default()
+            },
+            MemoryNav::Project(path) => MemoryFilter {
+                project_paths: if path.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![path.clone()]
+                },
+                unattributed: path.is_empty(),
+                user: UserMemories::Excluded,
+                ..Default::default()
+            },
         };
         let task = cx.background_spawn(async move {
             let docs = store.list_memories(&filter)?;
@@ -123,9 +217,18 @@ impl Workbench {
         self.memory.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = task.await;
             this.update(cx, |this, cx| {
-                if let Ok((docs, counts)) = loaded {
+                if let Ok((mut docs, counts)) = loaded {
                     this.memory.counts = counts;
-                    let rows = memory_rows(&docs);
+                    // 用户记忆对每个项目都成立、没有"发生时间"的意义,像会话列表的 Pinned
+                    // 那样单独一组置顶;其余按更新时间倒序进时间桶
+                    docs.sort_by(|a, b| {
+                        (a.scope != MemoryScope::User)
+                            .cmp(&(b.scope != MemoryScope::User))
+                            .then_with(|| b.updated_at.cmp(&a.updated_at))
+                            .then_with(|| a.key.cmp(&b.key))
+                    });
+                    let pin_user = this.memory_pins_user();
+                    let rows = memory_rows(&docs, Local::now().date_naive(), pin_user);
                     // 重载来自每轮扫描,滚动位置要留住:splice 整段会把落在段内的
                     // 滚动锚点归零(gpui 的 splice 只保段外的锚点),所以先记下再恢复;
                     // 筛选刚换过则回到顶部
@@ -279,7 +382,11 @@ impl Workbench {
                         self.memory_context_title(),
                         subtitle,
                         SPACE_LG,
-                        Some(self.refresh_button(cx)),
+                        Some(self.refresh_button(
+                            self.scan.scanning || self.memory.syncing,
+                            Self::refresh_memories,
+                            cx,
+                        )),
                         cx,
                     ))
                     .child(column),
@@ -290,23 +397,20 @@ impl Workbench {
 
     /// 左列页头的标题 = 当前侧栏筛选(与会话页 context_title 同规矩)
     fn memory_context_title(&self) -> String {
-        if let Some(agent) = self.memory.agent {
-            return agent.display_name().to_string();
-        }
-        if let Some(path) = &self.memory.project {
-            if path.is_empty() {
-                return t("Unknown project").to_string();
-            }
-            return self
+        match &self.memory.nav {
+            MemoryNav::All => t("All Memory").to_string(),
+            MemoryNav::User => t("User memory").to_string(),
+            MemoryNav::Agent(agent) => agent.display_name().to_string(),
+            MemoryNav::Project(path) if path.is_empty() => t("Unknown project").to_string(),
+            MemoryNav::Project(path) => self
                 .memory
                 .counts
                 .projects
                 .iter()
                 .find(|p| &p.path == path)
                 .map(|p| p.name.clone())
-                .unwrap_or_else(|| t("Projects").to_string());
+                .unwrap_or_else(|| t("Projects").to_string()),
         }
-        t("All Memory").to_string()
     }
 
     /// 记忆流:gpui::list 虚拟化(行高不等:分组头与两行的文档行)
@@ -339,12 +443,14 @@ impl Workbench {
         };
         match row {
             MemoryRow::Group(first) => {
-                // 组头 = 会话流的时间分割线(用户 2026-09-21 定)
+                // 组头 = 置顶的 User memory,或会话流同一套时间分割线(Today / Yesterday / …);
+                // 文案画的时候现算
+                let pin_user = self.memory_pins_user();
                 let label = self
                     .memory
                     .docs
                     .get(first)
-                    .map(memory_group_label)
+                    .map(|d| memory_section_label(d, Local::now().date_naive(), pin_user))
                     .unwrap_or_default();
                 section_header_row(label, &theme).into_any_element()
             }
@@ -400,15 +506,22 @@ impl Workbench {
                             )
                             .child(
                                 h_flex()
-                                    .gap(px(6.))
+                                    .gap(ICON_TEXT_GAP)
                                     .text_size(FONT_LABEL)
                                     .text_color(theme.muted_foreground)
-                                    // 项目名由组头说明,行里不重复挂项目徽章
                                     .child(
                                         img(d.agent.brand_icon(theme.mode.is_dark()))
                                             .size(px(15.))
                                             .flex_shrink_0(),
                                     )
+                                    // 项目徽章与会话行同款(muted 胶囊;用户级 / 没归属的
+                                    // 也用组头同一套文案),用户 2026-09-21 定:组头说明了
+                                    // 也要挂,和会话列表看起来一致
+                                    .child(badge(
+                                        memory_group_label(d),
+                                        theme.muted,
+                                        theme.muted_foreground,
+                                    ))
                                     .children(memory_badges(d, &theme))
                                     .child(div().flex_1())
                                     .child(
@@ -499,7 +612,7 @@ impl Workbench {
         let meta_rows: Vec<AnyElement> = vec![
             h_flex()
                 .min_w_0()
-                .gap(px(6.))
+                .gap(ICON_TEXT_GAP)
                 .child(
                     icon("icons/file-text.svg")
                         .with_size(px(12.))
@@ -509,7 +622,7 @@ impl Workbench {
                 .into_any_element(),
             h_flex()
                 .min_w_0()
-                .gap(px(6.))
+                .gap(ICON_TEXT_GAP)
                 .items_center()
                 .child(
                     icon("icons/calendar.svg")
@@ -586,11 +699,11 @@ impl Workbench {
     }
 
     /// Memory 页的侧栏导航,替换会话导航(搜索框、All Sessions / Starred、Agents /
-    /// Projects):All Memory 一行,再接 Agents / Projects 两组(`sidebar_groups`,与会话
-    /// 侧栏同一套组件、同一个单选模型)按记忆文件计数
+    /// Projects):All Memory / User memory 两行,再接 Agents / Projects 两组
+    /// (`sidebar_groups`,与会话侧栏同一套组件、同一个单选模型)按记忆文件计数
     pub(super) fn render_memory_nav(&self, cx: &Context<Self>) -> AnyElement {
         let counts = &self.memory.counts;
-        let all_active = self.memory.agent.is_none() && self.memory.project.is_none();
+        let nav = &self.memory.nav;
         v_flex()
             .flex_1()
             .min_h_0()
@@ -607,58 +720,95 @@ impl Workbench {
                         RowLead::Icon(icon("icons/file-text.svg")),
                         t("All Memory"),
                         Some(counts.total),
-                        all_active,
+                        *nav == MemoryNav::All,
                         RowLevel::Primary,
                         cx.listener(|this, _, _window, cx| {
-                            this.set_memory_scope(None, None, cx);
+                            this.set_memory_scope(MemoryNav::All, cx);
+                        }),
+                        cx,
+                    ))
+                    // 会话侧栏 Starred 的同位(用户 2026-09-22 定):只列用户记忆,项目行
+                    // 里不再混它;再点一次回到全部,计数为零不挂徽章
+                    .child(sidebar_row(
+                        "memory-user",
+                        RowLead::Icon(icon("icons/user.svg")),
+                        t("User memory"),
+                        (counts.user > 0).then_some(counts.user),
+                        *nav == MemoryNav::User,
+                        RowLevel::Primary,
+                        cx.listener(|this, _, _window, cx| {
+                            let next = if this.memory.nav == MemoryNav::User {
+                                MemoryNav::All
+                            } else {
+                                MemoryNav::User
+                            };
+                            this.set_memory_scope(next, cx);
                         }),
                         cx,
                     )),
             )
-            .child(
-                self.sidebar_groups(
-                    "memory-sidebar-scroll",
-                    counts
-                        .agents
-                        .iter()
-                        .map(|(agent, count)| (*agent, *count, self.memory.agent == Some(*agent))),
-                    counts.projects.iter().map(|p| {
-                        let label: SharedString = if p.path.is_empty() {
-                            t("Unknown project").into()
-                        } else {
-                            p.name.clone().into()
-                        };
-                        (
-                            p.path.clone(),
-                            label,
-                            p.count,
-                            self.memory.project.as_deref() == Some(p.path.as_str()),
-                        )
-                    }),
-                    |this, next, cx| this.set_memory_scope(next, None, cx),
-                    |this, next, cx| this.set_memory_scope(None, next, cx),
-                    cx,
-                ),
-            )
+            .child(self.sidebar_groups(
+                "memory-sidebar-scroll",
+                counts.agents.iter().map(|(agent, count)| {
+                    (
+                        *agent,
+                        *count,
+                        matches!(nav, MemoryNav::Agent(sel) if sel == agent),
+                    )
+                }),
+                counts.projects.iter().map(|p| {
+                    let label: SharedString = if p.path.is_empty() {
+                        t("Unknown project").into()
+                    } else {
+                        p.name.clone().into()
+                    };
+                    (
+                        p.path.clone(),
+                        label,
+                        p.count,
+                        matches!(nav, MemoryNav::Project(sel) if *sel == p.path),
+                    )
+                }),
+                |this, next, cx| {
+                    this.set_memory_scope(next.map_or(MemoryNav::All, MemoryNav::Agent), cx)
+                },
+                |this, next, cx| {
+                    this.set_memory_scope(next.map_or(MemoryNav::All, MemoryNav::Project), cx)
+                },
+                cx,
+            ))
             .into_any_element()
     }
 }
 
-/// 组头 + 文档扁平成行;分组判据是 `MemoryDoc::group`(与 store 的排序一致:项目按
-/// 路径、没归属的一组在项目之后、用户级最后)。不折叠、不缩进(树的形制试过,用户
-/// 2026-09-21 定没必要)
-fn memory_rows(docs: &[MemoryDoc]) -> Vec<MemoryRow> {
+/// 组头 + 文档扁平成行:`docs` 已排成"用户记忆在前,其余按更新时间倒序",用户记忆
+/// 自成一组置顶(会话列表的 Pinned 同位),其余按会话列表同一套时间桶
+/// (`session_group_label`)切组。按项目分组的形制(树、平铺组头)都试过,行上有了
+/// 项目徽章之后用户 2026-09-21 定与会话列表完全一致;用户记忆混进时间线"有点奇怪",
+/// 同日再定置顶单列;侧栏选了 User memory 行时整页都是它(`pin_user` 为假),那个
+/// 组头就没意义,照时间分
+fn memory_rows(docs: &[MemoryDoc], today: NaiveDate, pin_user: bool) -> Vec<MemoryRow> {
     let mut rows = Vec::with_capacity(docs.len() + 8);
-    let mut current: Option<MemoryGroup> = None;
+    let mut current: Option<SharedString> = None;
     for (ix, d) in docs.iter().enumerate() {
-        let group = d.group();
-        if current != Some(group) {
+        let label = memory_section_label(d, today, pin_user);
+        if current.as_ref() != Some(&label) {
             rows.push(MemoryRow::Group(ix));
-            current = Some(group);
+            current = Some(label);
         }
         rows.push(MemoryRow::Doc(ix));
     }
     rows
+}
+
+/// 一份文档落在哪个组头下:用户记忆 = "User memory"(`pin_user`),其余按更新时间进
+/// 会话列表的时间桶
+fn memory_section_label(d: &MemoryDoc, today: NaiveDate, pin_user: bool) -> SharedString {
+    if pin_user && d.scope == MemoryScope::User {
+        t("User memory").into()
+    } else {
+        session_group_label(d.updated_at, today)
+    }
 }
 
 /// 读到 LoadedMemory 之前阅读面要显示的来源路径:线程记忆(Codex 的逐会话摘要)的
@@ -676,14 +826,15 @@ fn memory_display_path(d: &MemoryDoc) -> String {
 /// 组头 / 归属徽章的文案:项目名;用户级记忆一组、没有项目的一组
 fn memory_group_label(d: &MemoryDoc) -> SharedString {
     match d.group() {
-        MemoryGroup::User => t("User-level").into(),
+        MemoryGroup::User => t("User memory").into(),
         MemoryGroup::Unknown => t("Unknown project").into(),
         MemoryGroup::Project { name, .. } => name.to_string().into(),
     }
 }
 
 /// 文档行与阅读面头部共用的两枚徽章(有则画):Codex 逐会话记忆的 "session memory",
-/// 远程记忆的 @host
+/// 远程记忆的 @host。指令文件不另挂徽章——文件名(CLAUDE.md、AGENTS.md)已说明身份,
+/// 用户 2026-09-21 定不分
 fn memory_badges(d: &MemoryDoc, theme: &gpui_component::Theme) -> Vec<AnyElement> {
     let mut out = Vec::with_capacity(2);
     if d.scope == MemoryScope::Thread {

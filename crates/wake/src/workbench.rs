@@ -37,6 +37,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::Notification;
+use gpui_component::progress::Progress;
 use gpui_component::scroll::{AutoScroll, ScrollableElement as _};
 use gpui_component::spinner::Spinner;
 use gpui_component::text::{TextView, TextViewStyle};
@@ -813,7 +814,7 @@ impl ListDelegate for SessionsDelegate {
                         )
                         .child(
                             h_flex()
-                                .gap(px(6.))
+                                .gap(ICON_TEXT_GAP)
                                 .text_size(FONT_LABEL)
                                 .text_color(theme.muted_foreground)
                                 .child(
@@ -1394,7 +1395,7 @@ impl ListDelegate for SearchDelegate {
                     .gap(px(6.))
                     .child(
                         h_flex()
-                            .gap(SPACE_SM)
+                            .gap(ICON_TEXT_GAP)
                             .text_size(FONT_CAPTION)
                             .child(
                                 img(h.session.agent.brand_icon(theme.mode.is_dark()))
@@ -2330,6 +2331,31 @@ pub(crate) struct LocationSettingsSnapshot {
     pub(crate) diverged: bool,
 }
 
+/// Settings/Memory locations 的一行(= 一个记忆来源:各家默认的目录 / 文件 / 库 /
+/// 项目模式,或用户加的自定义目录 / 文件)
+#[derive(Clone)]
+pub(crate) struct MemoryLocationRow {
+    pub(crate) agent: AgentId,
+    /// `~/…` 展示形态;项目模式原样(`<project>/CLAUDE.md`)
+    pub(crate) display: SharedString,
+    /// 来源 id(`MemorySource::id`):停用开关、自定义行的落库路径都是它
+    pub(crate) raw: SharedString,
+    /// 文件数,或路径不存在时的状态词
+    pub(crate) tally: SharedString,
+    /// 具体路径当前存在(项目模式恒 true,但没有 Show in Finder)
+    pub(crate) exists: bool,
+    pub(crate) pattern: bool,
+    /// 用户加的(可编辑、可删);默认来源只能开关
+    pub(crate) custom: bool,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct MemoryLocationSettingsSnapshot {
+    pub(crate) rows: Vec<MemoryLocationRow>,
+    pub(crate) diverged: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct DataSettingsSnapshot {
     pub(crate) display_path: SharedString,
@@ -2365,6 +2391,28 @@ enum FormTarget {
         custom: bool,
         individual_default: bool,
     },
+}
+
+/// 路径表单的一份规格:Session locations 与 Memory locations 共用同一个表单(agent
+/// 下拉 + 路径输入 + 选择钮,Cancel/Save 只在有改动时出现;编辑态动作行左 Remove、
+/// 右 Show in Finder),两页的差别全在这里
+struct PathFormSpec {
+    title: &'static str,
+    ok_label: &'static str,
+    /// 路径字段的标签("Folder" / "Folder or file")
+    field_label: &'static str,
+    init_agent: AgentId,
+    init_path: SharedString,
+    /// 选择器是否也收文件(记忆来源可以是单个文件)
+    pick_files: bool,
+    /// 编辑态动作行 Show in Finder 挂的路径:Some = 这条路径当下存在(添加态、路径不在
+    /// 都是 None)
+    reveal: Option<SharedString>,
+    /// 编辑态 Remove(只有真正可删的自定义行才有)
+    remove: Option<Rc<dyn Fn(&mut Workbench, &mut Window, &mut Context<Workbench>)>>,
+    /// 提交;返回 false = 表单留着(校验没过,或已手工收场)
+    commit:
+        Rc<dyn Fn(&mut Workbench, AgentId, String, &mut Window, &mut Context<Workbench>) -> bool>,
 }
 
 impl Workbench {
@@ -3163,17 +3211,84 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (title, ok_label, init_agent, init_path): (
-            &'static str,
-            &'static str,
-            AgentId,
-            SharedString,
-        ) = match &target {
-            FormTarget::Add => (t("Add location"), t("Add"), AgentId::ClaudeCode, "".into()),
-            FormTarget::Edit { agent, path, .. } => {
-                (t("Edit location"), t("Save"), *agent, path.clone())
+        // 编辑态动作行:Show in Finder 只挂真实存在的路径——目录或 SQLite 库文件都算
+        // (open_in_finder 对文件走 reveal 选中;用 is_dir 会把三家库文件行的 Finder 恒
+        // 隐藏,2026-08-24 Codex review),fs 探测一次、不进每帧 builder;Remove 只属于
+        // 真正可删除的自定义 location,内置 location 由行内开关停用、不删除
+        let (title, ok_label, init_agent, init_path, reveal, remove) = match &target {
+            FormTarget::Add => (
+                t("Add location"),
+                t("Add"),
+                AgentId::ClaudeCode,
+                SharedString::from(""),
+                None,
+                None,
+            ),
+            FormTarget::Edit {
+                agent,
+                path,
+                custom,
+                ..
+            } => {
+                let reveal = std::path::Path::new(path.as_ref())
+                    .exists()
+                    .then(|| path.clone());
+                let remove: Option<
+                    Rc<dyn Fn(&mut Workbench, &mut Window, &mut Context<Workbench>)>,
+                > = if *custom {
+                    let (agent, stored) = (*agent, path.clone());
+                    Some(Rc::new(move |this: &mut Workbench, window, cx| {
+                        this.delete_location(agent, stored.clone(), window, cx)
+                    }))
+                } else {
+                    None
+                };
+                (
+                    t("Edit location"),
+                    t("Save"),
+                    *agent,
+                    path.clone(),
+                    reveal,
+                    remove,
+                )
             }
         };
+        let commit_target = target;
+        self.open_path_form(
+            PathFormSpec {
+                title,
+                ok_label,
+                field_label: t("Folder"),
+                init_agent,
+                init_path,
+                pick_files: false,
+                reveal,
+                remove,
+                commit: Rc::new(move |this, agent, text, window, cx| {
+                    this.commit_location_form(commit_target.clone(), agent, text, window, cx)
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 路径表单本体(添加/编辑共用一套 UI,2026-08-24 定稿):agent 下拉 + 路径输入框
+    /// (可手输,~ 展开)+ 选择按钮;Cancel/Save 只在有改动时出现。表单作为 Settings
+    /// 窗口的模态层,esc/取消回到来源页。Session locations 与 Memory locations 的差别
+    /// 全在 `PathFormSpec` 里
+    fn open_path_form(&mut self, spec: PathFormSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let PathFormSpec {
+            title,
+            ok_label,
+            field_label,
+            init_agent,
+            init_path,
+            pick_files,
+            reveal,
+            remove,
+            commit,
+        } = spec;
         // 占位符须与校验规则(Path::is_absolute)同形:Windows 上没有盘符
         // 的 `/absolute/...` 并不算绝对路径,照着占位符敲会被拒
         let placeholder = if cfg!(target_os = "windows") {
@@ -3186,13 +3301,6 @@ impl Workbench {
             let v = init_path.clone();
             path_input.update(cx, |st, cx| st.set_value(v, window, cx));
         }
-        // 编辑态动作行的 Finder 只挂真实存在的路径——目录或 SQLite 库文件都算
-        // (open_in_finder 对文件走 reveal 选中;用 is_dir 会把三家库文件行的
-        // Finder 恒隐藏,2026-08-24 Codex review)。fs 探测一次,不进每帧 builder
-        let edit_exists = match &target {
-            FormTarget::Add => None,
-            FormTarget::Edit { path, .. } => Some(std::path::Path::new(path.as_ref()).exists()),
-        };
         // 表单状态放 Rc<Cell>/entity 而非宿主字段:builder 每帧重跑,闭包内
         // read 宿主 entity 必 double-lease panic(与 refresh 进度弹窗同一约束)
         let selected: Rc<Cell<AgentId>> = Rc::new(Cell::new(init_agent));
@@ -3223,8 +3331,9 @@ impl Workbench {
             let ok_entity = entity.clone();
             let ok_input = path_input.clone();
             let ok_sel = selected.clone();
-            let ok_target = target.clone();
-            let action_target = target.clone();
+            let ok_commit = commit.clone();
+            let remove = remove.clone();
+            let reveal = reveal.clone();
             let dialog = dialog
                 .title(
                     div()
@@ -3262,7 +3371,7 @@ impl Workbench {
                                         .rounded(RADIUS_BUTTON)
                                         .child(
                                             h_flex()
-                                                .gap(SPACE_SM)
+                                                .gap(ICON_TEXT_GAP)
                                                 .items_center()
                                                 .child(
                                                     img(sel.brand_icon(dark))
@@ -3289,7 +3398,7 @@ impl Workbench {
                                                 menu = menu.item(
                                                     PopupMenuItem::element(move |_, _| {
                                                         h_flex()
-                                                            .gap(SPACE_SM)
+                                                            .gap(ICON_TEXT_GAP)
                                                             .items_center()
                                                             .child(
                                                                 img(a.brand_icon(dark))
@@ -3320,7 +3429,7 @@ impl Workbench {
                                         .flex_shrink_0()
                                         .text_size(FONT_CAPTION)
                                         .text_color(theme.muted_foreground)
-                                        .child(t("Folder")),
+                                        .child(field_label),
                                 )
                                 .child(div().flex_1().min_w_0().child(Input::new(&browse_input)))
                                 .child(
@@ -3328,118 +3437,103 @@ impl Workbench {
                                         .outline()
                                         .rounded(RADIUS_BUTTON)
                                         .icon(icon("icons/folder.svg").with_size(px(13.)))
-                                        .tooltip(t("Choose a folder"))
+                                        .tooltip(if pick_files {
+                                            t("Choose a folder or file")
+                                        } else {
+                                            t("Choose a folder")
+                                        })
                                         .on_click({
                                             let entity = browse_entity.clone();
                                             let input = browse_input.clone();
                                             move |_, window, cx| {
                                                 let input = input.clone();
                                                 entity.update(cx, |this, cx| {
-                                                    this.browse_for_location(input, window, cx)
+                                                    this.browse_for_location(
+                                                        input, pick_files, window, cx,
+                                                    )
                                                 });
                                             }
                                         }),
                                 ),
                         )
-                        .when_some(edit_exists, |el, exists| {
-                            let FormTarget::Edit {
-                                agent,
-                                path,
-                                root: _,
-                                custom,
-                                individual_default: _,
-                            } = action_target.clone()
-                            else {
-                                unreachable!("edit_exists 仅在 Edit 目标下为 Some")
-                            };
-                            let remove_entity = entity.clone();
-                            el.when(custom || exists, |el| {
-                                el.child(
-                                    // 动作行遵循破坏性靠左惯例:Remove 靠左、Show in
-                                    // Finder 靠右。Remove 只属于真正可删除的自定义
-                                    // location；内置 location 由行内开关停用，不删除。
-                                    // 两钮手排:内边距 = 轴缩进,Remove
-                                    // 左侧再减 1.5 补 lucide 字形内白(24 视框留 3
-                                    // 单位),字形左缘正落标签轴;右钮文字右缘正落
-                                    // 浏览钮右缘。全正值内边距,胶囊完整在内容盒里
-                                    h_flex()
-                                        .pt(SPACE_XS)
-                                        .items_center()
-                                        .justify_between()
-                                        .when(custom, |el| {
-                                            el.child(
-                                                h_flex()
-                                                    .id("loc-remove")
-                                                    .h(BUTTON_SM_H)
-                                                    .pl(BUTTON_SM_PX - px(1.5))
-                                                    .pr(BUTTON_SM_PX)
-                                                    .rounded(RADIUS_BUTTON)
-                                                    .items_center()
-                                                    .gap(px(6.))
-                                                    .cursor_pointer()
-                                                    .text_size(FONT_BODY)
-                                                    .text_color(theme.danger)
-                                                    .hover(|s| s.bg(theme.danger.opacity(0.1)))
-                                                    .active(|s| s.bg(theme.danger.opacity(0.16)))
-                                                    .on_click({
-                                                        let remove_entity = remove_entity.clone();
-                                                        let stored = path.clone();
-                                                        move |_, window, cx| {
-                                                            // 整栈收场(表单+过期面板);
-                                                            // delete 内会重开新快照面板
-                                                            window.close_all_dialogs(cx);
-                                                            let stored = stored.clone();
-                                                            remove_entity.update(cx, |this, cx| {
-                                                                this.delete_location(
-                                                                    agent, stored, window, cx,
-                                                                )
-                                                            });
-                                                        }
-                                                    })
-                                                    .child(
-                                                        icon("icons/trash-2.svg")
-                                                            .with_size(px(13.))
-                                                            .flex_shrink_0(),
-                                                    )
-                                                    .child(t("Remove")),
-                                            )
-                                        })
-                                        .when(exists, |el| {
-                                            el.child(
-                                                h_flex()
-                                                    .id("loc-reveal")
-                                                    .h(BUTTON_SM_H)
-                                                    .px(BUTTON_SM_PX)
-                                                    .rounded(RADIUS_BUTTON)
-                                                    .items_center()
-                                                    .gap(px(6.))
-                                                    .cursor_pointer()
-                                                    .text_size(FONT_BODY)
-                                                    .text_color(theme.foreground)
-                                                    .hover(|s| s.bg(theme.secondary_hover))
-                                                    .active(|s| s.bg(theme.secondary_active))
-                                                    .on_click(move |_, _, _| {
-                                                        terminal::open_in_file_manager(&path)
-                                                    })
-                                                    .child(
-                                                        icon("icons/folder.svg")
-                                                            .with_size(px(13.))
-                                                            .flex_shrink_0()
-                                                            .text_color(theme.muted_foreground),
-                                                    )
-                                                    .child(show_in_fm()),
-                                            )
-                                        }),
-                                )
-                            })
+                        .when(remove.is_some() || reveal.is_some(), |el| {
+                            el.child(
+                                // 动作行遵循破坏性靠左惯例:Remove 靠左、Show in
+                                // Finder 靠右。两钮手排:内边距 = 轴缩进,Remove
+                                // 左侧再减 1.5 补 lucide 字形内白(24 视框留 3
+                                // 单位),字形左缘正落标签轴;右钮文字右缘正落
+                                // 浏览钮右缘。全正值内边距,胶囊完整在内容盒里
+                                h_flex()
+                                    .pt(SPACE_XS)
+                                    .items_center()
+                                    .justify_between()
+                                    .when_some(remove.clone(), |el, remove| {
+                                        let remove_entity = entity.clone();
+                                        el.child(
+                                            h_flex()
+                                                .id("loc-remove")
+                                                .h(BUTTON_SM_H)
+                                                .pl(BUTTON_SM_PX - px(1.5))
+                                                .pr(BUTTON_SM_PX)
+                                                .rounded(RADIUS_BUTTON)
+                                                .items_center()
+                                                .gap(ICON_TEXT_GAP)
+                                                .cursor_pointer()
+                                                .text_size(FONT_BODY)
+                                                .text_color(theme.danger)
+                                                .hover(|s| s.bg(theme.danger.opacity(0.1)))
+                                                .active(|s| s.bg(theme.danger.opacity(0.16)))
+                                                .on_click(move |_, window, cx| {
+                                                    // 整栈收场(表单+过期面板);
+                                                    // 删除内会让面板重读快照
+                                                    window.close_all_dialogs(cx);
+                                                    let remove = remove.clone();
+                                                    remove_entity.update(cx, |this, cx| {
+                                                        remove(this, window, cx)
+                                                    });
+                                                })
+                                                .child(
+                                                    icon("icons/trash-2.svg")
+                                                        .with_size(px(13.))
+                                                        .flex_shrink_0(),
+                                                )
+                                                .child(t("Remove")),
+                                        )
+                                    })
+                                    .when_some(reveal.clone(), |el, path| {
+                                        el.child(
+                                            h_flex()
+                                                .id("loc-reveal")
+                                                .h(BUTTON_SM_H)
+                                                .px(BUTTON_SM_PX)
+                                                .rounded(RADIUS_BUTTON)
+                                                .items_center()
+                                                .gap(ICON_TEXT_GAP)
+                                                .cursor_pointer()
+                                                .text_size(FONT_BODY)
+                                                .text_color(theme.foreground)
+                                                .hover(|s| s.bg(theme.secondary_hover))
+                                                .active(|s| s.bg(theme.secondary_active))
+                                                .on_click(move |_, _, _| {
+                                                    terminal::open_in_file_manager(&path)
+                                                })
+                                                .child(
+                                                    icon("icons/folder.svg")
+                                                        .with_size(px(13.))
+                                                        .flex_shrink_0()
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .child(show_in_fm()),
+                                        )
+                                    }),
+                            )
                         }),
                 )
                 .on_ok(move |_, window, cx| {
                     let path_text = ok_input.read(cx).text().to_string();
                     let agent = ok_sel.get();
-                    ok_entity.update(cx, |this, cx| {
-                        this.commit_location_form(ok_target.clone(), agent, path_text, window, cx)
-                    })
+                    let commit = ok_commit.clone();
+                    ok_entity.update(cx, |this, cx| commit(this, agent, path_text, window, cx))
                 });
             if dirty {
                 dialog.footer(
@@ -3464,15 +3558,17 @@ impl Workbench {
         });
     }
 
-    /// 表单的目录选择按钮:系统选择器,选中即回填输入框(取消无事发生)
+    /// 表单的选择按钮:系统选择器,选中即回填输入框(取消无事发生);记忆来源的
+    /// 表单也收文件
     fn browse_for_location(
         &mut self,
         input: Entity<InputState>,
+        files: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
+            files,
             directories: true,
             multiple: false,
             prompt: Some(t("Choose").into()),
@@ -3491,6 +3587,41 @@ impl Workbench {
         .detach();
     }
 
+    /// 表单里手输/选中的路径整形(两个路径表单共用):`~` 展开;Windows 上把手输的
+    /// '/' 折成 '\'(`~/.claude` 展开后是 `C:\Users\me/.claude` 这种混分隔符形态,而
+    /// path_owns 的重叠判定是字节精确比较、explorer 只认反斜杠——不在入口归一,同一
+    /// 目录就会以两种拼写各注册一份;POSIX 不动:'\' 在那边是合法文件名字符);绝对性
+    /// 先判、只判一次(is_absolute 三端同判据,空串它也判 false;**必须判在剪尾之前**:
+    /// `//` 剪完是空串,拿剪后的去判会退回未剪形态放行,2026-08-25 review);尾分隔符
+    /// 剪掉(展示与重叠判定都吃这份),裸根("/"、"C:\")剪完会失去绝对性、原样保留。
+    /// 不是绝对路径就弹提示、给 None
+    fn absolute_form_path(
+        &self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let expanded = expand_tilde(raw.trim());
+        let expanded = if cfg!(target_os = "windows") {
+            expanded.replace('/', "\\")
+        } else {
+            expanded
+        };
+        if !std::path::Path::new(&expanded).is_absolute() {
+            window.push_notification(
+                Notification::warning(t("Enter an absolute folder path")),
+                cx,
+            );
+            return None;
+        }
+        let trimmed = expanded.trim_end_matches(std::path::is_separator);
+        Some(if std::path::Path::new(trimmed).is_absolute() {
+            trimmed.to_string()
+        } else {
+            expanded
+        })
+    }
+
     /// 表单落库。返回值交给 on_ok:false = 表单留着(校验没过,或已手工收场)。
     /// 纯路径管理:不校验目录内容(2026-08-24 用户定稿),只拒空/相对路径与
     /// 同家重叠;预设行的编辑落库为"压默认 + 记自定义"
@@ -3502,34 +3633,8 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let expanded = expand_tilde(raw_text.trim());
-        // Windows 上把手输的 '/' 折成 '\':`~/.claude` 展开后是
-        // `C:\Users\me/.claude` 这种混分隔符形态,而 path_owns 的重叠判定是
-        // 字节精确比较、explorer 只认反斜杠——不在入口归一,同一目录就会以
-        // 两种拼写各注册一份(POSIX 不动:'\' 在那边是合法文件名字符)
-        let expanded = if cfg!(target_os = "windows") {
-            expanded.replace('/', "\\")
-        } else {
-            expanded
-        };
-        // 绝对性先判、只判一次:is_absolute 三端同判据(starts_with('/') 会把
-        // 所有 Windows 盘符路径误拒),空串它也判 false,无需另设 is_empty 关。
-        // **必须判在剪尾之前**:`//` 剪完是空串,若拿剪后的结果去判就会退回
-        // 未剪形态放行,而旧版是拒的(2026-08-25 review)
-        if !std::path::Path::new(&expanded).is_absolute() {
-            window.push_notification(
-                Notification::warning(t("Enter an absolute folder path")),
-                cx,
-            );
+        let Some(path) = self.absolute_form_path(&raw_text, window, cx) else {
             return false;
-        }
-        // 尾分隔符归一(展示与重叠判定都吃这份);裸根("/"、"C:\")剪完会
-        // 失去绝对性,原样保留
-        let trimmed = expanded.trim_end_matches(std::path::is_separator);
-        let path = if std::path::Path::new(trimmed).is_absolute() {
-            trimmed.to_string()
-        } else {
-            expanded.clone()
         };
         // 各家归一化(codex:直选 sessions 树/平铺 archived 上提到家层,侧档
         // 找回)。静态分派,不依赖该家实例是否还在 roster(默认被移除时也要
@@ -3684,34 +3789,46 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self
+        let res = self
             .store
-            .set_location_enabled(agent.as_str(), path.as_ref(), enabled)
-        {
-            Err(e) => window.push_notification(
-                Notification::error(crate::tf!("Couldn't update location: {}", e)),
-                cx,
-            ),
+            .set_location_enabled(agent.as_str(), path.as_ref(), enabled);
+        self.apply_roster_change(
+            res,
+            t("Couldn't update location"),
+            Notification::info(if enabled {
+                t("Location enabled")
+            } else {
+                t("Location disabled")
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// 配置写库后的统一收尾:失败弹错;成功先跑 `on_ok`(location:roster 换代 + 补扫;
+    /// 记忆来源:只同步一次记忆)再提示——location 增删改与开关、记忆来源增删改与开关
+    /// 同一条时序,别各自手写。Settings 页观察 Workbench 的 notify 并重读快照,不需要
+    /// 关闭 / 重开管理面板
+    fn apply_config_change(
+        &mut self,
+        res: anyhow::Result<()>,
+        err_prefix: &'static str,
+        ok_note: Notification,
+        on_ok: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match res {
+            Err(e) => window
+                .push_notification(Notification::error(crate::tf!("{}: {}", err_prefix, e)), cx),
             Ok(()) => {
-                self.rebuild_roster(cx);
-                self.kick_incremental_scan(cx);
-                window.push_notification(
-                    Notification::info(if enabled {
-                        t("Location enabled")
-                    } else {
-                        t("Location disabled")
-                    }),
-                    cx,
-                );
-                window.refresh();
+                on_ok(self, window, cx);
+                window.push_notification(ok_note, cx);
             }
         }
     }
 
-    /// location 变更的统一收尾(删/恢复/表单提交成功共用)。Settings 页
-    /// 观察 Workbench 的 notify 并重读快照，不需要关闭/重开管理面板。
-    /// 配置写库后的统一收尾:失败弹错,成功走"roster 换代 + 补扫 + 提示"
-    /// ——location 增删改、开关与远程 host 开关同一条时序,别各自手写
+    /// location 变更(删 / 恢复 / 开关 / 表单提交成功)的收尾:roster 换代 + 补扫
     fn apply_roster_change(
         &mut self,
         res: anyhow::Result<()>,
@@ -3720,19 +3837,270 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match res {
-            Err(e) => {
-                window.push_notification(
-                    Notification::error(crate::tf!("{}: {}", err_prefix, e)),
-                    cx,
-                );
+        self.apply_config_change(
+            res,
+            err_prefix,
+            ok_note,
+            |this, _, cx| {
+                this.rebuild_roster(cx);
+                this.kick_incremental_scan(cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    // ---------- 记忆来源(Settings → Memory locations) ----------
+
+    /// Memory locations 面板的快照:`memory_source_plan` 给的每个本地实例的来源(默认 +
+    /// 项目模式 + 自定义,与 scanner 同一份),按 AgentId 声明序分组;计数按来源 id 从
+    /// memories 表聚合(停用的来源行已出库,计数自然是 0)。三条 SQL + 每来源一次 stat:
+    /// Settings 在 observe 回调里取一次,不在 render 里每帧算
+    pub(crate) fn memory_location_settings_snapshot(&self) -> MemoryLocationSettingsSnapshot {
+        let counts = self.store.memory_source_counts().unwrap_or_default();
+        // 只是显示,读不出就按"没配置"画(scanner 那边读不出会整轮不动,别混为一谈)
+        let (customs, disabled) = self.store.memory_source_overrides().unwrap_or_default();
+        let diverged = !customs.is_empty() || !disabled.is_empty();
+        let plan = wake_core::adapters::memory_source_plan(&self.adapters, &customs, &disabled);
+        let mut by_agent: std::collections::BTreeMap<AgentId, Vec<MemoryLocationRow>> =
+            std::collections::BTreeMap::new();
+        for planned in plan {
+            if !planned.host.is_empty() {
+                continue;
             }
-            Ok(()) => {
-                self.rebuild_roster(cx);
-                self.kick_incremental_scan(cx);
-                window.push_notification(ok_note, cx);
+            for p in planned.sources {
+                let agent = p.source.agent;
+                let id = p.source.id();
+                let pattern = p.source.is_pattern();
+                let exists = pattern || p.source.path.exists();
+                let count = counts
+                    .get(&(agent.as_str().to_string(), id.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                by_agent.entry(agent).or_default().push(MemoryLocationRow {
+                    agent,
+                    display: if pattern {
+                        id.clone().into()
+                    } else {
+                        tilde_path(&id).into()
+                    },
+                    tally: if exists {
+                        file_tally(count).into()
+                    } else {
+                        t("Not found").into()
+                    },
+                    enabled: p.enabled,
+                    raw: id.into(),
+                    exists,
+                    pattern,
+                    custom: p.custom,
+                });
             }
         }
+        MemoryLocationSettingsSnapshot {
+            rows: by_agent.into_values().flatten().collect(),
+            diverged,
+        }
+    }
+
+    pub(crate) fn open_add_memory_location_form(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_form(
+            PathFormSpec {
+                title: t("Add memory location"),
+                ok_label: t("Add"),
+                field_label: t("Folder or file"),
+                init_agent: AgentId::ClaudeCode,
+                init_path: "".into(),
+                pick_files: true,
+                reveal: None,
+                remove: None,
+                commit: Rc::new(|this, agent, text, window, cx| {
+                    this.commit_memory_location_form(None, agent, text, window, cx)
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 只有自定义行可编辑(面板只对它们挂 Edit);默认来源由行内开关停用
+    pub(crate) fn open_edit_memory_location_form(
+        &mut self,
+        row: MemoryLocationRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = (row.agent, row.raw.clone());
+        let remove_old = old.clone();
+        self.open_path_form(
+            PathFormSpec {
+                title: t("Edit memory location"),
+                ok_label: t("Save"),
+                field_label: t("Folder or file"),
+                init_agent: row.agent,
+                init_path: row.raw.clone(),
+                pick_files: true,
+                reveal: row.exists.then(|| row.raw.clone()),
+                remove: Some(Rc::new(move |this, window, cx| {
+                    this.delete_memory_source(remove_old.0, remove_old.1.clone(), window, cx)
+                })),
+                commit: Rc::new(move |this, agent, text, window, cx| {
+                    this.commit_memory_location_form(Some(old.clone()), agent, text, window, cx)
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 记忆来源表单落库。纯路径管理:目录或文件都收、不校验内容,只拒相对路径与同家
+    /// 重复(默认来源里已有、或自定义里已有);编辑走 replace_memory_source 单事务
+    fn commit_memory_location_form(
+        &mut self,
+        old: Option<(AgentId, SharedString)>,
+        agent_new: AgentId,
+        raw_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(path) = self.absolute_form_path(&raw_text, window, cx) else {
+            return false;
+        };
+        if old
+            .as_ref()
+            .is_some_and(|(agent, p)| *agent == agent_new && p.as_ref() == path)
+        {
+            return true;
+        }
+        // 与面板同一份来源清单查重:该家的默认具体路径(项目模式不算)与已有的自定义
+        let (customs, disabled) = self.store.memory_source_overrides().unwrap_or_default();
+        let duplicate =
+            wake_core::adapters::memory_source_plan(&self.adapters, &customs, &disabled)
+                .into_iter()
+                .flat_map(|p| p.sources)
+                .any(|p| {
+                    p.source.agent == agent_new
+                        && !p.source.is_pattern()
+                        && p.source.path.to_string_lossy() == path
+                });
+        if duplicate {
+            window.push_notification(
+                Notification::info(t("This path is already in Wake's memory locations")),
+                cx,
+            );
+            return false;
+        }
+        let res = match &old {
+            None => self.store.add_memory_source(agent_new.as_str(), &path),
+            Some((agent, p)) => self.store.replace_memory_source(
+                agent.as_str(),
+                p.as_ref(),
+                agent_new.as_str(),
+                &path,
+            ),
+        };
+        if let Err(e) = res {
+            window.push_notification(Notification::error(crate::tf!("Save failed: {}", e)), cx);
+            return false;
+        }
+        window.close_all_dialogs(cx);
+        let note = if old.is_none() {
+            t("Location added")
+        } else {
+            t("Location updated")
+        };
+        self.memory_change_applied(window, cx);
+        window.push_notification(Notification::success(note), cx);
+        false
+    }
+
+    pub(crate) fn delete_memory_source(
+        &mut self,
+        agent: AgentId,
+        stored: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let res = self
+            .store
+            .remove_memory_source(agent.as_str(), stored.as_ref());
+        self.apply_memory_change(
+            res,
+            t("Remove failed"),
+            Notification::info(t("Location removed")),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn restore_default_memory_locations(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let res = self.store.clear_memory_source_overrides();
+        self.apply_memory_change(
+            res,
+            t("Restore failed"),
+            Notification::info(t("Locations restored to defaults")),
+            window,
+            cx,
+        );
+    }
+
+    /// Memory locations 行内开关
+    pub(crate) fn set_memory_source_enabled(
+        &mut self,
+        agent: AgentId,
+        id: SharedString,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let res = self
+            .store
+            .set_memory_source_enabled(agent.as_str(), id.as_ref(), enabled);
+        self.apply_memory_change(
+            res,
+            t("Couldn't update location"),
+            Notification::info(if enabled {
+                t("Location enabled")
+            } else {
+                t("Location disabled")
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// 记忆来源变更的收尾:只同步一次记忆(`sync_memories_quietly` 按新配置重读,不重扫
+    /// 会话、不换 roster;扫描进行中就交给它的收尾)
+    fn apply_memory_change(
+        &mut self,
+        res: anyhow::Result<()>,
+        err_prefix: &'static str,
+        ok_note: Notification,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_config_change(
+            res,
+            err_prefix,
+            ok_note,
+            Self::memory_change_applied,
+            window,
+            cx,
+        );
+    }
+
+    /// 记忆来源配置已落库之后该做的事(表单提交成功也走这里)
+    fn memory_change_applied(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_memories_quietly(cx);
+        cx.notify();
     }
 
     // ---------- 远程 host(Settings → Remote hosts) ----------
@@ -3954,9 +4322,11 @@ impl Workbench {
                     self.pending_rescan = false;
                     self.kick_incremental_scan(cx);
                 }
-                // 扫描期间整页目的地的重载被按住(见 reload_insights 注释),终态补最后一次
+                // 扫描期间整页目的地的重载被按住(见 reload_insights 注释),终态补最后一次;
+                // 扫描期间排队的记忆同步也在这里补
                 if !self.scan.scanning {
                     self.reload_page(cx);
+                    self.drain_pending_memory_sync(cx);
                 }
                 cx.notify();
                 note
@@ -4993,11 +5363,16 @@ impl Workbench {
             && !self.cleanup.open;
         // 常态沉默,仅刷新中/监听失效时出现;None 时状态栏整行不渲染。
         // 文案在此按 scan 现算,不另存字段——存下来就会有第二个写入点要维护
+        // 进行中的活动(会话扫描 / 记忆同步 / 远程同步):行首转圈——与页头 Refresh 按钮
+        // loading 态同一个 Spinner;出错的那句行首是静态图标
+        let busy = self.scan.scanning || self.memory.syncing || !self.syncing_hosts.is_empty();
         let note = if self.scan.scanning {
             Some(match self.scan.total {
                 0 => t("Refreshing…").to_string(),
                 total => crate::tf!("Refreshing {}/{}", self.scan.done, total),
             })
+        } else if self.memory.syncing {
+            Some(t("Refreshing memory…").to_string())
         } else if let [only] = self.syncing_hosts.as_slice() {
             // rsync 与扫描并行;扫描先收工时这里接着展示同步状态
             Some(crate::tf!("Syncing {}…", only))
@@ -5012,17 +5387,41 @@ impl Workbench {
                 .as_ref()
                 .map(|e| crate::tf!("Refresh failed: {}", e))
         };
+        // 文字下方一条进度条(用户 2026-09-22 要的):会话扫描按 done/total 定值;总数
+        // 未知、记忆同步与远程同步报不出进度,走不定值滑动
+        let progress = busy.then(|| {
+            let bar = Progress::new("refresh-progress")
+                .with_size(px(3.))
+                .color(theme.primary);
+            let bar = if self.scan.scanning && self.scan.total > 0 {
+                bar.value(self.scan.done as f32 / self.scan.total as f32 * 100.)
+            } else {
+                bar.loading(true)
+            };
+            bar.into_any_element()
+        });
         let status: Option<AnyElement> = if let Some(note) = note {
+            let lead = if busy {
+                div()
+                    .flex_shrink_0()
+                    .child(
+                        Spinner::new()
+                            .with_size(px(12.))
+                            .color(theme.muted_foreground),
+                    )
+                    .into_any_element()
+            } else {
+                icon("icons/refresh-cw.svg")
+                    .with_size(px(12.))
+                    .flex_shrink_0()
+                    .into_any_element()
+            };
             Some(
                 h_flex()
                     .w_full()
-                    .gap(SPACE_SM)
+                    .gap(ICON_TEXT_GAP)
                     .text_color(theme.muted_foreground)
-                    .child(
-                        icon("icons/refresh-cw.svg")
-                            .with_size(px(12.))
-                            .flex_shrink_0(),
-                    )
+                    .child(lead)
                     .child(div().min_w_0().truncate().child(note))
                     .into_any_element(),
             )
@@ -5030,7 +5429,7 @@ impl Workbench {
             Some(
                 h_flex()
                     .w_full()
-                    .gap(SPACE_SM)
+                    .gap(ICON_TEXT_GAP)
                     .text_color(theme.muted_foreground)
                     .child(
                         div()
@@ -5104,18 +5503,20 @@ impl Workbench {
                     .border_color(theme.sidebar_border)
                     .when_some(status, |this, status| {
                         this.child(
-                            h_flex()
+                            v_flex()
                                 .px(SPACE_XL)
                                 .pt(SPACE_MD)
+                                .gap(SPACE_SM)
                                 .text_size(FONT_LABEL)
-                                .child(status),
+                                .child(status)
+                                .children(progress),
                         )
                     })
                     // 两端分置的图标条(Zed 状态栏 / Xcode 导航条那种,不带盒子):左端
                     // 页切换 Sessions / Memory / Insights,当前页那颗用侧栏选中色做底;
-                    // 右端只有 Settings。Refresh 不在这里——它住在各页页头右端(全库重扫,
-                    // 三页同一条路;用户 2026-09-21 三轮反馈:六个一样的图标挤一排不行、
-                    // 刷新不该放这里、带边框的分段盒子也不行)
+                    // 右端只有 Settings。Refresh 不在这里——它住在各页页头右端(会话页整库
+                    // 重扫、Memory 页只同步记忆;用户 2026-09-21 三轮反馈:六个一样的图标挤
+                    // 一排不行、刷新不该放这里、带边框的分段盒子也不行)
                     .child(
                         h_flex()
                             .h(SIDEBAR_FOOTER_ROW_HEIGHT)
@@ -5365,17 +5766,23 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 各页页头右端的 Refresh(⌘R 同一条路,全库重扫、不分页——Memory 与 Insights 的
-    /// 数据都是扫描收尾派生的):扫描进行中显示转圈并禁用
-    fn refresh_button(&self, cx: &Context<Self>) -> AnyElement {
+    /// 页头右端的 Refresh(三页同一外形,各刷各的——用户 2026-09-22 定):会话页与
+    /// Insights 走整库重扫(`refresh_sessions`,Insights 的数字全是会话派生的),Memory
+    /// 页只同步记忆来源(`refresh_memories`)。进行中 `loading` + 禁用
+    fn refresh_button(
+        &self,
+        busy: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         Button::new("refresh")
             .ghost()
             .rounded(RADIUS_BUTTON)
             .icon(icon("icons/refresh-cw.svg").with_size(px(16.)))
-            .loading(self.scan.scanning)
-            .disabled(self.scan.scanning)
+            .loading(busy)
+            .disabled(busy)
             .tooltip(t("Refresh"))
-            .on_click(cx.listener(|this, _, window, cx| this.refresh_sessions(window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
             .into_any_element()
     }
 
@@ -5472,7 +5879,7 @@ impl Workbench {
                 Some(
                     h_flex()
                         .gap(SPACE_XS)
-                        .child(self.refresh_button(cx))
+                        .child(self.refresh_button(self.scan.scanning, Self::refresh_sessions, cx))
                         .child(sort_menu)
                         .into_any_element(),
                 ),
@@ -6077,7 +6484,7 @@ impl Workbench {
                 t("Insights"),
                 subtitle,
                 SPACE_XXL,
-                Some(self.refresh_button(cx)),
+                Some(self.refresh_button(self.scan.scanning, Self::refresh_sessions, cx)),
                 cx,
             ))
             .child(body)
@@ -6536,7 +6943,7 @@ impl Workbench {
             lead.push(
                 h_flex()
                     .min_w_0()
-                    .gap(SPACE_XS)
+                    .gap(ICON_TEXT_GAP)
                     .child(
                         icon("icons/git-branch.svg")
                             .with_size(px(11.))
@@ -6667,7 +7074,7 @@ impl Workbench {
                                 menu = menu.item(
                                     PopupMenuItem::element(move |_, _| {
                                         h_flex()
-                                            .gap(SPACE_SM)
+                                            .gap(ICON_TEXT_GAP)
                                             .items_center()
                                             .child(open_in_icon(
                                                 Some(term),
@@ -6759,7 +7166,7 @@ impl Workbench {
                 .into_any_element(),
             h_flex()
                 .min_w_0()
-                .gap(px(6.))
+                .gap(ICON_TEXT_GAP)
                 .child(icon("icons/folder.svg").with_size(px(12.)).flex_shrink_0())
                 .child(div().min_w_0().truncate().child(detail_path))
                 .into_any_element(),
@@ -6772,7 +7179,7 @@ impl Workbench {
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .gap(px(6.))
+                    .gap(ICON_TEXT_GAP)
                     .items_center()
                     .child(
                         icon("icons/calendar.svg")
@@ -6835,7 +7242,7 @@ impl Workbench {
                     .bg(theme.popover)
                     .items_center()
                     .justify_center()
-                    .gap(SPACE_SM)
+                    .gap(ICON_TEXT_GAP)
                     .text_color(theme.muted_foreground)
                     .child(Spinner::new().small())
                     .child(div().text_size(FONT_BODY).child(t("Loading session…")))
@@ -6913,7 +7320,10 @@ impl Workbench {
     }
 }
 
-/// 可折叠分组头:chevron + 文字,点击切换
+/// 侧栏组头(Agents / Projects):行首是 15px 折叠 chevron(收起指右、展开指下;与导航行
+/// 图标同一档,描边粗细才一致),中心压 26.75 轴(用户 2026-09-22 定"箭头放到开头,对准
+/// 上面菜单的 icon 和红绿灯的红灯";原先 chevron 跟在文字后,靠首字母字形宽度反推的
+/// GROUP_HEAD_INSET 压轴,字号 / 字重 / 语言一变就失效)
 fn group_header(
     id: &'static str,
     text: &'static str,
@@ -6925,7 +7335,10 @@ fn group_header(
     div()
         .id(id)
         .flex_shrink_0()
-        .pl(GROUP_HEAD_INSET)
+        // chevron 不占 18px 槽位、只按自己的框居中压轴:槽位居中再接统一间距,墨迹到
+        // 文字会比导航行空出一截(chevron 墨迹只有约 5px 宽,用户 2026-09-22 "间隔太大");
+        // 按框压轴后文字起点比导航行标签左 1.5px,墨迹到文字视觉约 10.9px、与导航行相当
+        .pl(LEAD_INSET + (LEAD_BOX - NAV_ICON) / 2.)
         .pr(SIDEBAR_EDGE)
         .pt(SPACE_MD)
         .pb(SPACE_XS)
@@ -6934,20 +7347,21 @@ fn group_header(
         .on_click(on_click)
         .child(
             h_flex()
-                .gap(SPACE_XS)
-                // 与主导航行同字号同字重(FONT_BODY / 常规),仅靠 muted 色
-                // 与"无行首图标"区分——加粗会让组头压过它统辖的行
+                .gap(ICON_TEXT_GAP)
+                // 与主导航行同字号同字重(FONT_BODY / 常规),仅靠 muted 色区分——
+                // 加粗会让组头压过它统辖的行
                 .text_size(FONT_BODY)
                 .text_color(theme.muted_foreground)
                 .hover(|s| s.text_colored(theme.foreground, FONT_BODY))
-                .child(text)
                 .child(
                     icon("icons/chevron-right.svg")
-                        .with_size(px(13.))
+                        .with_size(NAV_ICON)
+                        .flex_shrink_0()
                         .when(!collapsed, |ic| {
                             ic.rotate(gpui::Radians(std::f32::consts::FRAC_PI_2))
                         }),
-                ),
+                )
+                .child(text),
         )
 }
 
@@ -7069,7 +7483,7 @@ fn usage_bar_row(
     let frac = (count as f32 / max.max(1) as f32).clamp(0., 1.);
     h_flex()
         .h(SPACE_XXL)
-        .gap(SPACE_SM)
+        .gap(ICON_TEXT_GAP)
         .items_center()
         .when_some(lead, |row, lead| {
             row.child(
@@ -8274,7 +8688,7 @@ fn thinking_panel(
                 .w_full()
                 .min_w_0()
                 .items_center()
-                .gap(px(7.))
+                .gap(ICON_TEXT_GAP)
                 .px(SPACE_MD)
                 .py(SPACE_SM)
                 .cursor_pointer()
@@ -8389,7 +8803,7 @@ fn tool_cluster(
                 .w_full()
                 .min_w_0()
                 .items_center()
-                .gap(px(7.))
+                .gap(ICON_TEXT_GAP)
                 .px(SPACE_MD)
                 .py(SPACE_SM)
                 .cursor_pointer()
@@ -8633,6 +9047,11 @@ pub(crate) fn session_tally(n: i64) -> String {
     crate::tp!("{} session", "{} sessions", n)
 }
 
+/// "N files"(Memory locations 的行)
+pub(crate) fn file_tally(n: i64) -> String {
+    crate::tp!("{} file", "{} files", n)
+}
+
 /// 远程会话的 @host 徽章:填充胶囊但用 primary 淡底 + primary 字,与紧邻的 muted
 /// 项目胶囊拉开(描边版、muted 填充版都试过,用户否决 2026-09-03)。列表行与 ⌘K
 /// 结果行共用;详情页的描边版是有意的第三种
@@ -8740,7 +9159,7 @@ fn detail_header_frame(
                     h_flex()
                         .flex_1()
                         .min_w_0()
-                        .gap(SPACE_SM)
+                        .gap(ICON_TEXT_GAP)
                         .items_center()
                         .text_size(FONT_LABEL)
                         .text_color(theme.muted_foreground)
@@ -8868,7 +9287,7 @@ fn sidebar_row(
         .child(
             h_flex()
                 .w_full()
-                .gap(SPACE_SM)
+                .gap(ICON_TEXT_GAP)
                 .child(
                     // 定宽槽位保证文字起点统一;内部居中,使小图标的中心也落在
                     // LEAD_AXIS 上(左对齐会让 14/15px 图标的中心偏离轴 1.5~2pt)
@@ -8881,7 +9300,7 @@ fn sidebar_row(
                         .child(match lead {
                             // 线条图标比实心品牌图视觉轻,给它小一档才平衡
                             RowLead::Icon(ic) => ic
-                                .with_size(if sub { px(14.) } else { px(15.) })
+                                .with_size(if sub { px(14.) } else { NAV_ICON })
                                 .text_color(if active {
                                     theme.sidebar_accent_foreground
                                 } else {

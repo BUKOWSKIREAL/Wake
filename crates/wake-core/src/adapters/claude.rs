@@ -27,11 +27,14 @@ const KNOWN_SKIP_TYPES: &[&str] = &[
 
 pub struct ClaudeAdapter {
     root: PathBuf,
+    /// `~/.claude`(全局 CLAUDE.md 的所在);直接选中 projects 目录的自定义根 / 远程
+    /// 镜像没有 home——不越界摸父目录(不变量 8⑨)
+    home: Option<PathBuf>,
     /// 默认根(本机自己的 ~/.claude):项目目录名才能在本机文件系统上反推——目录名
     /// 指的是写下会话的那台机器上的路径,自定义根(别处拷来的、远程镜像)反推不得
     local: bool,
     /// auto-memory 文档,按目录指纹缓存(每轮扫描都会列,指纹没变不重读)
-    memories: MtimeCache<Vec<MemoryDoc>>,
+    memories: super::MemoryCache,
     /// 目录名 → 反推出的项目路径,进程内记住(含反推失败):反推要从 `/` 逐层
     /// read_dir + stat,答案又几乎不变,每轮扫描重走一遍是白费;目录后来才出现的
     /// 极少数情况重启即可
@@ -40,16 +43,33 @@ pub struct ClaudeAdapter {
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
-        let root = super::home_dir()
-            .unwrap_or_default()
-            .join(".claude")
-            .join("projects");
+        let home = super::home_dir().unwrap_or_default().join(".claude");
         Self {
-            root,
+            root: home.join("projects"),
+            home: Some(home),
             local: true,
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
             decoded: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// auto-memory 树 `projects/<dir>/memory/*.md` 展开成读取单元:每个项目目录的记忆
+    /// 挂到该目录最新的会话上(见 newest_session_key);目录里没有会话(Claude 按
+    /// cleanupPeriodDays 清过)就从目录名在本机磁盘上反推项目路径(decode_project_dir,
+    /// 只对默认根),反推不出才落 Unknown project。projects/ 不在 = 没有记忆;列不出来
+    ///(权限、I/O、fd 耗尽)是"不知道",报 Err 让 scanner 冻结这一来源——折成空会把
+    /// 库里 Claude 的记忆整组删光(2026-09-21 review)
+    fn tree_units(&self, source: &MemorySource) -> Result<Vec<super::MemoryUnit>> {
+        super::project_tree_units(source, |project| {
+            let session_key = newest_session_key(&project.path()).unwrap_or_default();
+            let project_path = if session_key.is_empty() && self.local {
+                self.project_path_of_dir(&project.file_name().to_string_lossy())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (session_key, project_path)
+        })
     }
 
     /// `decode_project_dir` 的记忆版
@@ -702,59 +722,51 @@ impl AgentAdapter for ClaudeAdapter {
         Some(self.session_paths(meta))
     }
 
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
-        // auto-memory:projects/<dir>/memory/*.md(MEMORY.md 索引 + 逐条主题文件)。
-        // 每个项目目录的记忆挂到该目录最新的会话上(见 newest_session_key);目录里
-        // 没有会话(Claude 按 cleanupPeriodDays 清过)就从目录名在本机磁盘上反推
-        // 项目路径(decode_project_dir,只对默认根),反推不出才落 Unknown project
-        // projects/ 不在 = 没有记忆;列不出来(权限、I/O、fd 耗尽)是"不知道",报 Err
-        // 让 scanner 冻结这一组——折成空会把库里 Claude 的记忆整组删光(2026-09-21 review)
-        let projects = match fs::read_dir(&self.root) {
-            Ok(projects) => projects,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(anyhow::Error::new(e).context(self.root.display().to_string())),
-        };
-        let mut dirs: Vec<super::MemoryDir> = projects
-            .flatten()
-            .filter_map(|project| {
-                let dir = project.path().join("memory");
-                if !dir.is_dir() {
-                    return None;
-                }
-                let session_key = newest_session_key(&project.path()).unwrap_or_default();
-                let project_path = if session_key.is_empty() && self.local {
-                    self.project_path_of_dir(&project.file_name().to_string_lossy())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                Some(super::MemoryDir {
-                    scope: MemoryScope::Project,
-                    session_key,
-                    project_path,
-                    dir,
-                })
-            })
-            .collect();
-        dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
-        super::cached_memory_docs(&self.memories, AgentId::ClaudeCode, &dirs)
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        // auto-memory 树(agent 记的、按项目)+ 全局 CLAUDE.md(用户写的指令,对每个
+        // 项目都成立);项目根下的 CLAUDE.md 由 project_instruction_sources 给
+        let mut v = vec![MemorySource {
+            agent: AgentId::ClaudeCode,
+            kind: MemorySourceKind::ProjectTree,
+            path: self.root.clone(),
+        }];
+        if let Some(home) = &self.home {
+            v.push(MemorySource {
+                agent: AgentId::ClaudeCode,
+                kind: MemorySourceKind::File,
+                path: home.join("CLAUDE.md"),
+            });
+        }
+        v
     }
 
-    fn memory_roots(&self) -> Vec<PathBuf> {
-        vec![self.root.clone()]
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        super::memory_docs_with_tree(
+            &self.memories,
+            AgentId::ClaudeCode,
+            sources,
+            projects,
+            |tree| self.tree_units(tree),
+        )
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
-        // 选中 `~/.claude` 形态(含 projects/)或直接选中 projects 目录都认
-        let root = if dir.join("projects").is_dir() {
-            dir.join("projects")
+        // 选中 `~/.claude` 形态(含 projects/)或直接选中 projects 目录都认;只有前者
+        // 有 home(全局 CLAUDE.md 的所在),裸 projects 目录不摸父目录
+        let (root, home) = if dir.join("projects").is_dir() {
+            (dir.join("projects"), Some(dir))
         } else {
-            dir
+            (dir, None)
         };
         Box::new(Self {
             root,
+            home,
             local: false,
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
             decoded: std::sync::Mutex::new(HashMap::new()),
         })
     }

@@ -68,10 +68,13 @@ pub const REMOTE_LAYOUTS: &[RemoteAgentLayout] = &[
             ".codex/archived_sessions",
             ".codex/state_5.sqlite",
             ".codex/state_5.sqlite-wal",
-            // 记忆:用户级 Markdown 与逐线程的整合库(list_memories 读)
+            // 记忆:用户级 Markdown 与逐线程的整合库(list_memories 读);全局指令
+            // AGENTS.md 与 rules/*.rules 同属 home 直属、不是凭证
             ".codex/memories",
             ".codex/memories_1.sqlite",
             ".codex/memories_1.sqlite-wal",
+            ".codex/AGENTS.md",
+            ".codex/rules",
         ],
         exclude: &[],
     },

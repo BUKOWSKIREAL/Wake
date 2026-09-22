@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 /// data:{content:[{kind:text,data}],meta:{timestamp:unix秒}}};.history 忽略。
 pub struct KiroAdapter {
     root: PathBuf,
+    /// 指令文件(项目根下的)与自定义来源按指纹缓存,每轮扫描只 stat
+    memories: super::MemoryCache,
 }
 
 impl KiroAdapter {
@@ -22,6 +24,7 @@ impl KiroAdapter {
                 .join(".kiro")
                 .join("sessions")
                 .join("cli"),
+            memories: super::MemoryCache::new(),
         }
     }
 }
@@ -191,6 +194,15 @@ impl AgentAdapter for KiroAdapter {
         })
     }
 
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        // 只有项目指令文件与用户加的自定义来源;trait 默认实现没处放缓存、每轮都重读
+        super::generic_memory_docs(&self.memories, AgentId::Kiro, sources, projects)
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // `~/.kiro`/`~/.kiro/sessions`/`~/.kiro/sessions/cli` 三层都认
         let root = if dir.join("sessions").join("cli").is_dir() {
@@ -200,7 +212,10 @@ impl AgentAdapter for KiroAdapter {
         } else {
             dir
         };
-        Box::new(Self { root })
+        Box::new(Self {
+            root,
+            memories: super::MemoryCache::new(),
+        })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {

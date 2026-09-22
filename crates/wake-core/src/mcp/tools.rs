@@ -216,7 +216,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": LIST_MEMORIES,
             "title": "List agent memory files",
-            "description": "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files) and Codex's memories — read-only, grouped by project, user-level ones last. Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas. Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
+            "description": "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files), Codex's memories — plus the instruction files the user keeps for them (CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules, .kiro/steering, copilot-instructions.md), read-only, grouped by project, user memory (the notes that apply to every project) last. Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas. Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -613,7 +613,7 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
     let (project, unmatched) = memory_project_scope(ctx, args)?;
     if let Some(text) = unmatched {
         // 会话没有这个项目,但用户级记忆对每个项目都成立——提示之余照样查一遍
-        let memory = memory_hits_section(ctx, query, &agents, &project)?;
+        let memory = memory_hits_section(ctx, query, &agents, &project, since)?;
         let mut out = text;
         if !memory.is_empty() {
             // 提示文本不带收尾换行,记忆段自带前导空行;没命中就一字不加
@@ -646,7 +646,7 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
     }
     let scope = scope_note(&project, &agents, since, false);
     // 记忆命中是另一类数据,不与会话命中混排,作为尾巴附在两种结果后面
-    let memory = memory_hits_section(ctx, query, &agents, &project)?;
+    let memory = memory_hits_section(ctx, query, &agents, &project, since)?;
     let mut out = String::new();
     if order.is_empty() {
         out.push_str(&format!("No session matches `{query}`{scope}.\n"));
@@ -719,13 +719,17 @@ fn memory_hits_section(
     query: &str,
     agents: &[AgentId],
     project: &Option<Vec<String>>,
+    since: Option<i64>,
 ) -> Result<String, ToolError> {
+    // since 同样约束记忆命中:说了 "in the last 24 hours" 就不能跟着几个月前的笔记
     let hits = ctx.store.search_memories(
         query,
         &MemoryFilter {
             agents: agents.to_vec(),
             project_paths: project.clone().unwrap_or_default(),
             unattributed: false,
+            user: UserMemories::Alongside,
+            updated_since: since,
             limit: MEMORY_HITS_IN_SEARCH,
         },
     )?;
@@ -751,7 +755,7 @@ fn memory_hits_section(
 fn memory_label(d: &MemoryDoc) -> String {
     // 标题入库时已按 MEMORY_TITLE_MAX 折行封顶;老库里的行要等文件变了才重读,这里再兜一道
     let mut s = format!(
-        "{} · {} · {}",
+        "{} · {} · {} memory",
         one_line(&d.title, crate::adapters::MEMORY_TITLE_MAX),
         d.agent.display_name(),
         d.scope.label()
@@ -765,7 +769,7 @@ fn memory_label(d: &MemoryDoc) -> String {
 /// 记忆归属哪一组(列表的组头、搜索命中的归属都用它);分组判据在 `MemoryDoc::group`
 fn memory_group(d: &MemoryDoc) -> String {
     match d.group() {
-        MemoryGroup::User => "User-level (applies to every project)".to_string(),
+        MemoryGroup::User => "User memory (applies to every project)".to_string(),
         MemoryGroup::Unknown => "Unknown project".to_string(),
         MemoryGroup::Project { path, name } => format!("{path} — {name}"),
     }
@@ -788,6 +792,8 @@ fn list_memories(ctx: &ToolContext, args: &Value) -> ToolResult {
         agents: agents.clone(),
         project_paths: project.clone().unwrap_or_default(),
         unattributed: false,
+        user: UserMemories::Alongside,
+        updated_since: None,
         limit,
     })?;
     let scope = scope_note(&project, &agents, None, false);
@@ -795,18 +801,18 @@ fn list_memories(ctx: &ToolContext, args: &Value) -> ToolResult {
     if let Some(text) = unmatched {
         let first_line = text.lines().next().unwrap_or_default();
         out.push_str(&format!(
-            "{first_line} Only user-level memory files, which apply everywhere, are listed below.\n\n"
+            "{first_line} Only user memory, which applies everywhere, is listed below.\n\n"
         ));
     }
     if docs.is_empty() {
         out.push_str(&format!(
-            "No memory files{scope}. Claude Code writes them under ~/.claude/projects/<project>/memory/ once it has saved something about a project; Codex keeps its own under ~/.codex/memories/; ZCode under ~/.zcode/cli/memories/projects/. Wake only lists what is there.\n\n"
+            "No memory files{scope}. Claude Code writes them under ~/.claude/projects/<project>/memory/ once it has saved something about a project; Codex keeps its own under ~/.codex/memories/; ZCode under ~/.zcode/cli/memories/projects/; instruction files such as CLAUDE.md or AGENTS.md are listed from the project roots Wake has sessions for. Wake only lists what is there.\n\n"
         ));
         out.push_str(&index_note(ctx.store));
         return Ok(out);
     }
     out.push_str(&format!(
-        "{} memory file{}{scope}, grouped by project (user-level last; the limit applies to project-level files, user-level ones are always included).\n",
+        "{} memory file{}{scope}, grouped by project (user memory last; the limit applies to project memory, user memory is always included).\n",
         docs.len(),
         plural(docs.len() as i64)
     ));
@@ -864,7 +870,7 @@ fn get_memory(ctx: &ToolContext, key: &str, args: &Value) -> ToolResult {
         fmt_time(Some(doc.updated_at)),
         doc.path
     ));
-    let (text, truncated) = crate::adapters::parse_utils::clip(&body, max_chars);
+    let (text, truncated) = crate::adapters::parse_utils::clip_chars(&body, max_chars);
     out.push_str(&text);
     if !text.ends_with('\n') {
         out.push('\n');

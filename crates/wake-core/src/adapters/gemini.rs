@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 pub struct GeminiAdapter {
     root: PathBuf,
     projects_json: PathBuf,
+    /// `~/.gemini`(全局 GEMINI.md 的所在);直接选中 tmp 目录的自定义根 / 远程镜像没有
+    home: Option<PathBuf>,
+    /// 指令文件(全局 GEMINI.md + 项目根的 GEMINI.md)按指纹缓存
+    memories: super::MemoryCache,
     /// slug → 项目路径映射,按 projects.json mtime 缓存(全量刷新时逐会话调用)
     slug_cache: std::sync::Mutex<Option<(i64, HashMap<String, String>)>>,
 }
@@ -25,6 +29,8 @@ impl GeminiAdapter {
         Self {
             root: home.join("tmp"),
             projects_json: home.join("projects.json"),
+            home: Some(home),
+            memories: super::MemoryCache::new(),
             slug_cache: std::sync::Mutex::new(None),
         }
     }
@@ -279,6 +285,7 @@ impl AgentAdapter for GeminiAdapter {
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // `~/.gemini` 形态(含 tmp/)则 projects.json 在其顶层;直接选中 tmp
         // 形态则上一层找。侧档必须相对 dir 派生,落回默认家就会拿错 cwd 映射
+        let home = dir.join("tmp").is_dir().then(|| dir.clone());
         let (root, projects_json) = if dir.join("tmp").is_dir() {
             (dir.join("tmp"), dir.join("projects.json"))
         } else {
@@ -291,11 +298,37 @@ impl AgentAdapter for GeminiAdapter {
         Box::new(Self {
             root,
             projects_json,
+            home,
+            memories: super::MemoryCache::new(),
             slug_cache: std::sync::Mutex::new(None),
         })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        // Gemini 没有 agent 自己记的记忆目录;`save_memory` 工具追加的 "Gemini Added
+        // Memories" 段就在全局 GEMINI.md 里,整个文件按用户写的指令列。项目根下的
+        // GEMINI.md 由 project_instruction_sources 给
+        self.home
+            .as_ref()
+            .map(|home| {
+                vec![MemorySource {
+                    agent: AgentId::Gemini,
+                    kind: MemorySourceKind::File,
+                    path: home.join("GEMINI.md"),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        super::generic_memory_docs(&self.memories, AgentId::Gemini, sources, projects)
     }
 }

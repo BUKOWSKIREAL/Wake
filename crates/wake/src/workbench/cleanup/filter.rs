@@ -171,16 +171,20 @@ fn agent_label(
     selected: bool,
     cx: &App,
 ) -> Button {
-    option_label(button, label, selected, cx).pl(px(26.)).child(
-        // The button's content excludes its padding; return the brand icon
-        // to the reserved leading slot without shifting text on selection.
-        div()
-            .absolute()
-            .left(px(6. - 26.))
-            .top(px(6.5))
-            .size(px(15.))
-            .child(leading),
-    )
+    // 行首 6px 处放 15px 品牌图,文字从 6 + 15 + ICON_TEXT_GAP 起(与别处图标-文字同距)
+    let text_start = px(6.) + px(15.) + ICON_TEXT_GAP;
+    option_label(button, label, selected, cx)
+        .pl(text_start)
+        .child(
+            // The button's content excludes its padding; return the brand icon
+            // to the reserved leading slot without shifting text on selection.
+            div()
+                .absolute()
+                .left(px(6.) - text_start)
+                .top(px(6.5))
+                .size(px(15.))
+                .child(leading),
+        )
 }
 
 fn section(title: &'static str, selected: usize, options: Vec<Button>) -> AnyElement {

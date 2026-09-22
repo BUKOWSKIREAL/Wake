@@ -80,9 +80,11 @@ wake-cli memories --project "$PWD"
 ```
 
 The memory files agents keep for themselves — Claude Code's auto-memory, Codex's
-memories, ZCode's project memory — read-only, grouped by project, user-level ones last.
-Each entry ends with a `wake://memory/…` reference; pass it to `show` to read the file.
-Reach for it before re-deriving a project's conventions or decisions from scratch.
+memories, ZCode's project memory — plus the instruction files kept for them (CLAUDE.md,
+AGENTS.md, GEMINI.md, `.cursor/rules` …), read-only, grouped by project, user memory
+(notes that apply to every project) last. Each entry ends with a `wake://memory/…`
+reference; pass it to `show` to read the file. Reach for it before re-deriving a
+project's conventions or decisions from scratch.
 
 ## Keys, references and paging
 

@@ -110,6 +110,7 @@ icons!(
     "loader",
     "circle-x",
     "file-text",
+    "user",
     "more-horizontal",
     "hard-drive",
     "server",

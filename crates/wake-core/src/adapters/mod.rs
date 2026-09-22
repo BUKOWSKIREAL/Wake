@@ -110,21 +110,32 @@ pub trait AgentAdapter: Send + Sync {
     fn cleanup_paths(&self, _meta: &SessionMeta) -> Option<Vec<String>> {
         None
     }
-    /// 本家 agent 自己写下的记忆文档(Claude Code 的 auto-memory 目录、Codex 的
-    /// memories)——Wake 只读:列出、搜索、阅读。默认没有。正文整份带上(记忆是
-    /// 小 Markdown),但每轮扫描都会调,实现方要**先 stat 后读**:指纹没变就交
-    /// `MtimeCache`(`cached_memory_docs`),缺根返回 Ok(空);scanner 在每轮扫描
-    /// 收尾按 (agent, host) 整组替换入库,消失的文件随之出库。项目归属不在这里
+    /// 读这些来源的记忆文档——Wake 只读:列出、搜索、阅读。`sources` 已按用户配置
+    /// 裁决过(停用的不在、自定义的与项目模式在),`projects` 是已索引的本地项目根,
+    /// 给项目模式展开(远程实例传空)。正文整份带上(都是小文件),但每轮扫描都会调,
+    /// 实现方要**先 stat 后读**:指纹没变就交 `MtimeCache`(`cached_memory_docs`),
+    /// 缺根返回 Ok(空)、读失败报 Err(scanner 只冻结这些来源的行);scanner 在每轮
+    /// 扫描收尾按 (agent, host) 整组替换入库,消失的文件随之出库。项目归属不在这里
     /// 算:填 `session_key` 指向所属会话,读库时按它连 sessions 表解析(见 MemoryDoc)。
-    /// 远程装饰器必须转发并改写 key / host / session_key
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
-        Ok(Vec::new())
+    /// 默认实现读通用形态(目录 / 文件 / 项目模式)、不缓存——没有自家记忆的 agent
+    /// 只有被用户加了自定义来源或有项目指令文件时才走到。远程装饰器必须转发并改写
+    /// key / host / session_key
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[std::path::PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        cached_memory_docs(
+            &MemoryCache::new(),
+            self.agent(),
+            &generic_units(sources, projects),
+        )
     }
-    /// `list_memories` 读的根(目录,或 SQLite 型的库文件;虚拟路径以库路径开头):
-    /// 同 (agent, host) 有多个实例时,某个实例 `list_memories` 报 Err,scanner 只冻结
-    /// 它这些根下的行(不删不改),其余实例照常对账——否则一个坏 location 会让默认
-    /// 实例的记忆永远停在上次(2026-09-21 review)。实现了 list_memories 就要给
-    fn memory_roots(&self) -> Vec<std::path::PathBuf> {
+    /// 本实例默认读记忆的来源(Settings → Memory locations 的行):按实例的根派生,
+    /// 不看存不存在。项目模式(`<project>/CLAUDE.md` 一类)不在这里报——那是 agent 级
+    /// 的,由 `project_instruction_sources` 给、scanner 只挂到该家第一个本地实例上。
+    /// 停用 / 自定义由 scanner 按 store 的配置裁决后经 `list_memories` 交回。默认没有
+    fn memory_sources(&self) -> Vec<MemorySource> {
         Vec::new()
     }
     /// 一轮扫描开始前刷新 adapter 的跨会话快照。默认 adapter 没有这类状态。
@@ -189,6 +200,14 @@ pub trait AgentAdapter: Send + Sync {
     /// 败方仍留作解析失败的回退顺位。远程装饰器必须转发
     fn dedup_rank(&self) -> u8 {
         0
+    }
+    /// `parent_links` 报的边是不是一张**全局**总表(Codex 的 state DB `thread_spawn_edges`
+    /// 在 home 里,parent 的胜出文件可能归同家另一个 location)。默认 false = 边车长在
+    /// parent 自己的 location 里(Grok),scanner 只认"报边者拥有 parent"的边;true 的才
+    /// 走"parent 在库里就接受"的兜底——对 location 级边车放开兜底,备份目录里过期的边车
+    /// 会把用户已解除的关系重新挂上(2026-09-22 review)。远程装饰器必须转发
+    fn parent_links_global(&self) -> bool {
+        false
     }
 }
 
@@ -505,68 +524,434 @@ pub(crate) fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUn
         .collect()
 }
 
-/// 一个装 Markdown 记忆文件的目录(Claude 的 projects/<dir>/memory、Codex 的
-/// memories):目录里的 `*.md` 各成一份 MemoryDoc,`session_key` 是归属锚点
-/// (Claude 给该项目目录里最新的会话,项目路径读库时按它解析;用户级留空)
-pub(crate) struct MemoryDir {
+/// 记忆的一个读取单元:一个目录直属的 `*.<ext>`,或单个文件,带归属元数据。来源
+/// (`MemorySource`)展开成单元——Claude 的记忆树按项目目录各一份,项目模式按每个
+/// 已索引项目根各一份(`generic_units`)。`session_key` 是归属锚点(Claude 给该项目
+/// 目录里最新的会话,项目路径读库时按它解析;用户级留空)
+pub(crate) struct MemoryUnit {
     pub scope: MemoryScope,
+    /// 所属来源的 id(memories.source 列;停用出库、读失败冻结、Settings 计数都按它)
+    pub source: String,
     pub session_key: String,
-    /// adapter 自己就知道的项目路径(Claude 目录里没会话时从目录名反推);空 = 交给锚点
+    /// adapter 自己就知道的项目路径(Claude 目录里没会话时从目录名反推、项目模式的
+    /// 项目根);空 = 交给锚点
     pub project_path: String,
-    pub dir: std::path::PathBuf,
+    pub place: UnitPlace,
 }
 
-/// 几个记忆目录的文档,经 `MtimeCache` 缓存:每轮只 stat(路径 + mtime + size +
+pub(crate) enum UnitPlace {
+    Dir {
+        dir: std::path::PathBuf,
+        ext: &'static str,
+    },
+    File(std::path::PathBuf),
+    /// 用户加的路径:stat 到是目录就读直属 `*.<ext>`,是文件就读它自己(`Custom` 来源)
+    Path {
+        path: std::path::PathBuf,
+        ext: &'static str,
+    },
+}
+
+impl UnitPlace {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            UnitPlace::Dir { dir, .. } => dir,
+            UnitPlace::File(path) | UnitPlace::Path { path, .. } => path,
+        }
+    }
+
+    /// 项目模式的相对路径落到某个项目根下
+    fn under(&self, root: &Path) -> UnitPlace {
+        match self {
+            UnitPlace::Dir { dir, ext } => UnitPlace::Dir {
+                dir: root.join(dir),
+                ext,
+            },
+            UnitPlace::File(path) => UnitPlace::File(root.join(path)),
+            UnitPlace::Path { path, ext } => UnitPlace::Path {
+                path: root.join(path),
+                ext,
+            },
+        }
+    }
+}
+
+/// 一个来源按形态给出读取位置;记忆树与线程库是各家自己的形态,这里给 None、由 adapter
+/// 自己展开。项目模式给的是相对项目根的位置,展开时再 `under` 到每个项目根
+fn unit_place(source: &MemorySource) -> Option<UnitPlace> {
+    let path = source.path.clone();
+    Some(match source.kind {
+        MemorySourceKind::Dir { ext } | MemorySourceKind::ProjectDir { ext } => {
+            UnitPlace::Dir { dir: path, ext }
+        }
+        MemorySourceKind::File | MemorySourceKind::ProjectFile => UnitPlace::File(path),
+        MemorySourceKind::Custom => UnitPlace::Path { path, ext: "md" },
+        MemorySourceKind::ProjectTree | MemorySourceKind::ThreadDb => return None,
+    })
+}
+
+/// 通用来源(目录 / 文件 / 自定义 / 项目模式)展开成读取单元
+pub(crate) fn generic_units(
+    sources: &[MemorySource],
+    projects: &[std::path::PathBuf],
+) -> Vec<MemoryUnit> {
+    // 项目根偶尔就是某家的 home(用户在 ~/.codex 里跑过一次 codex):`<project>/AGENTS.md`
+    // 会展开成全局那份 `~/.codex/AGENTS.md`——同一文件、同一 key,后写的项目级那份会把
+    // 用户级那份顶成 ".codex" 项目的。具体来源(全局文件 / 目录)优先,项目模式展开到
+    // 已被它们覆盖的路径就跳过(2026-09-21 用户在本机数据上发现)
+    let concrete: std::collections::HashSet<&Path> = sources
+        .iter()
+        .filter(|s| !s.is_pattern())
+        .map(|s| s.path.as_path())
+        .collect();
+    let mut units = Vec::new();
+    for s in sources {
+        let Some(place) = unit_place(s) else {
+            continue;
+        };
+        let source = s.id();
+        let unit = |project_path: String, place: UnitPlace| MemoryUnit {
+            scope: s.scope(),
+            source: source.clone(),
+            session_key: String::new(),
+            project_path,
+            place,
+        };
+        if s.is_pattern() {
+            for p in projects {
+                let place = place.under(p);
+                if concrete.contains(place.path()) {
+                    continue;
+                }
+                units.push(unit(p.to_string_lossy().to_string(), place));
+            }
+        } else {
+            units.push(unit(String::new(), place));
+        }
+    }
+    units
+}
+
+/// 记忆树 `<root>/<项目目录>/memory/*.md` 展开成单元(Claude auto-memory 与 ZCode 同形):
+/// 每个含 memory/ 的子目录一份,`attribute(子目录)` 给 (归属会话 key, 项目路径)。root
+/// 不在 = 没有记忆;列不出来(权限、I/O、fd 耗尽)是"不知道",报 Err 让 scanner 冻结这一
+/// 来源——折成空会把库里这家的记忆整组删光(2026-09-21 review)。按目录排序,结果稳定
+pub(crate) fn project_tree_units(
+    source: &MemorySource,
+    attribute: impl Fn(&std::fs::DirEntry) -> (String, String),
+) -> Result<Vec<MemoryUnit>> {
+    let entries = match std::fs::read_dir(&source.path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::Error::new(e).context(source.path.display().to_string())),
+    };
+    let id = source.id();
+    let mut units: Vec<MemoryUnit> = Vec::new();
+    for entry in entries {
+        // 逐项的读取错误也是"不知道"(吞掉会让那个项目的记忆行被当成消失而出库)
+        let entry = entry.with_context(|| source.path.display().to_string())?;
+        let dir = entry.path().join("memory");
+        if !dir.is_dir() {
+            continue;
+        }
+        let (session_key, project_path) = attribute(&entry);
+        units.push(MemoryUnit {
+            scope: MemoryScope::Project,
+            source: id.clone(),
+            session_key,
+            project_path,
+            place: UnitPlace::Dir { dir, ext: "md" },
+        });
+    }
+    units.sort_by(|a, b| a.place.path().cmp(b.place.path()));
+    Ok(units)
+}
+
+/// `list_memories` 的通用骨架:通用来源展开 + 各家自己的记忆树(有 ProjectTree 来源时
+/// 交 `tree` 展开)+ 指纹缓存读取。持 `memories` 缓存的 adapter 都用它,别各写一遍
+pub(crate) fn memory_docs_with_tree(
+    cache: &MemoryCache,
+    agent: AgentId,
+    sources: &[MemorySource],
+    projects: &[std::path::PathBuf],
+    tree: impl FnOnce(&MemorySource) -> Result<Vec<MemoryUnit>>,
+) -> Result<Vec<MemoryDoc>> {
+    let mut units = generic_units(sources, projects);
+    if let Some(t) = sources
+        .iter()
+        .find(|s| s.kind == MemorySourceKind::ProjectTree)
+    {
+        units.extend(tree(t)?);
+    }
+    cached_memory_docs(cache, agent, &units)
+}
+
+/// 没有自家记忆树的 adapter 的 `list_memories`:只有通用来源(全局文件、项目指令文件、
+/// 自定义路径),经各自的 `memories` 缓存读
+pub(crate) fn generic_memory_docs(
+    cache: &MemoryCache,
+    agent: AgentId,
+    sources: &[MemorySource],
+    projects: &[std::path::PathBuf],
+) -> Result<Vec<MemoryDoc>> {
+    cached_memory_docs(cache, agent, &generic_units(sources, projects))
+}
+
+/// 各家在项目根下读的指令文件(记忆可见层二期):按 agent 静态给,scanner 只挂到该家
+/// 的第一个本地实例上(项目根是本机路径,自定义根 / 远程实例不展开)。文件名来自
+/// 各家文档:Claude 的 CLAUDE.md / CLAUDE.local.md,Codex 的 AGENTS.md,Gemini 的
+/// GEMINI.md,Cursor 的 .cursor/rules/*.mdc 与旧式 .cursorrules,Kiro 的
+/// .kiro/steering/*.md,Copilot 的 .github/copilot-instructions.md
+pub fn project_instruction_sources(agent: AgentId) -> Vec<MemorySource> {
+    let file = |rel: &str| MemorySource {
+        agent,
+        kind: MemorySourceKind::ProjectFile,
+        path: std::path::PathBuf::from(rel),
+    };
+    let dir = |rel: &str, ext: &'static str| MemorySource {
+        agent,
+        kind: MemorySourceKind::ProjectDir { ext },
+        path: std::path::PathBuf::from(rel),
+    };
+    match agent {
+        AgentId::ClaudeCode => vec![file("CLAUDE.md"), file("CLAUDE.local.md")],
+        AgentId::Codex => vec![file("AGENTS.md")],
+        AgentId::Gemini => vec![file("GEMINI.md")],
+        AgentId::Cursor => vec![dir(".cursor/rules", "mdc"), file(".cursorrules")],
+        AgentId::Kiro => vec![dir(".kiro/steering", "md")],
+        AgentId::Copilot => vec![file(".github/copilot-instructions.md")],
+        _ => Vec::new(),
+    }
+}
+
+/// 一个实例这一轮的一个来源,按 Settings → Memory locations 的配置标好开关
+pub struct PlannedSource {
+    pub source: MemorySource,
+    /// 没被用户停用
+    pub enabled: bool,
+    /// 用户添加的(Settings 里可编辑、可删);默认来源只能开关
+    pub custom: bool,
+}
+
+/// 一个实例(或没有实例的一家)这一轮要读的来源
+pub struct PlannedInstance {
+    /// roster 下标;None = 该家没有本地实例(会话 location 全停用了),只剩 agent 级来源
+    pub adapter: Option<usize>,
+    pub agent: AgentId,
+    /// 实例的 host(远程镜像);没有实例的一家恒为本地
+    pub host: String,
+    pub sources: Vec<PlannedSource>,
+}
+
+/// 各家这一轮的记忆来源:实例自己报的默认来源 + **该家第一个本地实例**再挂 agent 级的
+/// 项目模式(`project_instruction_sources`)与用户的自定义来源(默认实例在 roster 前段;
+/// 默认被移除时落到首个自定义实例),再按停用表标 `enabled`。会话 location 全停用、roster
+/// 里没有实例的家,agent 级来源照旧归它(`adapter: None`):项目指令文件与自定义路径不在
+/// 被停用的 location 里,不该随它消失,停掉的只是从那个根派生的默认来源——原先这种家直接
+/// 从计划里消失,scanner 把它整组删光、Settings 里连自定义行都看不见了(2026-09-22 review)。
+/// 这条规矩只在这里:scanner 读 enabled 的,Settings 面板全列(画开关),表单查重也看它——
+/// 原先三处各写一遍,GUI 还自己拼来源 id、假定它等于路径(2026-09-22 /simplify)
+pub fn memory_source_plan(
+    adapters: &[Box<dyn AgentAdapter>],
+    customs: &[(AgentId, std::path::PathBuf)],
+    disabled: &std::collections::HashSet<(AgentId, String)>,
+) -> Vec<PlannedInstance> {
+    let agent_level = |agent: AgentId| -> Vec<(MemorySource, bool)> {
+        project_instruction_sources(agent)
+            .into_iter()
+            .map(|s| (s, false))
+            .chain(
+                customs
+                    .iter()
+                    .filter(|(a, _)| *a == agent)
+                    .map(|(_, path)| (MemorySource::custom(agent, path.clone()), true)),
+            )
+            .collect()
+    };
+    let planned = |agent: AgentId, sources: Vec<(MemorySource, bool)>| -> Vec<PlannedSource> {
+        sources
+            .into_iter()
+            .map(|(source, custom)| PlannedSource {
+                enabled: !disabled.contains(&(agent, source.id())),
+                source,
+                custom,
+            })
+            .collect()
+    };
+    let mut agent_level_taken: std::collections::HashSet<AgentId> =
+        std::collections::HashSet::new();
+    let mut plan: Vec<PlannedInstance> = adapters
+        .iter()
+        .enumerate()
+        .map(|(ix, adapter)| {
+            let agent = adapter.agent();
+            let mut sources: Vec<(MemorySource, bool)> = adapter
+                .memory_sources()
+                .into_iter()
+                .map(|s| (s, false))
+                .collect();
+            if adapter.host().is_empty() && agent_level_taken.insert(agent) {
+                sources.extend(agent_level(agent));
+            }
+            PlannedInstance {
+                adapter: Some(ix),
+                agent,
+                host: adapter.host().to_string(),
+                sources: planned(agent, sources),
+            }
+        })
+        .collect();
+    for agent in AgentId::ALL.iter().copied() {
+        if agent_level_taken.contains(&agent) {
+            continue;
+        }
+        let sources = agent_level(agent);
+        if sources.is_empty() {
+            continue;
+        }
+        plan.push(PlannedInstance {
+            adapter: None,
+            agent,
+            host: String::new(),
+            sources: planned(agent, sources),
+        });
+    }
+    plan
+}
+
+/// 记忆文档按来源缓存:key = 这次读的来源 id(多个就按序拼),值 = (指纹, docs)。scanner
+/// 逐来源调 `list_memories`(一个来源读失败只冻结它自己),单槽的 `MtimeCache` 会在来源
+/// 之间来回失效(2026-09-22 review)。失败不缓存
+pub(crate) struct MemoryCache(
+    std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<MemoryDoc>)>>,
+);
+
+impl MemoryCache {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn get_or_build(
+        &self,
+        key: &str,
+        stamp: i64,
+        build: impl FnOnce() -> Result<Vec<MemoryDoc>>,
+    ) -> Result<Vec<MemoryDoc>> {
+        if let Some((s, docs)) = self.0.lock().unwrap().get(key) {
+            if *s == stamp {
+                return Ok(docs.clone());
+            }
+        }
+        let docs = build()?;
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (stamp, docs.clone()));
+        Ok(docs)
+    }
+}
+
+/// (路径, mtime, size):读取单元下一份文件的指纹
+type FileStamp = (std::path::PathBuf, i64, i64);
+
+/// 一个读取单元下要读的文件:目录列直属 `*.<ext>`,文件就它自己,`Path` 按 stat 到的形状
+/// 二选一。不存在 = 没有记忆(None);列不出来、stat 不到 = 不知道,报 Err——静默当成空
+/// 会让库里那组被删(与读正文失败同一条规矩)。stat 跟符号链接(与会话枚举的
+/// default_file_ref 同判据)
+fn unit_files(place: &UnitPlace) -> Result<Option<Vec<FileStamp>>> {
+    fn stat(path: &Path) -> Result<Option<std::fs::Metadata>> {
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(path.display().to_string())),
+        }
+    }
+    fn dir_files(dir: &Path, ext: &str) -> Result<Option<Vec<FileStamp>>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow::Error::new(e).context(dir.display().to_string())),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| dir.display().to_string())?;
+            let path = entry.path();
+            if !path.extension().is_some_and(|x| x == ext) {
+                continue;
+            }
+            // 挂空的符号链接、read_dir 与 stat 之间被 agent 删掉的文件 = 不在,跳过这一项;
+            // 别的 stat 失败才是"不知道"(2026-09-22 review)
+            let meta = match std::fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(anyhow::Error::new(e).context(path.display().to_string())),
+            };
+            if meta.is_file() {
+                files.push((path, parse_utils::mtime_ms(&meta), meta.len() as i64));
+            }
+        }
+        Ok(Some(files))
+    }
+    let file = |path: &Path, meta: &std::fs::Metadata| {
+        (
+            path.to_path_buf(),
+            parse_utils::mtime_ms(meta),
+            meta.len() as i64,
+        )
+    };
+    match place {
+        UnitPlace::Dir { dir, ext } => dir_files(dir, ext),
+        UnitPlace::File(path) => Ok(stat(path)?
+            .filter(|meta| meta.is_file())
+            .map(|meta| vec![file(path, &meta)])),
+        UnitPlace::Path { path, ext } => match stat(path)? {
+            None => Ok(None),
+            Some(meta) if meta.is_dir() => dir_files(path, ext),
+            Some(meta) => Ok(Some(vec![file(path, &meta)])),
+        },
+    }
+}
+
+/// 几个记忆目录的文档,经 `MemoryCache` 缓存:每轮只 stat(路径 + mtime + size +
 /// 锚点拼成指纹),指纹没变就交上一轮读好的那份,变了才重读正文——`list_memories`
 /// 每轮扫描都会调,159 份文件每轮都读是白费(2026-09-17 /simplify)。非 UTF-8 的
 /// 文件不是记忆,跳过;别的读取失败(权限、I/O)整轮报 Err、不缓存——scanner 对
 /// Err 是跳过该组不动库,下一轮再试;缓存成"少了这份"会让库里那行被删且指纹不变
 /// 就再也不读(Codex review 2026-09-17)
 pub(crate) fn cached_memory_docs(
-    cache: &parse_utils::MtimeCache<Vec<MemoryDoc>>,
+    cache: &MemoryCache,
     agent: AgentId,
-    dirs: &[MemoryDir],
+    units: &[MemoryUnit],
 ) -> Result<Vec<MemoryDoc>> {
     use std::hash::{Hash as _, Hasher as _};
-    let mut listing: Vec<(&MemoryDir, Vec<(std::path::PathBuf, i64, i64)>)> = Vec::new();
+    // 缓存槽按这次读的来源分:scanner 逐来源调,各来源的指纹互不干扰
+    let mut key: Vec<&str> = units.iter().map(|u| u.source.as_str()).collect();
+    key.sort_unstable();
+    key.dedup();
+    let key = key.join("\n");
+    let mut listing: Vec<(&MemoryUnit, Vec<FileStamp>)> = Vec::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for md in dirs {
-        // 目录不存在 = 没有记忆;列不出来、某项 stat 不到 = 不知道,整轮报 Err——
-        // 静默当成空会让库里那组被删(与下面读正文失败同一条规矩)
-        let entries = match std::fs::read_dir(&md.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(anyhow::Error::new(e).context(md.dir.display().to_string())),
+    for unit in units {
+        let Some(mut files) = unit_files(&unit.place)? else {
+            continue;
         };
-        let mut files: Vec<(std::path::PathBuf, i64, i64)> = Vec::new();
-        for entry in entries {
-            let entry = entry.with_context(|| md.dir.display().to_string())?;
-            let path = entry.path();
-            if !path.extension().is_some_and(|x| x == "md") {
-                continue;
-            }
-            let meta = entry
-                .metadata()
-                .with_context(|| path.display().to_string())?;
-            if meta.is_file() {
-                files.push((path, parse_utils::mtime_ms(&meta), meta.len() as i64));
-            }
-        }
         if files.is_empty() {
             continue;
         }
         files.sort();
-        md.session_key.hash(&mut hasher);
-        md.project_path.hash(&mut hasher);
+        unit.source.hash(&mut hasher);
+        unit.session_key.hash(&mut hasher);
+        unit.project_path.hash(&mut hasher);
         files.hash(&mut hasher);
-        listing.push((md, files));
+        listing.push((unit, files));
     }
     let stamp = hasher.finish() as i64;
-    cache.get_or_build_result(stamp, || {
+    cache.get_or_build(&key, stamp, || {
         let mut docs = Vec::new();
-        for (md, files) in &listing {
+        for (unit, files) in &listing {
             for (path, updated_at, size_bytes) in files {
-                if let Some(doc) = memory_doc_from_file(agent, md, path, *updated_at, *size_bytes)?
+                if let Some(doc) =
+                    memory_doc_from_file(agent, unit, path, *updated_at, *size_bytes)?
                 {
                     docs.push(doc);
                 }
@@ -581,12 +966,12 @@ pub(crate) fn cached_memory_docs(
 pub const MEMORY_TITLE_MAX: usize = 120;
 
 /// 读一份 Markdown 记忆文件成 MemoryDoc:标题取 frontmatter 的 description,其次
-/// name,再退文件名;正文原样保留(含 frontmatter,阅读面照渲染)。项目路径不在这里
-/// 填(读库时按 session_key 解析)。非 UTF-8 给 Ok(None)(不是记忆),其余读取失败
-/// 原样报错
+/// name,再退文件名(带扩展名——"CLAUDE.md" / "MEMORY.md" 本身就是它的名字);正文
+/// 原样保留(含 frontmatter,阅读面照渲染)。项目路径不在这里填(读库时按 session_key
+/// 解析)。非 UTF-8 给 Ok(None)(不是记忆),其余读取失败原样报错
 fn memory_doc_from_file(
     agent: AgentId,
-    dir: &MemoryDir,
+    unit: &MemoryUnit,
     path: &Path,
     updated_at: i64,
     size_bytes: i64,
@@ -596,8 +981,8 @@ fn memory_doc_from_file(
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
         Err(e) => return Err(anyhow::Error::new(e).context(path.display().to_string())),
     };
-    let stem = path
-        .file_stem()
+    let fallback = path
+        .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     // description 是一句话,本机实测有 565 字符的:折行、按字符封顶,列表与 MCP 一行
@@ -605,24 +990,25 @@ fn memory_doc_from_file(
     let title = frontmatter_field(&body, "description")
         .or_else(|| frontmatter_field(&body, "name"))
         .map(|t| crate::text::one_line(&t, MEMORY_TITLE_MAX))
-        .unwrap_or(stem);
+        .unwrap_or(fallback);
     let path_str = path.to_string_lossy().to_string();
     Ok(Some(MemoryDoc {
         key: session_key(agent, "", &path_str),
         agent,
         host: String::new(),
-        scope: dir.scope,
-        project_path: dir.project_path.clone(),
-        project_name: if dir.project_path.is_empty() {
+        scope: unit.scope,
+        project_path: unit.project_path.clone(),
+        project_name: if unit.project_path.is_empty() {
             String::new()
         } else {
-            parse_utils::project_name_of(&dir.project_path)
+            parse_utils::project_name_of(&unit.project_path)
         },
-        session_key: dir.session_key.clone(),
+        session_key: unit.session_key.clone(),
         path: path_str,
         title,
         updated_at,
         size_bytes,
+        source: unit.source.clone(),
         body,
     }))
 }

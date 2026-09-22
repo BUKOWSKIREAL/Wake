@@ -24,7 +24,7 @@ pub struct CodexAdapter {
     home: Option<PathBuf>,
     /// memories/*.md 按目录指纹缓存、memories_1.sqlite 的线程记忆按库戳缓存
     /// (每轮扫描都会列,没变不重读)
-    memories: MtimeCache<Vec<MemoryDoc>>,
+    memories: super::MemoryCache,
     thread_memories: MtimeCache<Vec<MemoryDoc>>,
 }
 
@@ -44,7 +44,7 @@ impl CodexAdapter {
             scan_archived: true,
             links_cache: MtimeCache::new(),
             home: Some(root),
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),
         }
     }
@@ -991,13 +991,18 @@ fn build_meta(r: &SessionFileRef, p: &CodexParse, archived_dir: &Path) -> Sessio
 /// 不记——把一次瞬时失败缓存成"没有"会让库里的线程记忆整组被删,而戳不动就再也
 /// 不读(Codex 不在跑时文件 mtime 是静止的)。schema 按 2026-09 的库推断,本机零
 /// 行、未经真数据验证
-fn thread_memories(db: &Path, cache: &MtimeCache<Vec<MemoryDoc>>) -> Option<Vec<MemoryDoc>> {
-    cache.get_or_try_build(super::sqlite_ro::db_cache_stamp(db), || {
-        read_thread_memories(db)
+fn thread_memories(
+    source: &MemorySource,
+    cache: &MtimeCache<Vec<MemoryDoc>>,
+) -> Option<Vec<MemoryDoc>> {
+    cache.get_or_try_build(super::sqlite_ro::db_cache_stamp(&source.path), || {
+        read_thread_memories(&source.path, &source.id())
     })
 }
 
-fn read_thread_memories(db: &Path) -> Option<Vec<MemoryDoc>> {
+/// `source` 是来源 id(memories.source 列),由调用方从 MemorySource 取——别在这里按路径
+/// 重新拼一遍(id 规则一变这里就静默对不上,2026-09-22 /simplify)
+fn read_thread_memories(db: &Path, source: &str) -> Option<Vec<MemoryDoc>> {
     if !db.is_file() {
         return Some(Vec::new());
     }
@@ -1073,6 +1078,7 @@ fn read_thread_memories(db: &Path) -> Option<Vec<MemoryDoc>> {
             // 秒还是毫秒未验证,交 epoch_ms 统一裁定
             updated_at: epoch_ms(generated),
             size_bytes: body.len() as i64,
+            source: source.to_string(),
             path,
             body,
         });
@@ -1177,6 +1183,11 @@ impl AgentAdapter for CodexAdapter {
         Some(r)
     }
 
+    fn parent_links_global(&self) -> bool {
+        // thread_spawn_edges 是 home 里的一张总表,parent 的胜出文件可能归同家另一个 location
+        true
+    }
+
     fn manages_parent_links(&self) -> bool {
         true
     }
@@ -1252,35 +1263,44 @@ impl AgentAdapter for CodexAdapter {
         Some(self.session_paths(meta))
     }
 
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
-        // memories/ 与 memories_1.sqlite 是 CODEX_HOME 直属;只选了 sessions 目录或
-        // 裸 rollout 拷贝的自定义根没有 home,那里就没有记忆(不摸父目录)
+    fn memory_sources(&self) -> Vec<MemorySource> {
+        // memories/ 与 memories_1.sqlite(agent 记的)、AGENTS.md 与 rules/*.rules(用户
+        // 写的指令)都是 CODEX_HOME 直属;只选了 sessions 目录或裸 rollout 拷贝的自定义
+        // 根没有 home,那里就没有记忆(不摸父目录)。项目根下的 AGENTS.md 由
+        // project_instruction_sources 给
         let Some(home) = &self.home else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let mut out = super::cached_memory_docs(
-            &self.memories,
-            AgentId::Codex,
-            &[super::MemoryDir {
-                scope: MemoryScope::User,
-                session_key: String::new(),
-                project_path: String::new(),
-                dir: home.join("memories"),
-            }],
-        )?;
-        let db = home.join("memories_1.sqlite");
-        let threads = thread_memories(&db, &self.thread_memories)
-            .ok_or_else(|| anyhow::anyhow!("{} exists but could not be read", db.display()))?;
-        out.extend(threads);
-        Ok(out)
+        let source = |kind, rel: &str| MemorySource {
+            agent: AgentId::Codex,
+            kind,
+            path: home.join(rel),
+        };
+        vec![
+            source(MemorySourceKind::Dir { ext: "md" }, "memories"),
+            source(MemorySourceKind::ThreadDb, "memories_1.sqlite"),
+            source(MemorySourceKind::File, "AGENTS.md"),
+            source(MemorySourceKind::Dir { ext: "rules" }, "rules"),
+        ]
     }
 
-    fn memory_roots(&self) -> Vec<PathBuf> {
-        // 线程记忆的虚拟路径 `<db>#<thread_id>` 以库路径开头,按前缀就能认
-        self.home
-            .as_ref()
-            .map(|home| vec![home.join("memories"), home.join("memories_1.sqlite")])
-            .unwrap_or_default()
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        let mut out =
+            super::generic_memory_docs(&self.memories, AgentId::Codex, sources, projects)?;
+        if let Some(db) = sources
+            .iter()
+            .find(|s| s.kind == MemorySourceKind::ThreadDb)
+        {
+            let threads = thread_memories(db, &self.thread_memories).ok_or_else(|| {
+                anyhow::anyhow!("{} exists but could not be read", db.path.display())
+            })?;
+            out.extend(threads);
+        }
+        Ok(out)
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
@@ -1309,7 +1329,7 @@ impl AgentAdapter for CodexAdapter {
             scan_archived: true,
             links_cache: MtimeCache::new(),
             home,
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),
         })
     }
@@ -1334,7 +1354,7 @@ impl AgentAdapter for CodexAdapter {
             scan_archived: self.scan_archived && !roots.contains(&self.archived_dir),
             links_cache: MtimeCache::new(),
             home: self.home.clone(),
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),
         }))
     }

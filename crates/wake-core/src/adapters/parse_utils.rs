@@ -766,6 +766,15 @@ pub fn tool_call_view(
 }
 
 /// 截断到 max 字符(按 char 边界),返回 (text, truncated)
+/// `clip` 的按字符版:预算是字符数——记忆正文多是中文(约 3 字节一字),按字节截会把
+/// 9000 字的文件在 6600 字处截断、提示却说"20000 of 9000 characters"(2026-09-22 review)
+pub fn clip_chars(s: &str, max_chars: usize) -> (String, bool) {
+    match s.char_indices().nth(max_chars) {
+        None => (s.to_string(), false),
+        Some((end, _)) => (format!("{}\n… (truncated)", &s[..end]), true),
+    }
+}
+
 pub fn clip(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
@@ -988,6 +997,15 @@ pub fn make_preview(input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_chars_counts_characters() {
+        let s = "记忆正文一共九个字";
+        assert_eq!(clip_chars(s, 9), (s.to_string(), false));
+        let (cut, truncated) = clip_chars(s, 4);
+        assert!(truncated);
+        assert!(cut.starts_with("记忆正文\n…"), "{cut}");
+    }
 
     const IMAGE_SHAPES: &str = include_str!("../../tests/fixtures/image_content_shapes.json");
 

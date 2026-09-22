@@ -83,7 +83,7 @@ pub struct ZcodeAdapter {
     /// tasks-index 里要藏的会话 id,按它自己的 mtime 缓存
     hidden_cache: MtimeCache<HashSet<String>>,
     /// 记忆文档按目录指纹缓存(每轮扫描都会列,没变不重读)
-    memories: MtimeCache<Vec<MemoryDoc>>,
+    memories: super::MemoryCache,
 }
 
 #[derive(Clone)]
@@ -163,7 +163,7 @@ impl ZcodeAdapter {
             home: Some(home),
             rows_cache: MtimeCache::new(),
             hidden_cache: MtimeCache::new(),
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
         }
     }
 
@@ -175,12 +175,35 @@ impl ZcodeAdapter {
             home: None,
             rows_cache: MtimeCache::new(),
             hidden_cache: MtimeCache::new(),
-            memories: MtimeCache::new(),
+            memories: super::MemoryCache::new(),
         }
     }
 
     fn open(&self) -> Option<SqliteRo> {
         open_sqlite_ro(&self.db, "zcode")
+    }
+
+    /// `cli/memories/projects/<slug>-<hash>/memory/*.md` 展开成读取单元。目录名的 hash
+    /// 对应库里会话的 directory(见 memory_dir_hash);库读不出就都对不上,记忆照列、
+    /// 落 Unknown project。没这个目录 = 确定没有记忆;别的读取失败报 Err,scanner 只
+    /// 冻结这一来源
+    fn tree_units(&self, source: &MemorySource) -> Result<Vec<super::MemoryUnit>> {
+        let workspaces: HashMap<String, String> = self
+            .rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (memory_dir_hash(&row.directory), row.directory))
+            .collect();
+        super::project_tree_units(source, |entry| {
+            let project_path = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.rsplit_once('-'))
+                .and_then(|(_, hash)| workspaces.get(hash))
+                .cloned()
+                .unwrap_or_default();
+            (String::new(), project_path)
+        })
     }
 
     /// 行清单。库这一刻读不出(ZCode 原地 migration、copy 梯度失败)交回**上一次读到
@@ -418,7 +441,16 @@ impl AgentAdapter for ZcodeAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let rows = self.rows().unwrap_or_default();
+        // 库不在 = 没有会话(Ok 空,不变量 8①);库在但从没读成功过(ZCode 常驻、正在原地
+        // migration)= 不知道,报 Err 让这一轮扫描停下——折成空会让 seen_paths 清理把整家
+        // 会话当"磁盘已删"删掉、下一轮再全部重解析回来(2026-09-22 review)
+        let rows = match self.rows() {
+            Some(rows) => rows,
+            None if self.db.is_file() => {
+                anyhow::bail!("{} exists but could not be read", self.db.display())
+            }
+            None => Vec::new(),
+        };
         let hidden = self.hidden();
         Ok(rows
             .into_iter()
@@ -457,56 +489,27 @@ impl AgentAdapter for ZcodeAdapter {
         vec![self.db.clone()]
     }
 
-    fn memory_roots(&self) -> Vec<PathBuf> {
+    fn memory_sources(&self) -> Vec<MemorySource> {
         self.home
             .as_ref()
-            .map(|home| vec![home.join(MEMORIES_REL)])
+            .map(|home| {
+                vec![MemorySource {
+                    agent: AgentId::Zcode,
+                    kind: MemorySourceKind::ProjectTree,
+                    path: home.join(MEMORIES_REL),
+                }]
+            })
             .unwrap_or_default()
     }
 
-    fn list_memories(&self) -> Result<Vec<MemoryDoc>> {
-        let Some(home) = &self.home else {
-            return Ok(Vec::new());
-        };
-        let projects = home.join(MEMORIES_REL);
-        let entries = match std::fs::read_dir(&projects) {
-            Ok(entries) => entries,
-            // 没这个目录 = 确定没有记忆;别的读取失败报 Err,scanner 跳过这一组不动库
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(anyhow!("read {}: {e}", projects.display())),
-        };
-        // 目录名 `<slug>-<hash>` 的 hash 对应库里会话的 directory(见 memory_dir_hash);
-        // 库读不出就都对不上,记忆照列、落 Unknown project
-        let workspaces: HashMap<String, String> = self
-            .rows()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (memory_dir_hash(&row.directory), row.directory))
-            .collect();
-        let mut dirs: Vec<super::MemoryDir> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let dir = entry.path().join("memory");
-                if !dir.is_dir() {
-                    return None;
-                }
-                let project_path = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.rsplit_once('-'))
-                    .and_then(|(_, hash)| workspaces.get(hash))
-                    .cloned()
-                    .unwrap_or_default();
-                Some(super::MemoryDir {
-                    scope: MemoryScope::Project,
-                    session_key: String::new(),
-                    project_path,
-                    dir,
-                })
-            })
-            .collect();
-        dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
-        super::cached_memory_docs(&self.memories, AgentId::Zcode, &dirs)
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        super::memory_docs_with_tree(&self.memories, AgentId::Zcode, sources, projects, |tree| {
+            self.tree_units(tree)
+        })
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {

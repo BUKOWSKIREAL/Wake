@@ -16,6 +16,8 @@ pub struct CopilotAdapter {
     /// rows() 的全表聚合较贵,按 db mtime 缓存一轮扫描内的重复调用
     /// (list_session_files 与 quick_meta 各调一次)
     rows_cache: Mutex<Option<(i64, Vec<CopilotRow>)>>,
+    /// 指令文件(项目根下的)与自定义来源按指纹缓存,每轮扫描只 stat
+    memories: super::MemoryCache,
 }
 
 impl CopilotAdapter {
@@ -26,6 +28,7 @@ impl CopilotAdapter {
                 .join(".copilot")
                 .join("session-store.db"),
             rows_cache: Mutex::new(None),
+            memories: super::MemoryCache::new(),
         }
     }
 
@@ -243,6 +246,15 @@ impl AgentAdapter for CopilotAdapter {
         })
     }
 
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        // 只有项目指令文件与用户加的自定义来源;trait 默认实现没处放缓存、每轮都重读
+        super::generic_memory_docs(&self.memories, AgentId::Copilot, sources, projects)
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 手输/预填的就是库文件路径时直接认,不再往下拼(Codex review)
         let db = if dir.is_file() {
@@ -253,6 +265,7 @@ impl AgentAdapter for CopilotAdapter {
         Box::new(Self {
             db,
             rows_cache: Mutex::new(None),
+            memories: super::MemoryCache::new(),
         })
     }
 

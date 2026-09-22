@@ -147,7 +147,7 @@ impl Workbench {
                                 .child(
                                     h_flex()
                                         .min_w_0()
-                                        .gap(SPACE_XS)
+                                        .gap(ICON_TEXT_GAP)
                                         .items_center()
                                         .text_size(FONT_LABEL)
                                         .text_color(theme.muted_foreground)

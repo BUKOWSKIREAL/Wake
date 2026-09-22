@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 pub struct CursorAdapter {
     root: PathBuf,
     metadata_db: Option<PathBuf>,
+    /// 指令文件(项目根下的 .cursor/rules、.cursorrules)与自定义来源按指纹缓存,每轮扫描只 stat
+    memories: super::MemoryCache,
 }
 
 impl CursorAdapter {
@@ -30,6 +32,7 @@ impl CursorAdapter {
                 .join(".cursor")
                 .join("projects"),
             metadata_db: Some(cursor_ide::default_db_path()),
+            memories: super::MemoryCache::new(),
         }
     }
 
@@ -559,6 +562,15 @@ impl AgentAdapter for CursorAdapter {
         Some(self.session_paths(meta))
     }
 
+    fn list_memories(
+        &self,
+        sources: &[MemorySource],
+        projects: &[PathBuf],
+    ) -> Result<Vec<MemoryDoc>> {
+        // 只有项目指令文件与用户加的自定义来源;trait 默认实现没处放缓存、每轮都重读
+        super::generic_memory_docs(&self.memories, AgentId::Cursor, sources, projects)
+    }
+
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 选中 `~/.cursor` 形态(含 projects/)或直接选中 projects 目录都认
         let root = if dir.join("projects").is_dir() {
@@ -570,6 +582,7 @@ impl AgentAdapter for CursorAdapter {
             root,
             // 自定义目录也用于远程缓存,不能混用本机 IDE 元数据。
             metadata_db: None,
+            memories: super::MemoryCache::new(),
         })
     }
 
@@ -617,6 +630,7 @@ impl AgentAdapter for CursorAdapter {
             Some(Box::new(Self {
                 root: PathBuf::new(),
                 metadata_db: None,
+                memories: super::MemoryCache::new(),
             }))
         } else {
             None
@@ -658,6 +672,7 @@ mod tests {
         let adapter = CursorAdapter {
             root,
             metadata_db: Some(db),
+            memories: crate::adapters::MemoryCache::new(),
         };
         let r = adapter.file_ref(&file).unwrap();
         (dir, adapter, r)
@@ -860,6 +875,7 @@ mod tests {
         let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(CursorAdapter {
             root,
             metadata_db: Some(metadata_db),
+            memories: crate::adapters::MemoryCache::new(),
         })];
         let events = Events::default();
         run_scan(&adapters, &store, &events, false).unwrap();

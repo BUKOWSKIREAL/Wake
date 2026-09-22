@@ -641,15 +641,20 @@ pub struct MemoryDoc {
     /// epoch ms
     pub updated_at: i64,
     pub size_bytes: i64,
+    /// 来自哪个来源(`MemorySource::id`):Settings 的计数、停用后的出库、读失败时的
+    /// 冻结都按它
+    pub source: String,
     /// 正文原样(含 frontmatter);文件型阅读时先读磁盘,这份是索引与兜底
     pub body: String,
 }
 
-/// Memory 页侧栏的导航计数:总数、按 agent、按解析出的项目(用户级记忆只计入
-/// 总数与 agent,不属于任何项目;没归属的记在 path 为空的那一项)
+/// Memory 页侧栏的导航计数:总数、用户级、按 agent、按解析出的项目(用户级记忆计入
+/// 总数、`user` 与 agent,不属于任何项目;没归属的记在 path 为空的那一项)
 #[derive(Debug, Clone, Default)]
 pub struct MemoryCounts {
     pub total: i64,
+    /// 用户级(侧栏的 User memory 行)
+    pub user: i64,
     pub agents: Vec<(AgentId, i64)>,
     pub projects: Vec<MemoryProject>,
 }
@@ -718,26 +723,123 @@ impl MemoryScope {
         }
     }
 
-    /// 人读标签(MCP 输出用;UI 另过 t())
+    /// 人读标签(MCP 输出用;UI 另过 t()),后面接 " memory":User memory / Project
+    /// memory / Session memory——沿用 Claude Code 文档的说法(用户 2026-09-21 定)
     pub fn label(self) -> &'static str {
         match self {
-            Self::User => "user-level",
+            Self::User => "user",
             Self::Project => "project",
             Self::Thread => "session",
         }
     }
 }
 
+/// 记忆来源的形态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySourceKind {
+    /// 按项目目录的记忆树:`<dir>/<项目目录>/memory/*.md`(Claude auto-memory,ZCode 同形)
+    ProjectTree,
+    /// 一个目录直属的 `*.<ext>`(Codex 的 memories、`~/.codex/rules/*.rules`)
+    Dir { ext: &'static str },
+    /// 单个文件(`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md`、`~/.gemini/GEMINI.md`)
+    File,
+    /// 用户添加的路径:是目录就读直属 `*.md`,是文件就读它自己——**读的时候才看形状**
+    /// (构造不摸磁盘,与别的来源"不看存不存在"同规矩;曾在构造时按 `is_file()` 定成
+    /// Dir / File,2026-09-22 /simplify)
+    Custom,
+    /// Codex memories_1.sqlite 的逐线程摘要
+    ThreadDb,
+    /// 每个已索引的本地项目根下的一个文件:`<project>/<rel>`
+    ProjectFile,
+    /// 每个已索引的本地项目根下的一个目录:`<project>/<rel>/*.<ext>`
+    ProjectDir { ext: &'static str },
+}
+
+/// 记忆的一个来源 = Settings → Memory locations 的一行。各家 adapter 按自己的根报默认
+/// 来源(不看存不存在),项目模式由 `adapters::project_instruction_sources` 按 agent
+/// 给;用户可停用默认来源、添加自定义的目录或文件(store 记偏离,scanner 每轮按
+/// 配置裁决后交给 `list_memories`)。不区分"agent 记的"与"用户写的指令"——曾有过
+/// origin 字段与 instructions 徽章,文件名本身已说明身份,用户 2026-09-21 定拿掉
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySource {
+    pub agent: AgentId,
+    pub kind: MemorySourceKind,
+    /// 目录 / 文件 / 库的绝对路径;项目模式是相对项目根的路径(`CLAUDE.md`、`.cursor/rules`)
+    pub path: std::path::PathBuf,
+}
+
+impl MemorySource {
+    pub fn is_pattern(&self) -> bool {
+        matches!(
+            self.kind,
+            MemorySourceKind::ProjectFile | MemorySourceKind::ProjectDir { .. }
+        )
+    }
+
+    /// 层级由形态决定:全局目录 / 文件 / 自定义路径是用户级(对每个项目都成立),记忆树
+    /// 与项目模式是项目级,线程库是会话级——曾是独立字段,每个构造点填的都是 kind 蕴含
+    /// 的值(2026-09-22 /simplify)
+    pub fn scope(&self) -> MemoryScope {
+        match self.kind {
+            MemorySourceKind::Dir { .. } | MemorySourceKind::File | MemorySourceKind::Custom => {
+                MemoryScope::User
+            }
+            MemorySourceKind::ProjectTree
+            | MemorySourceKind::ProjectFile
+            | MemorySourceKind::ProjectDir { .. } => MemoryScope::Project,
+            MemorySourceKind::ThreadDb => MemoryScope::Thread,
+        }
+    }
+
+    /// 稳定标识:停用记录、memories.source 列、按来源冻结与计数都用它。项目模式带
+    /// `<project>/` 前缀,具体路径就是路径本身
+    pub fn id(&self) -> String {
+        let path = self.path.to_string_lossy();
+        if self.is_pattern() {
+            format!("<project>/{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// 用户添加的来源(Settings → Memory locations 的 Add location):目录或文件,读时才看
+    pub fn custom(agent: AgentId, path: std::path::PathBuf) -> Self {
+        Self {
+            agent,
+            kind: MemorySourceKind::Custom,
+            path,
+        }
+    }
+}
+
+/// 用户记忆(对每个项目都成立)在一次筛选里怎么算——它是唯一带特殊语义的层级
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserMemories {
+    /// 照列,项目筛选下也放行:MCP 的口径,问一个项目的记忆连用户记忆一起给
+    #[default]
+    Alongside,
+    /// 不列:GUI 的项目行只算项目记忆(用户 2026-09-22 定)
+    Excluded,
+    /// 只列用户记忆:GUI 侧栏的 User memory 行
+    Only,
+}
+
 /// 记忆列表/搜索的筛选面(Memory 页与 wake_list_memories / wake_search 共用)
 #[derive(Debug, Clone, Default)]
 pub struct MemoryFilter {
     pub agents: Vec<AgentId>,
-    /// 项目路径并集;空串不匹配任何东西。用户级记忆对每个项目都成立,任何项目筛选
-    /// 下都列出
+    /// 项目路径并集;空串不匹配任何东西。用户级记忆对每个项目都成立,`user` 默认
+    /// (Alongside)下任何项目筛选都列出它
     pub project_paths: Vec<String>,
     /// 只要没归属(项目解析不出)的那一组——GUI 侧栏的 Unknown project 行;与
     /// `project_paths` 一起时取并集。显式一位,不拿空串当暗号
     pub unattributed: bool,
+    /// 用户级记忆进不进这次筛选
+    pub user: UserMemories,
+    /// 只要这个时刻(epoch ms)之后更新过的;None = 不限。wake_search 的 `since` 也约束
+    /// 记忆命中——否则 "No session matches … in the last 24 hours" 后面跟着几个月前的
+    /// 笔记(2026-09-22 review)
+    pub updated_since: Option<i64>,
     /// 0 = 不限
     pub limit: i64,
 }

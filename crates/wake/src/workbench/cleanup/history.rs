@@ -699,7 +699,7 @@ impl Workbench {
                     .aria_label(format!("{} · {}", candidate.root.title, file_label))
                     .h(px(40.))
                     .px(SPACE_LG)
-                    .gap(SPACE_SM)
+                    .gap(ICON_TEXT_GAP)
                     .border_t_1()
                     .border_color(theme.border)
                     .text_size(FONT_CAPTION)

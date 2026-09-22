@@ -147,9 +147,22 @@ CREATE TABLE IF NOT EXISTS memories (
   title        TEXT NOT NULL DEFAULT '',
   updated_at   INTEGER DEFAULT 0,
   size_bytes   INTEGER DEFAULT 0,
+  source       TEXT NOT NULL DEFAULT '',
   body         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_memories_group ON memories(agent_id, host);
+CREATE TABLE IF NOT EXISTS memory_sources_custom (
+  agent    TEXT NOT NULL,
+  path     TEXT NOT NULL,
+  added_at INTEGER NOT NULL,
+  PRIMARY KEY (agent, path)
+);
+CREATE TABLE IF NOT EXISTS memory_sources_disabled (
+  agent       TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  disabled_at INTEGER NOT NULL,
+  PRIMARY KEY (agent, source)
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   title,
   body,
@@ -226,9 +239,21 @@ fn open_conn(path: &Path) -> Result<Connection> {
     }
     // host 迁移(2026-09-01 远程会话加列;空串 = 本地)。老库首扫时既有行
     // 全部落 '',与远程装饰器生产的非空 host 天然分域,无需回填
-    if !table_has_column(&conn, NEWEST_COLUMN.0, NEWEST_COLUMN.1)? {
+    if !table_has_column(&conn, "sessions", "host")? {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // 记忆来源列(记忆可见层二期,2026-09-21):source = 所属来源的 id。memories 表还
+    // 没发布过,但开发机上的库已按旧 DDL 建过;老行 source 为空,下一轮扫描按来源
+    // 指纹重写(开发机上短暂存在过的 origin 列留着不碍事,DDL 与读写都不再提它)
+    // 守卫写死列名、不引用 NEWEST_COLUMN:那个常量下次迁移就会改指别的列,这里跟着改指
+    // 就会对已迁移的库再 ALTER 一次,duplicate column 让 open_or_rebuild 把好端端的索引
+    // 当坏库重建(2026-09-22 review)
+    if !table_has_column(&conn, "memories", "source")? {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
@@ -257,7 +282,7 @@ fn open_conn(path: &Path) -> Result<Connection> {
 
 /// 最近一次迁移加的列——`open_read_only` 用它判断库够不够新。**加新迁移时把
 /// 这里改成新列**,否则只读入口会放行老库、深处查询才报 no such column
-const NEWEST_COLUMN: (&str, &str) = ("sessions", "host");
+const NEWEST_COLUMN: (&str, &str) = ("memories", "source");
 /// 最近一次迁移加的、只读读者会查的表(wake_list_memories 读 memories),与
 /// NEWEST_COLUMN 同一用途、同一维护规矩
 const NEWEST_TABLE: &str = "memories";
@@ -1433,15 +1458,18 @@ impl Store {
         agent: AgentId,
         host: &str,
         docs: &[MemoryDoc],
-        frozen: &[std::path::PathBuf],
+        frozen: &[String],
     ) -> Result<bool> {
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
-        // key → (id, 指纹);指纹含 session_key 与 project_path,锚点换了(目录里来了
-        // 更新的会话)同样要重写,否则项目归属定格在首次入库那一刻
-        let existing: HashMap<String, (i64, (i64, i64, String, String))> = {
+        // key → (id, 指纹);指纹 = (updated_at, size, session_key, project_path, source, title):
+        // 锚点换了(目录里来了更新的会话)同样要重写,否则项目归属定格在首次入库那一刻;
+        // 来源换了(同一文件从自定义变成默认)也重写;标题也在指纹里——标题是从文件派生
+        // 的,派生规则换了(2026-09-21 改成文件名带扩展名)文件没变也要跟上,正文不比
+        type Stamp = (i64, i64, String, String, String, String);
+        let existing: HashMap<String, (i64, Stamp)> = {
             let mut stmt = tx.prepare_cached(
-                "SELECT key, id, updated_at, size_bytes, session_key, project_path
+                "SELECT key, id, updated_at, size_bytes, session_key, project_path, source, title
                  FROM memories WHERE agent_id = ?1 AND host = ?2",
             )?;
             let rows = stmt.query_map(params![agent.as_str(), host], |r| {
@@ -1450,52 +1478,50 @@ impl Store {
                     (
                         r.get::<_, i64>(1)?,
                         (
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, String>(5)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
                         ),
                     ),
                 ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        // 同 key 重复(同家两个实例的根重叠)后者胜:先按 key 收成一份再写,否则
-        // 前一份写了、后一份与库里相同被跳过,就成了前者胜
-        let latest: std::collections::BTreeMap<&str, &MemoryDoc> =
-            docs.iter().map(|d| (d.key.as_str(), d)).collect();
+        let unchanged = |s: &Stamp, d: &MemoryDoc| {
+            s.0 == d.updated_at
+                && s.1 == d.size_bytes
+                && s.2 == d.session_key
+                && s.3 == d.project_path
+                && s.4 == d.source
+                && s.5 == d.title
+        };
+        // 同 key 重复**前者胜**:docs 按来源计划的顺序读入(默认来源 → 项目模式 → 自定义,
+        // 默认实例 → 自定义实例),先到的是默认那份——自定义目录盖住默认文件(加 ~/.claude
+        // 当自定义目录,里面的 CLAUDE.md 已是默认来源)时计数与开关才落在默认行上,而不是
+        // 默认行显示 0 份、关掉也不生效(2026-09-22 review)。先按 key 收成一份再写,不然
+        // 写了第一份、第二份与库里相同被跳过,胜负就看谁先到库里
+        let mut latest: std::collections::BTreeMap<&str, &MemoryDoc> =
+            std::collections::BTreeMap::new();
+        for d in docs {
+            latest.entry(d.key.as_str()).or_insert(d);
+        }
         let mut changed = false;
         for d in latest.values() {
-            let stamp = (
-                d.updated_at,
-                d.size_bytes,
-                d.session_key.clone(),
-                d.project_path.clone(),
-            );
-            if existing.get(&d.key).is_some_and(|(_, s)| *s == stamp) {
+            if existing.get(&d.key).is_some_and(|(_, s)| unchanged(s, d)) {
                 continue;
             }
             upsert_memory(&tx, d)?;
             changed = true;
         }
-        // `frozen` 是这一轮读失败的实例的根:那些根下的行不删(它们没出现在 docs 里
-        // 只是因为读不出,不是文件没了)
-        let frozen: Vec<String> = frozen
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        // `frozen` 是这一轮读失败的实例的来源 id:那些来源的行不删(它们没出现在 docs
+        // 里只是因为读不出,不是文件没了)
         let mut stmt_fts = tx.prepare_cached("DELETE FROM memories_fts WHERE rowid = ?1")?;
         let mut stmt_row = tx.prepare_cached("DELETE FROM memories WHERE key = ?1")?;
-        for (key, (id, (_, _, _, _))) in existing.iter() {
-            if latest.contains_key(key.as_str()) {
-                continue;
-            }
-            let path: String = tx.query_row(
-                "SELECT path FROM memories WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )?;
-            if frozen.iter().any(|root| memory_root_covers(root, &path)) {
+        for (key, (id, stamp)) in existing.iter() {
+            if latest.contains_key(key.as_str()) || frozen.contains(&stamp.4) {
                 continue;
             }
             stmt_fts.execute(params![id])?;
@@ -1506,6 +1532,145 @@ impl Store {
         drop(stmt_row);
         tx.commit()?;
         Ok(changed)
+    }
+
+    /// Settings → Memory locations 的计数:每个 (agent, 来源 id) 有多少份
+    pub fn memory_source_counts(&self) -> Result<HashMap<(String, String), i64>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("SELECT agent_id, source, COUNT(*) FROM memories GROUP BY 1, 2")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 已索引的本地项目根(host 为空、路径非空),给记忆的项目模式(`<project>/CLAUDE.md`
+    /// 一类)展开;远程会话的项目是别的机器上的路径,不在其中
+    pub fn local_project_roots(&self) -> Result<Vec<PathBuf>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT project_path FROM sessions
+             WHERE host = '' AND project_path != '' ORDER BY project_path",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    // ---------- 记忆来源配置(Settings → Memory locations) ----------
+
+    /// 与 Session locations 同一层级的用户数据:自定义来源(目录或文件)与被停用的
+    /// 默认来源(按 `MemorySource::id`),重扫不动它。对外只有 `memory_source_overrides`
+    /// 一次取齐
+    fn list_memory_sources_custom(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT agent, path FROM memory_sources_custom ORDER BY added_at, path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_memory_source(&self, agent: &str, path: &str) -> Result<()> {
+        let conn = self.write.lock().unwrap();
+        insert_memory_source(&conn, agent, path)
+    }
+
+    /// 删自定义来源,连同它的停用记录(日后重新添加同一路径要按启用开始)
+    pub fn remove_memory_source(&self, agent: &str, path: &str) -> Result<()> {
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        delete_memory_source(&tx, agent, path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 编辑自定义来源:删旧记新,一个事务(半程失败不得半生效)
+    pub fn replace_memory_source(
+        &self,
+        old_agent: &str,
+        old_path: &str,
+        new_agent: &str,
+        new_path: &str,
+    ) -> Result<()> {
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        delete_memory_source(&tx, old_agent, old_path)?;
+        insert_memory_source(&tx, new_agent, new_path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn list_memory_sources_disabled(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT agent, source FROM memory_sources_disabled ORDER BY disabled_at, source",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 来源开关的唯一写入口。enabled=true 删停用标记;false 幂等记入
+    pub fn set_memory_source_enabled(
+        &self,
+        agent: &str,
+        source: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let conn = self.write.lock().unwrap();
+        if enabled {
+            conn.execute(
+                "DELETE FROM memory_sources_disabled WHERE agent = ?1 AND source = ?2",
+                params![agent, source],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_sources_disabled(agent, source, disabled_at)
+                 VALUES (?1, ?2, ?3)",
+                params![agent, source, now_ms()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Restore defaults:清空自定义来源与停用记录
+    pub fn clear_memory_source_overrides(&self) -> Result<()> {
+        let conn = self.write.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM memory_sources_custom;
+             DELETE FROM memory_sources_disabled;",
+        )?;
+        Ok(())
+    }
+
+    /// 记忆来源配置一次取齐,解析成模型层类型;未识别的 agent 名静默跳过。停用表给
+    /// 集合——调用方都是按 (agent, 来源 id) 查它。scanner 与 Settings 共用。读失败原样
+    /// 报 Err:scanner 拿它做"按缺席删",折成"什么都没配置"会删光项目指令文件、把停用的
+    /// 来源重新索引进来(2026-09-22 review);Settings 只是显示,自己 unwrap_or_default
+    pub fn memory_source_overrides(
+        &self,
+    ) -> Result<(
+        Vec<(AgentId, PathBuf)>,
+        std::collections::HashSet<(AgentId, String)>,
+    )> {
+        let customs = self
+            .list_memory_sources_custom()?
+            .into_iter()
+            .filter_map(|(a, p)| AgentId::from_str(&a).map(|a| (a, PathBuf::from(p))))
+            .collect();
+        let disabled = self
+            .list_memory_sources_disabled()?
+            .into_iter()
+            .filter_map(|(a, s)| AgentId::from_str(&a).map(|a| (a, s)))
+            .collect();
+        Ok((customs, disabled))
     }
 
     /// 库里现有记忆的 (agent, host) 分组——scanner 拿它对照当前 roster,不再配置的来源
@@ -1526,9 +1691,10 @@ impl Store {
 
     /// Memory 页侧栏的计数:agent 按 AgentId 声明序(与会话侧栏同序,计数平局不抖),
     /// 项目按最近更新降序、没归属的一项(path 为空)垫底。项目按读时解析的归属算,
-    /// 与 list_memories 同一口径——**用户级记忆对每个项目都成立**,list_memories 在
-    /// 任何项目筛选下都列它们,所以每个项目行(含 Unknown project)的计数都把用户级
-    /// 加进去,点开看到多少行、徽章就是多少(2026-09-21 review)
+    /// 与 list_memories 同一口径:**项目行只数项目记忆**(GUI 的项目行喂
+    /// `UserMemories::Excluded`),用户级另给 `user`——曾把用户级加进每个项目行
+    /// (2026-09-21 review),用户 2026-09-22 定用户记忆不进项目、自成一行;两种口径
+    /// 下都是点开看到多少行、徽章就是多少
     pub fn memory_counts(&self) -> Result<MemoryCounts> {
         let conn = self.read.lock().unwrap();
         let mut stmt = conn.prepare_cached(&format!(
@@ -1574,9 +1740,7 @@ impl Store {
             p.count += n;
             p.updated_at = p.updated_at.max(last);
         }
-        for p in projects.values_mut() {
-            p.count += user_level;
-        }
+        counts.user = user_level;
         counts.agents = agents.into_iter().collect();
         counts.agents.sort_by_key(|(agent, _)| *agent);
         counts.projects = projects.into_values().collect();
@@ -1591,7 +1755,8 @@ impl Store {
     }
 
     /// 记忆列表:项目级按项目路径成组、组内新到旧,没归属的一组排在项目之后,
-    /// 用户级(对每个项目都成立)最后;项目筛选下用户级照列。**`limit` 只封项目级**:
+    /// 用户级(对每个项目都成立)最后;项目筛选下用户级照列(`f.user` 默认 Alongside,
+    /// GUI 的项目行 Excluded、User memory 行 Only)。**`limit` 只封项目级**:
     /// 用户级排在最后,一刀切的 LIMIT 砍掉的正是筛选特意放进来的那几份(2026-09-21
     /// review),所以项目级带 LIMIT 查、用户级不限量另查再接上。**行里 body 是空串**
     /// (`MEMORY_LIST_COLS`),要正文走 `get_memory`
@@ -1681,7 +1846,9 @@ impl Store {
                 |r| {
                     Ok(MemoryHit {
                         doc: row_to_memory(r)?,
-                        snippet: r.get(12)?,
+                        // snippet 是 SELECT 里跟在 memory_cols! 后面的最后一列,按列数取——写死下标加列时
+                        // 顶错过一次(2026-09-21)
+                        snippet: r.get(r.as_ref().column_count() - 1)?,
                     })
                 },
             )?;
@@ -2356,7 +2523,7 @@ macro_rules! memory_cols {
             "m.key, m.agent_id, m.host, m.scope,
     COALESCE(NULLIF(m.project_path, ''), s.project_path, ''),
     COALESCE(NULLIF(m.project_name, ''), s.project_name, ''),
-    m.session_key, m.path, m.title, m.updated_at, m.size_bytes, ",
+    m.session_key, m.path, m.title, m.updated_at, m.size_bytes, m.source, ",
             $body
         )
     };
@@ -2365,15 +2532,6 @@ const MEMORY_COLS: &str = memory_cols!("m.body");
 /// 列表用的同一组列,只是正文给空串:列表谁都不看正文(GUI 阅读时经 get_memory
 /// 另取,MCP 的 wake_list_memories 只打标题),没必要每次刷新把几百 KB 文本拉出来
 const MEMORY_LIST_COLS: &str = memory_cols!("''");
-
-/// `path` 在不在这个记忆根下:目录根按分隔符划界,SQLite 型的库文件根认虚拟路径
-/// `<db>#<id>`(`replace_memories` 的冻结判据)
-fn memory_root_covers(root: &str, path: &str) -> bool {
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with(std::path::is_separator) || rest.starts_with('#'))
-}
 
 fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDoc> {
     let agent: String = r.get(1)?;
@@ -2390,15 +2548,23 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDoc> {
         title: r.get(8)?,
         updated_at: r.get(9)?,
         size_bytes: r.get(10)?,
-        body: r.get(11)?,
+        source: r.get(11)?,
+        body: r.get(12)?,
     })
 }
 
 /// list_memories / search_memories 共用的筛选谓词(表别名 m):agent 并集;项目并集
-/// 之外用户级记忆恒放行——它对每个项目都成立
+/// 之外用户级记忆默认放行——它对每个项目都成立;`f.user` 可以把它剔掉(GUI 的
+/// 项目行)或只留它(GUI 的 User memory 行)
 fn memory_filter(f: &MemoryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sql = String::new();
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let user = MemoryScope::User.as_str();
+    match f.user {
+        UserMemories::Alongside => {}
+        UserMemories::Excluded => sql.push_str(&format!(" AND m.scope != '{user}'")),
+        UserMemories::Only => sql.push_str(&format!(" AND m.scope = '{user}'")),
+    }
     if !f.agents.is_empty() {
         sql.push_str(&format!(
             " AND m.agent_id IN ({})",
@@ -2408,9 +2574,14 @@ fn memory_filter(f: &MemoryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
             args.push(Box::new(a.as_str().to_string()));
         }
     }
+    if let Some(since) = f.updated_since {
+        sql.push_str(" AND m.updated_at >= ?");
+        args.push(Box::new(since));
+    }
     if f.scopes_projects() {
         // 项目并集 ∪ 没归属的一组(显式的 unattributed,不拿空串当暗号:空串什么都
-        // 不匹配)∪ 用户级(对每个项目都成立)
+        // 不匹配)∪ 用户级(对每个项目都成立;只有 Alongside 放行——Excluded 上面已
+        // 剔掉,Only 与项目筛选本就没有交集)
         let mut terms: Vec<String> = Vec::new();
         if !f.project_paths.is_empty() {
             terms.push(format!(
@@ -2424,10 +2595,34 @@ fn memory_filter(f: &MemoryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         if f.unattributed {
             terms.push(format!("{MEMORY_PROJECT} = ''"));
         }
-        terms.push(format!("m.scope = '{}'", MemoryScope::User.as_str()));
+        if f.user == UserMemories::Alongside {
+            terms.push(format!("m.scope = '{user}'"));
+        }
         sql.push_str(&format!(" AND ({})", terms.join(" OR ")));
     }
     (sql, args)
+}
+
+/// 自定义记忆来源的两条写语句,add / remove / replace 共用(replace = 同一事务里先删后加)
+fn insert_memory_source(conn: &rusqlite::Connection, agent: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_sources_custom(agent, path, added_at) VALUES (?1, ?2, ?3)",
+        params![agent, path, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// 连同它的停用记录一起删(日后重新添加同一路径要按启用开始)
+fn delete_memory_source(conn: &rusqlite::Connection, agent: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM memory_sources_custom WHERE agent = ?1 AND path = ?2",
+        params![agent, path],
+    )?;
+    conn.execute(
+        "DELETE FROM memory_sources_disabled WHERE agent = ?1 AND source = ?2",
+        params![agent, path],
+    )?;
+    Ok(())
 }
 
 /// 写一份记忆:memories 行按 key 就地更新(id 不变,memories_fts 的 rowid 就是它),
@@ -2437,13 +2632,13 @@ fn upsert_memory(tx: &rusqlite::Transaction<'_>, d: &MemoryDoc) -> Result<()> {
     let id: i64 = tx
         .prepare_cached(
             "INSERT INTO memories(key, agent_id, host, scope, project_path, project_name,
-           session_key, path, title, updated_at, size_bytes, body)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+           session_key, path, title, updated_at, size_bytes, source, body)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(key) DO UPDATE SET agent_id = excluded.agent_id, host = excluded.host,
            scope = excluded.scope, project_path = excluded.project_path,
            project_name = excluded.project_name, session_key = excluded.session_key,
            path = excluded.path, title = excluded.title, updated_at = excluded.updated_at,
-           size_bytes = excluded.size_bytes, body = excluded.body
+           size_bytes = excluded.size_bytes, source = excluded.source, body = excluded.body
          RETURNING id",
         )?
         .query_row(
@@ -2459,6 +2654,7 @@ fn upsert_memory(tx: &rusqlite::Transaction<'_>, d: &MemoryDoc) -> Result<()> {
                 d.title,
                 d.updated_at,
                 d.size_bytes,
+                d.source,
                 d.body,
             ],
             |r| r.get::<_, i64>(0),
