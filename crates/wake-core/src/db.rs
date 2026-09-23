@@ -2,8 +2,10 @@ use crate::models::*;
 use anyhow::{Context as _, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub type LocationOverrides = (
     Vec<(AgentId, std::path::PathBuf)>,
@@ -346,12 +348,16 @@ pub fn open_or_rebuild(path: &Path) -> Result<(Store, Option<String>)> {
         Ok(store) => return Ok((store, None)),
         Err(e) => e,
     };
+    // 挪走的是**真实文件**:默认路径是符号链接时链接留着、新库仍沿链接建在目标处,GUI 手里
+    // `IndexLock` 锁的正是目标旁那把;挪链接本身会让锁留在旧目标旁、新库无人看管
+    // (Codex review 2026-09-23)。重开仍走原路径,`Store.path` 与远程镜像目录不变。
     // 三件套一起挪:留下 WAL 或 SHM 任何一个,新库都会接着读旧日志
-    let backup = std::path::PathBuf::from(format!("{}.corrupt", path.display()));
+    let real = canonical(path);
+    let backup = std::path::PathBuf::from(format!("{}.corrupt", real.display()));
     let _ = std::fs::remove_file(&backup);
-    let _ = std::fs::rename(path, &backup);
+    let _ = std::fs::rename(&real, &backup);
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        let _ = std::fs::remove_file(format!("{}{suffix}", real.display()));
     }
     let store = Store::open(path).with_context(|| format!("rebuild failed after: {first}"))?;
     Ok((
@@ -362,6 +368,273 @@ pub fn open_or_rebuild(path: &Path) -> Result<(Store, Option<String>)> {
             backup.display()
         )),
     ))
+}
+
+/// 索引库的**跨进程**写者锁。`scanner::SCAN_GATE` 只管一个进程里的两条扫描串行,
+/// 这把锁管进程之间:GUI 与 `wake-cli refresh` / `wake-cli index` / scan bin 都是写者,
+/// 同一时刻只能有一个——两个进程各建一份 roster,launchd 与 Dock 起的 GUI 看到的 env
+/// 未必相同(CODEX_HOME / XDG_DATA_HOME / WAKE_HOME 各解各的根),删除检测会把对方收进来
+/// 的会话当"磁盘已删"清掉、下一轮再由对方加回,每十分钟互删一次;靠 busy_timeout 排队
+/// 解决不了这个,只能不并发。
+///
+/// 形态:`<db>.lock` 旁路文件上的文件锁(unix flock / Windows LockFileEx,std 的
+/// `File::try_lock`),路径按库的**真实路径**派生——`--db` 给到符号链接别名也得撞上同一把。
+/// **GUI 另持一把 `<db>.lock.app`**:别人拿不到主锁时探这把锁,拿不到就是有个活着的 GUI——
+/// 锁随进程生死,不会残留,"持有者是不是 GUI"这条决定 GUI 等不等、CLI 怎么措辞的判据
+/// 只认它。持有者自述(`"wake-cli refresh 4242"`)另写在 `<db>.lock.holder`,**只用来点名**:
+/// 它写在拿到锁之后,拿到与写完之间读到的是上一任的残留,拿它做判断就会把新起的 GUI 误
+/// 劝退;也不写进锁文件——Windows 的文件锁是强制锁,别的句柄读不到被锁的内容(三条都是
+/// 2026-09-23 Codex review)。
+/// **谁写库谁持有,且持有期必须盖住读写 `Store` 的整个生命期**:GUI 从启动持到退出
+/// (watcher 与扫描随时会写),CLI 写命令只在干活那几秒持有;只读旁路(wake-mcp、
+/// wake-cli 的查询)不拿。锁不长在 `Store::open` 里,因为同一进程会同时开多个 Store
+/// (scanner_finale 的用例、Dock 重开)而 `open_or_rebuild` 还会把库挪走重开,锁的生命期
+/// 得独立于单个 Store——写者名单是封闭的,见 `Store::open` 的约定。锁跟着文件描述符走,
+/// 进程退出(含 SIGKILL)即释放,不留残骸;锁文件本身不删——删了别人接着 open 出来的
+/// 是另一个 inode,两把锁互不相见
+pub struct IndexLock {
+    _file: File,
+    /// GUI 才有的第二把(`<db>.lock.app`)
+    _app: Option<File>,
+}
+
+/// 拿不到锁时的持有者:`app` 来自 `.lock.app` 那把锁(活着的 GUI 才持有),文字来自
+/// 旁路自述(可能残留,只用来点名)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockHolder {
+    pub app: bool,
+    description: String,
+}
+
+impl LockHolder {
+    fn new(app: bool, note: &str) -> Self {
+        let description = match note.trim() {
+            "" => "another process",
+            s => s,
+        };
+        Self {
+            app,
+            description: description.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for LockHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+/// `IndexLock::try_acquire` 的结果
+pub enum Ownership {
+    Ours(IndexLock),
+    Held(LockHolder),
+}
+
+/// `IndexLock::acquire_or_wait` 的结果
+pub enum Wait {
+    Ours(IndexLock),
+    /// GUI 持有:没等,它不会让
+    HeldByApp(LockHolder),
+    /// 等满了还是别人的
+    TimedOut(LockHolder),
+}
+
+/// GUI 拿锁时报的种类名;CLI 写命令写 "wake-cli index" / "wake-cli refresh"。种类是
+/// GUI 才多持 `.lock.app` 那把锁
+pub const LOCK_KIND_APP: &str = "Wake";
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+impl IndexLock {
+    /// `<db>.lock`,按库的真实路径派生(见 `canonical`)
+    pub fn path_for(db: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.lock", canonical(db).display()))
+    }
+
+    /// 持有者自述的旁路文件 `<db>.lock.holder`
+    fn holder_path(lock: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.holder", lock.display()))
+    }
+
+    /// GUI 的第二把锁 `<db>.lock.app`
+    fn app_path(lock: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.app", lock.display()))
+    }
+
+    /// 非阻塞。`kind` 是自述的前半段,pid 由这里补
+    pub fn try_acquire(db: &Path, kind: &str) -> std::io::Result<Ownership> {
+        let path = Self::path_for(db);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = open_lock_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                // 自述只用来点名,写不进去(权限一类)不能把刚到手的主锁放掉——放掉后 GUI 的
+                // 对策是无锁启动,那就成了并发写库;尽力写,写不成别人只看到 "another process"
+                // (Codex review 2026-09-23)
+                let _ = std::fs::write(
+                    Self::holder_path(&path),
+                    format!("{kind} {}", std::process::id()),
+                );
+                // 主锁到手就算拿到了;`.lock.app` 拿不到(权限一类)只让别人认不出这是 GUI:
+                // CLI 会当成别的写者退让,另一个 GUI 会等满再报——都不会并发写库
+                let app = if kind == LOCK_KIND_APP {
+                    Self::take_app_lock(&path).ok()
+                } else {
+                    None
+                };
+                Ok(Ownership::Ours(IndexLock {
+                    _file: file,
+                    _app: app,
+                }))
+            }
+            Err(TryLockError::WouldBlock) => {
+                // 主锁被占是已经确认的事实,探 `.lock.app` 失败不能把它翻成 I/O 错——GUI 对
+                // 拿锁出错的对策是无锁启动,那就成了并发写库;保守按"被占、不是 GUI"报,
+                // GUI 会等、CLI 会退让(Codex review 2026-09-23)
+                let app = Self::app_lock_is_held(&path).unwrap_or(false);
+                let note = std::fs::read_to_string(Self::holder_path(&path)).unwrap_or_default();
+                Ok(Ownership::Held(LockHolder::new(app, &note)))
+            }
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// 主锁在手时拿 `.lock.app`(独占)。活着的 GUI 只可能是我们自己,所以它本该是空的;
+    /// 别人的共享锁探测会瞬时占住几微秒(拿到即放),撞上就隔一下再拿,别当失败
+    fn take_app_lock(lock: &Path) -> std::io::Result<File> {
+        let path = Self::app_path(lock);
+        let mut tries = 0;
+        loop {
+            let file = open_lock_file(&path)?;
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::other(
+                        "another Wake holds the app lock while the index lock was free",
+                    ))
+                }
+                Err(TryLockError::Error(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// 探 `.lock.app`:以**共享锁**探,拿到即放,拿不到就是有个活着的 GUI 持着独占锁。
+    /// 共享锁探测者之间不互斥——两个 CLI 或 CLI 与正在启动的 GUI 同时探,用独占锁探会把
+    /// 对方的瞬时占用当成 GUI(Codex review 2026-09-23)
+    fn app_lock_is_held(lock: &Path) -> std::io::Result<bool> {
+        let probe = open_lock_file(&Self::app_path(lock))?;
+        match probe.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// 等着拿(GUI 启动用,阻塞调用方,放在开窗之前):持有者是 CLI 写命令就隔 100ms
+    /// 再试直到 `timeout`——它几秒到几十秒就完;是另一个 GUI 立刻放弃,它不会让。
+    /// 用轮询不用阻塞的 `File::lock`:阻塞版认不出持有者中途从 CLI 换成了 GUI,
+    /// 会无窗地挂死
+    pub fn acquire_or_wait(db: &Path, kind: &str, timeout: Duration) -> std::io::Result<Wait> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::try_acquire(db, kind)? {
+                Ownership::Ours(lock) => return Ok(Wait::Ours(lock)),
+                Ownership::Held(holder) if holder.app => return Ok(Wait::HeldByApp(holder)),
+                Ownership::Held(holder) if Instant::now() >= deadline => {
+                    return Ok(Wait::TimedOut(holder))
+                }
+                Ownership::Held(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+}
+
+/// `Store.path` 的形态:相对路径按 cwd 补成绝对——`--db wake.db` 这种相对目录不然会以相对
+/// 形态拼进远程镜像的 file_path,换个 cwd 就读不到;**不解析符号链接**:远程镜像
+/// `remotes/<host>` 挂在"你打开的那个路径"旁边,把库文件链到别的盘、链接留在默认位置的
+/// 用户,镜像一直在默认目录里,解析了就找不到、下一轮扫描会把远程会话全判成已删(两条都是
+/// 2026-09-23 Codex review)。锁文件另按 `canonical` 落在真实文件旁
+fn anchored(db: &Path) -> PathBuf {
+    std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf())
+}
+
+/// 库的真实绝对路径:文件在就解析它本身;还不在(`index` 建库前、清过索引再启动)就
+/// 顺着符号链接走到目标、解析目标的父目录再接文件名——`Store::open` 沿链接建库建在目标
+/// 处,锁得提前落在那里;都解析不了原样用。锁文件落在哪、`open_or_rebuild` 挪哪个文件按它(`Store.path` 不按,见 `anchored`)
+fn canonical(db: &Path) -> PathBuf {
+    if let Ok(real) = db.canonicalize() {
+        return strip_verbatim(real);
+    }
+    let mut target = db.to_path_buf();
+    for _ in 0..8 {
+        let Ok(link) = std::fs::read_link(&target) else {
+            break;
+        };
+        target = match target.parent() {
+            Some(dir) => dir.join(link),
+            None => link,
+        };
+    }
+    match (target.parent(), target.file_name()) {
+        (Some(dir), Some(name)) => dir
+            .canonicalize()
+            .map(|dir| strip_verbatim(dir).join(name))
+            .unwrap_or_else(|_| target.clone()),
+        _ => target,
+    }
+}
+
+/// Windows 的 `canonicalize` 给的是 `\\?\C:\…` 的 verbatim 形态;它存进 `Store.path`、
+/// 派生成 `remotes/<host>` 根再与库里既有的 `C:\…` 形态的 file_path 按字符串前缀比,就
+/// 全对不上(Codex review 2026-09-23)。盘符与 UNC 两种各剥回普通写法;其他平台原样
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+/// 这文件是不是 Wake 自己的索引:`wake-cli refresh --db` 指错到别家 SQLite(Cursor 的
+/// state.vscdb、Hermes 的 state.db)时,`Store::open` 会对它改 journal_mode、建 Wake 的表——
+/// 别家数据只读是铁律(Codex review 2026-09-23)。只读开、只看三张表在不在,老版本的 Wake
+/// 索引照样认(refresh 要能升级它);打不开、不是 SQLite 都算不是
+pub fn is_wake_index(path: &Path) -> bool {
+    let Ok(conn) = open_conn_ro(path) else {
+        return false;
+    };
+    ["schema_meta", "sessions", "messages_fts"]
+        .iter()
+        .all(|table| table_exists(&conn, table).unwrap_or(false))
+}
+
+/// "没有索引"这一句的唯一出处:只读旁路(wake-mcp / wake-cli 查询)与 `wake-cli refresh`
+/// 说的是同一句,docs/cli.md 的排障条目照抄它
+pub fn missing_index(path: &Path) -> String {
+    format!(
+        "no Wake index at {} — launch Wake once to build it",
+        path.display()
+    )
 }
 
 /// 读写分连接(WAL 单写多读);Connection 非 Sync,各自套 Mutex
@@ -377,11 +650,14 @@ pub struct Store {
 }
 
 impl Store {
+    /// 读写打开(建表、迁移)。**写真实索引的进程必须先持 `IndexLock`**,名单是封闭的:
+    /// GUI(main.rs `hold_index_lock`)、`scanner::build_index` / `refresh_index`、
+    /// scan bin——新写者照做。锁为什么不在这里拿,见 `IndexLock` 的注释
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             write: Mutex::new(open_conn(path)?),
             read: Mutex::new(open_conn(path)?),
-            path: path.to_path_buf(),
+            path: anchored(path),
             read_only: false,
         })
     }
@@ -389,14 +665,12 @@ impl Store {
     /// 只读打开既有索引库(wake-mcp 这类旁路读者用):不建表、不迁移、不改
     /// journal_mode;库不存在或 schema 太老直接报错——重建权只归 GUI 的
     /// `open_or_rebuild`,旁路进程绝不能把正在被 GUI 写的库挪走重建
-    /// (唯一的例外是**库根本不存在**时建一个:`scanner::build_index`)。
+    /// (例外只有两个,都先拿 `IndexLock`:库不存在时 `scanner::build_index` 建一个,
+    /// Wake 没开时 `scanner::refresh_index` 增量刷一轮)。
     /// WAL 下读者不阻塞 GUI 写入;只读连接要能建 -shm,同用户下目录可写即可
     pub fn open_read_only(path: &Path) -> Result<Self> {
         if !path.is_file() {
-            anyhow::bail!(
-                "no Wake index at {} — launch Wake once to build it",
-                path.display()
-            );
+            anyhow::bail!("{}", missing_index(path));
         }
         let read = open_conn_ro(path)?;
         if !table_has_column(&read, NEWEST_COLUMN.0, NEWEST_COLUMN.1)?
@@ -411,7 +685,7 @@ impl Store {
             // Store 的形状要求有 write 连接;这里给的同样是只读句柄
             write: Mutex::new(open_conn_ro(path)?),
             read: Mutex::new(read),
-            path: path.to_path_buf(),
+            path: anchored(path),
             read_only: true,
         })
     }

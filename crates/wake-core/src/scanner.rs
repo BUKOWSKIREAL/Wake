@@ -1,6 +1,7 @@
 use crate::adapters::AgentAdapter;
-use crate::db::Store;
+use crate::db::{IndexLock, LockHolder, Ownership, Store};
 use crate::models::*;
+use crate::text::plural;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,52 +58,176 @@ impl Drop for ScanFinale<'_> {
 /// join 了,扫描没有)——不排队就是两条扫描并发改写同一个库。门放在 run_scan
 /// 入口而不是某个调用方:任何起扫描的入口都自动被管住。锁是进程级而非 Store
 /// 级,要挡的正是两个 Store 实例开同一个库文件;扫描 panic 会毒化锁,
-/// into_inner 照常放行。排在后面的照常出终态事件,UI 只是多等一会儿
+/// into_inner 照常放行。排在后面的照常出终态事件,UI 只是多等一会儿。进程**之间**
+/// 由 `db::IndexLock` 管(GUI 整个生命周期持有、CLI 写命令干活时持有),两者不可
+/// 互代:按扫描粒度拿文件锁会与 GUI 的常驻持有自锁(同进程第二个文件描述是另一把 flock)
 static SCAN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 从零建一次索引:**只在索引文件不存在时**建,已经有库就原样留给 GUI
-/// (`Ok(None)`)。这是"重建权只归 GUI 的 `open_or_rebuild`"(db.rs)唯一的
-/// 例外,场景是"装了 Wake 但从没启动过"。
+/// `build_index` / `refresh_index` 的收场;措辞由 bin 翻。退让不是失败
+pub enum Outcome {
+    /// 干完了,库里现在有这些
+    Done(Tally),
+    /// 前置条件不满足、库一个字节没动
+    Skipped(Skip),
+    /// 别的进程正持有这份索引(GUI 在跑,或另一个 wake-cli)
+    Busy(LockHolder),
+}
+
+/// `Outcome::Skipped` 的缘由;措辞与退出码由 bin 定(`Exists` 是正常收场,其余都是
+/// `--db` 拿错了路径)
+pub enum Skip {
+    /// `index`:库已在
+    Exists,
+    /// `refresh`:没有库
+    Missing,
+    /// `refresh`:`--db` 指到的不是 Wake 的索引(别家 SQLite)
+    NotAnIndex,
+    /// `refresh`:有远程会话入库,镜像目录却不在这条路径旁——给的不是 GUI 开它的那条路径
+    MirrorsElsewhere,
+}
+
+/// 索引里有多少:两个写命令收尾说的同一句
+pub struct Tally {
+    pub sessions: i64,
+    pub agents: i64,
+}
+
+impl Tally {
+    pub fn of(store: &Store) -> Result<Self> {
+        let sessions = store
+            .list_sessions(&SessionFilter {
+                limit: 1,
+                ..Default::default()
+            })?
+            .1;
+        let agents = store.agent_counts()?.len() as i64;
+        Ok(Self { sessions, agents })
+    }
+}
+
+impl std::fmt::Display for Tally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} session{} from {} agent{}",
+            self.sessions,
+            plural(self.sessions),
+            self.agents,
+            plural(self.agents)
+        )
+    }
+}
+
+/// 从零建一次索引:**只在索引文件不存在时**建,已经有库就原样留给 GUI(`Skipped`)。
+/// 这是"重建权只归 GUI 的 `open_or_rebuild`"(db.rs)对"建"的唯一例外,场景是
+/// "装了 Wake 但从没启动过";已有的库要跟上磁盘用 `refresh_index`。
 ///
-/// 扫描落在旁边的 `<db>.build-<pid>`,扫完才用 `hard_link` 占位——**先拿到
-/// 名字,再动任何东西**:
+/// 先拿 `IndexLock`(拿不到即 `Busy` 退让:GUI 正在启动、下一步就是自己建库),拿到
+/// 再看一次库在不在。扫描仍落在旁边的 `<db>.build-<pid>`,扫完才用 `hard_link` 占位——
+/// 锁管的是"同一时刻只有一个写者",这一层管的是"中途死掉不留半截":
 /// ① 中途报错 / panic / 被 agent 超时杀掉,目标路径一个字节都没出现过,下次
 ///    还能重试(不然半截索引会被开头那道 exists 当成"已经有了"永久挡住,而
 ///    只读查询会把它当正常结果);
-/// ② GUI 在我们扫的这几秒里首次启动并建了库,hard_link 直接 AlreadyExists,
-///    我们丢掉自己那份退让,绝不往对方的库里写、也不碰对方的日志文件;
+/// ② 不认这把锁的老版本 GUI 在这几秒里首次启动建了库,hard_link 对它照样是
+///    AlreadyExists——我们丢掉自己那份退让,绝不往对方的库里写;
 /// ③ 用 hard_link 不用 rename:rename 无条件覆盖,给不出"已存在即失败"这条
-///    语义,而它正是这里唯一的仲裁(POSIX 与 Windows 都保证)。
+///    语义(POSIX 与 Windows 都保证)。
 ///
-/// 残留:占位成功到清扫孤儿边车之间还有几十微秒窗口。真要抹平得让 GUI 与
-/// CLI 共用一把跨进程锁——`SCAN_GATE` 自己那段注释就承认它只管进程内,
-/// 同样的理由 **别加 --force**
-pub fn build_index(path: &Path, events: &dyn ScanEvents) -> Result<Option<Arc<Store>>> {
+/// 占位成功后清孤儿边车:目标刚才还不存在,躺在那儿的 -wal/-shm 只可能是孤儿(主库
+/// 被手删,或 open_or_rebuild 挪库与删边车之间崩过),留着任何一个,新库都会接着读旧
+/// 日志——锁在手,这几十微秒里没人会开这个库。**别加 --force**:重建已有的库归 GUI
+pub fn build_index(path: &Path, events: &dyn ScanEvents) -> Result<Outcome> {
     if path.exists() {
-        return Ok(None);
+        return Ok(Outcome::Skipped(Skip::Exists));
+    }
+    let _lock = match IndexLock::try_acquire(path, "wake-cli index")? {
+        Ownership::Ours(lock) => lock,
+        Ownership::Held(holder) => return Ok(Outcome::Busy(holder)),
+    };
+    // 锁外那一眼可能过时:GUI 刚建完库又退出了
+    if path.exists() {
+        return Ok(Outcome::Skipped(Skip::Exists));
     }
     let staging = Staging::new(path);
-    {
+    let tally = {
         let store = Arc::new(Store::open(&staging.0)?);
-        // 不变量 8⑥:按库里的 location 配置建 roster(新库即内置全家)
-        let adapters = crate::adapters::create_adapters_for(&store);
-        run_scan(&adapters, &store, events, true)?;
-    } // 关掉最后一个连接即 checkpoint,-wal/-shm 消失,临时库自成一体
+        scan_with(&store, events, true)?
+    }; // 关掉最后一个连接即 checkpoint,-wal/-shm 消失,临时库自成一体
     match std::fs::hard_link(&staging.0, path) {
         Ok(()) => {}
-        // 有人抢先了(GUI 首扫 / 另一个 wake-cli index)。他的库归他,退让
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        // 有人抢先了(不认锁的老版本 GUI 首扫)。他的库归他,退让
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(Outcome::Skipped(Skip::Exists))
+        }
         // 个别文件系统不给硬链接:退回 rename,但只在目标确实还空着时
         Err(_) if !path.exists() => std::fs::rename(&staging.0, path)?,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(Outcome::Skipped(Skip::Exists)),
     }
-    // 名字到手了才清孤儿边车:目标刚才还不存在,躺在那儿的 -wal/-shm 只可能
-    // 是孤儿(主库被手删,或 open_or_rebuild 挪库与删边车之间崩过)。留着任何
-    // 一个,新库都会接着读旧日志——与 open_or_rebuild 挪走三件套同一条理由
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
-    Ok(Some(Arc::new(Store::open_read_only(path)?)))
+    Ok(Outcome::Done(tally))
+}
+
+/// 增量刷新一份**已有**的索引(`wake-cli refresh`):给"app 不开、靠 MCP / CLI 用 Wake"
+/// 的人用 launch agent / systemd timer 定时跑(issue #43)。做的正是 GUI 启动与 ⌘R
+/// 那一轮——增量 `run_scan`,收尾同步记忆,升级后的 FTS 回填旗子照常生效——只少远程
+/// rsync(要 ssh,留给 GUI 的同步线程)。
+///
+/// **只在 Wake 没运行时干活**:`IndexLock` 拿不到就 `Busy` 退让。GUI 开着时它的 watcher
+/// 本来就在保鲜,再跑一轮不只是多余——两个进程各建一份 roster,看到的 env 未必相同,
+/// 删除检测会互删对方收进来的会话(理由在 `IndexLock` 的注释),锁把这类并发整个排除。
+/// `Store::open` 会顺手迁移 schema,与 GUI 首开同一条路:刷新的目的就是让库跟上二进制;
+/// 反过来(库比二进制新)认不出来,docs 让定时任务指向 app 包内那份 wake-cli
+pub fn refresh_index(path: &Path, events: &dyn ScanEvents) -> Result<Outcome> {
+    if !path.is_file() {
+        return Ok(Outcome::Skipped(Skip::Missing));
+    }
+    // 开写之前先只读认一眼:`--db` 指错到别家 SQLite 时 `Store::open` 会改它的 journal_mode、
+    // 建 Wake 的表,而别家数据只读是铁律(Codex review 2026-09-23)
+    if !crate::db::is_wake_index(path) {
+        return Ok(Outcome::Skipped(Skip::NotAnIndex));
+    }
+    let _lock = match IndexLock::try_acquire(path, "wake-cli refresh")? {
+        Ownership::Ours(lock) => lock,
+        Ownership::Held(holder) => return Ok(Outcome::Busy(holder)),
+    };
+    let store = Arc::new(Store::open(path)?);
+    if mirrors_elsewhere(&store)? {
+        return Ok(Outcome::Skipped(Skip::MirrorsElsewhere));
+    }
+    Ok(Outcome::Done(scan_with(&store, events, false)?))
+}
+
+/// 远程镜像按 `Store::db_dir()` 找(与 GUI 同一约定:挂在打开的那个路径旁)。给的是真库的
+/// 别名、或被链接到别处的真库本身,而 GUI 开的是另一条路径时,这里的 `remotes/<host>` 不在,
+/// 枚举为空,删除检测会把远程会话整批当"磁盘已删"清掉、还报成功——有远程会话入库、镜像
+/// 根却不在,就是拿错了路径(Codex review 2026-09-23)。"有东西入库"要连记忆一起看:
+/// 转录清掉了、Codex 记忆还在的 host 没有会话行,`sync_memories` 照样会把它的记忆当消失
+/// 的来源整组删掉(同轮 review)
+fn mirrors_elsewhere(store: &Store) -> Result<bool> {
+    let Some(db_dir) = store.db_dir() else {
+        return Ok(false);
+    };
+    let sessions = store.host_counts()?;
+    let memories: std::collections::HashSet<String> = store
+        .memory_groups()?
+        .into_iter()
+        .map(|(_, host)| host)
+        .filter(|host| !host.is_empty())
+        .collect();
+    Ok(store.enabled_remote_host_names().iter().any(|host| {
+        (sessions.get(host).is_some_and(|n| *n > 0) || memories.contains(host))
+            && !crate::remote::host_cache_dir(&db_dir, host).is_dir()
+    }))
+}
+
+/// 按库里的 location / remote host 配置建 roster(不变量 8⑥)、扫一轮、数一数。读写
+/// `Store` 由调用方持有并在放锁前关掉(最后一个连接关掉即 checkpoint,-wal/-shm 消失)
+fn scan_with(store: &Arc<Store>, events: &dyn ScanEvents, full: bool) -> Result<Tally> {
+    let adapters = crate::adapters::create_adapters_for(store);
+    run_scan(&adapters, store, events, full)?;
+    Tally::of(store)
 }
 
 /// 临时库的清场:正常收尾、`?` 提前返回、panic unwind 三条路都要把它连同边车

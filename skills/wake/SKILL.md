@@ -32,6 +32,10 @@ Two things can be missing, and they need different answers:
   installed but has never run. Run `wake-cli index` once; it builds the index in a
   few seconds without opening the app, then retry your query.
 
+If the freshness line at the end of a listing is well behind and Wake is not running,
+`wake-cli refresh` updates the index in a few seconds; it does nothing while the app is
+open. Retry the query afterwards.
+
 ## Commands
 
 Always scope to the current repository with `--project "$PWD"` unless the user clearly

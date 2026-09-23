@@ -109,6 +109,11 @@ const PLAIN: &[PlainSpec] = &[
         action: Action::Index,
         summary: "build the index once, when Wake has never run here",
     },
+    PlainSpec {
+        name: "refresh",
+        action: Action::Refresh,
+        summary: "update an existing index while Wake is closed",
+    },
 ];
 
 const F_PROJECT: FlagSpec = FlagSpec::new(
@@ -259,6 +264,8 @@ pub enum Action {
     Setup,
     /// 从零建一次索引。**只在索引不存在时**——已存在的库归 GUI 管
     Index,
+    /// 增量刷一轮已有的索引。**只在 Wake 没运行时**——它在跑就退让
+    Refresh,
     /// 一次工具调用。`args` **恒为 JSON object**——mcp/mod.rs 那道
     /// `arguments` 形状检查在这条路上不可达,别再补一遍
     Tool {
@@ -312,8 +319,8 @@ impl CliError {
     }
 }
 
-/// 结果 → 写哪条流、什么退出码。CLI **唯一**的这份映射:工具调用与 `index`
-/// 都从这里收场,别在 bin 里另写一个 `fail()`。三个变体全列、不写 `_`:
+/// 结果 → 写哪条流、什么退出码。CLI **唯一**的这份映射:工具调用与 `index` /
+/// `refresh` 都从这里收场,别在 bin 里另写一个 `fail()`。三个变体全列、不写 `_`:
 /// ToolError 加变体时这里编译不过,正是要的
 pub fn report(result: Result<String, tools::ToolError>) -> Report {
     match result {
@@ -351,7 +358,7 @@ pub fn emit(text: &str, out: &mut impl Write) -> std::io::Result<()> {
     out.flush()
 }
 
-/// `wake-cli index` 在终端上的进度行:同一行 `\r` 原地刷新,终态**只补一个换行**。
+/// `wake-cli index` / `refresh` 在终端上的进度行:同一行 `\r` 原地刷新,终态**只补一个换行**。
 /// 不在这里宣布 "Indexed …"——那句由 bin 用库里查出来的会话数在 stdout 说,进度
 /// 只知道文件数(墓碑/解析失败的文件也计 done),两个数字并排只会互相打架;而且
 /// 扫描收尾(parent_links / backfill)出错时 done 已经等于 total,先打一行成功再
@@ -598,7 +605,8 @@ Run `wake-cli --help` for every option.";
 const HELP_HEAD: &str = "wake-cli — query your Wake session index from the terminal
 
 Wake indexes every coding-agent session on this machine (Claude Code, Codex,
-Cursor, Gemini CLI and more). This reads that index; it never writes to it.
+Cursor, Gemini CLI and more). This reads that index. Only `index` and `refresh`
+write to it, and only while Wake is closed.
 
 USAGE:
   wake-cli <command> [ARGS] [OPTIONS]
@@ -642,7 +650,7 @@ EXIT CODES:
   1  a session could not be read (unknown key, or a transcript that would not parse)
   2  the command line was wrong, or the index is missing / unreadable / too old
 
-Everything is read-only. Full reference: docs/cli.md";
+Everything except `index` and `refresh` is read-only. Full reference: docs/cli.md";
 
 /// 命令块与选项块的说明列起始列
 const CMD_COL: usize = 36;
@@ -1156,8 +1164,10 @@ mod tests {
         assert!(message(&["sessions", "x"]).contains("takes no arguments"));
         assert!(message(&["setup", "x"]).contains("takes no arguments"));
         assert!(message(&["index", "x"]).contains("takes no arguments"));
+        assert!(message(&["refresh", "x"]).contains("takes no arguments"));
         // PLAIN 命令不收旗标,包括全局之外的任何一个
         assert!(message(&["index", "--limit", "5"]).contains("takes no options"));
+        assert!(message(&["refresh", "--full"]).contains("takes no options"));
         assert!(message(&[]).contains("needs a command"));
         assert!(message(&["nope"]).contains("unknown command"));
     }
@@ -1186,6 +1196,7 @@ mod tests {
         assert_eq!(p(&["-V"]).unwrap().action, Action::Version);
         assert_eq!(p(&["setup"]).unwrap().action, Action::Setup);
         assert_eq!(p(&["index"]).unwrap().action, Action::Index);
+        assert_eq!(p(&["refresh"]).unwrap().action, Action::Refresh);
         assert!(USAGE.lines().count() < 15, "USAGE 不该长回参考手册");
         assert!(!USAGE.ends_with('\n'));
     }

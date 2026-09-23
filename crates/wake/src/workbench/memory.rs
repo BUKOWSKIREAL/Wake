@@ -149,10 +149,11 @@ impl Workbench {
         cx.notify();
         let adapters = self.adapters.clone();
         let store = self.store.clone();
-        let task =
-            cx.background_spawn(
-                async move { wake_core::scanner::run_memory_sync(&adapters, &store) },
-            );
+        let lock = self.index_lock.clone();
+        let task = cx.background_spawn(async move {
+            let _lock = lock;
+            wake_core::scanner::run_memory_sync(&adapters, &store)
+        });
         cx.spawn(async move |this, cx| {
             task.await;
             this.update(cx, |this, cx| {

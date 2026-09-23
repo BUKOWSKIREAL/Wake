@@ -1,8 +1,12 @@
 //! Store 写入/搜索/删除语义的往返测试(临时库,不碰真实索引)。
 //! 覆盖 CLAUDE.md 不变量 3:tombstone 防复活、user_data 独立表重建不丢。
 
-use wake_core::db::Store;
+use std::time::{Duration, Instant};
+
+use wake_core::db::{self, IndexLock, Ownership, Store, Wait};
 use wake_core::models::*;
+
+mod common;
 
 fn temp_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1750,4 +1754,252 @@ fn memories_resolve_their_project_through_the_anchor_session() {
             .all(|h| h.doc.key == moved.key),
         "重写后 FTS 里只剩这一份、没有旧行残留"
     );
+}
+
+/// 跨进程写锁的契约:同一路径第二把拿不到、拿不到时点得出持有者(GUI 与否)、放了
+/// 就能拿;等待策略只等 CLI 持有者,遇 GUI 立刻放弃。flock 与 LockFileEx 都按打开的
+/// 文件描述计,进程内第二次 open 就能演
+#[test]
+fn index_lock_is_exclusive_names_its_holder_and_waits_only_for_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let app = common::lock_as(&db, db::LOCK_KIND_APP);
+    match IndexLock::try_acquire(&db, "wake-cli refresh").unwrap() {
+        Ownership::Ours(_) => panic!("the second acquisition must fail while the first is held"),
+        Ownership::Held(who) => {
+            assert!(who.app, "{who}");
+            assert_eq!(who.to_string(), format!("Wake {}", std::process::id()));
+        }
+    }
+    // GUI 持有:不等,立刻报
+    let t0 = Instant::now();
+    assert!(matches!(
+        IndexLock::acquire_or_wait(&db, "wake-cli refresh", Duration::from_secs(5)).unwrap(),
+        Wait::HeldByApp(_)
+    ));
+    assert!(t0.elapsed() < Duration::from_secs(1), "遇 GUI 不该等");
+    drop(app);
+
+    // CLI 持有:等它放
+    let cli = common::lock_as(&db, "wake-cli refresh");
+    match IndexLock::try_acquire(&db, db::LOCK_KIND_APP).unwrap() {
+        Ownership::Held(who) => assert!(!who.app, "{who}"),
+        Ownership::Ours(_) => panic!("the CLI holder should block the app"),
+    }
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(cli);
+    });
+    match IndexLock::acquire_or_wait(&db, db::LOCK_KIND_APP, Duration::from_secs(5)).unwrap() {
+        Wait::Ours(_) => {}
+        Wait::HeldByApp(who) | Wait::TimedOut(who) => panic!("should have waited out {who}"),
+    }
+    releaser.join().unwrap();
+
+    // 等满了还是别人的
+    let _cli = common::lock_as(&db, "wake-cli index");
+    assert!(matches!(
+        IndexLock::acquire_or_wait(&db, db::LOCK_KIND_APP, Duration::from_millis(250)).unwrap(),
+        Wait::TimedOut(_)
+    ));
+}
+
+/// `--db` 给符号链接别名也得撞上同一把锁:锁文件按库的真实路径派生(Codex review
+/// 2026-09-23)。Windows 建符号链接要特权,只在 unix 演
+#[cfg(unix)]
+#[test]
+fn index_lock_follows_the_database_through_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("wake.db");
+    std::fs::write(&db, b"").unwrap();
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    assert_eq!(IndexLock::path_for(&alias), IndexLock::path_for(&db));
+    let _app = common::lock_as(&db, db::LOCK_KIND_APP);
+    match IndexLock::try_acquire(&alias, "wake-cli refresh").unwrap() {
+        Ownership::Held(who) => assert!(who.app, "{who}"),
+        Ownership::Ours(_) => panic!("the alias must share the app's lock"),
+    }
+    // 库还不存在时按父目录解析:目录的别名同样撞上
+    let dir_alias = dir.path().join("dir-alias");
+    std::os::unix::fs::symlink(dir.path(), &dir_alias).unwrap();
+    assert_eq!(
+        IndexLock::path_for(&dir_alias.join("none.db")),
+        IndexLock::path_for(&dir.path().join("none.db"))
+    );
+}
+
+/// `db_dir()` 是"打开的那个路径"所在目录,**不解析符号链接**——远程镜像 `remotes/<host>`
+/// 挂在它下面,把库链到别的盘、链接留在默认位置的用户不能因升级换镜像目录;锁文件才按真实
+/// 文件落(Codex review 2026-09-23)。相对 `--db` 补成绝对那一支没法在并行测试里演
+/// (cwd 是进程级状态)
+#[test]
+fn store_keeps_the_directory_it_was_opened_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("x.db")).unwrap();
+    assert_eq!(store.db_dir().unwrap(), dir.path());
+    drop(store);
+    let ro = Store::open_read_only(&dir.path().join("x.db")).unwrap();
+    assert_eq!(ro.db_dir().unwrap(), dir.path());
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        let via_alias = Store::open(&alias.join("x.db")).unwrap();
+        assert_eq!(
+            via_alias.db_dir().unwrap(),
+            alias,
+            "镜像目录跟着打开的路径走"
+        );
+        assert_eq!(
+            IndexLock::path_for(&alias.join("x.db")),
+            IndexLock::path_for(&dir.path().join("x.db")),
+            "锁按真实文件落"
+        );
+    }
+}
+
+/// 持有者自述是旁路文件、写在拿到锁之后,可能残留上一任 GUI 的 "Wake …";"是不是 GUI"
+/// 只认 `.lock.app` 那把锁(随进程生死)。这里主锁被一个从不写自述、也不持 `.lock.app`
+/// 的持有者拿着,残留的自述不能把新起的 GUI 劝退(Codex review 2026-09-23)
+#[test]
+fn a_stale_app_holder_note_does_not_turn_the_gui_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let lock_path = IndexLock::path_for(&db);
+    // 与 IndexLock 同一条命名规则:旁路文件 = 锁文件名 + ".holder"
+    std::fs::write(format!("{}.holder", lock_path.display()), "Wake 1").unwrap();
+    let raw = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    raw.try_lock().unwrap();
+    match IndexLock::try_acquire(&db, "wake-cli refresh").unwrap() {
+        Ownership::Held(who) => {
+            assert!(!who.app, "残留自述不算 GUI:{who}");
+            assert_eq!(who.to_string(), "Wake 1", "点名仍用自述");
+        }
+        Ownership::Ours(_) => panic!("the raw holder should block"),
+    }
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(raw);
+    });
+    match IndexLock::acquire_or_wait(&db, db::LOCK_KIND_APP, Duration::from_secs(5)).unwrap() {
+        Wait::Ours(_) => {}
+        Wait::HeldByApp(who) => panic!("turned away by a stale note: {who}"),
+        Wait::TimedOut(who) => panic!("should have waited out the holder: {who}"),
+    }
+    releaser.join().unwrap();
+}
+
+/// 默认路径是**悬空**符号链接(目标清掉后再启动):锁要落在目标旁,`Store::open` 沿链接
+/// 建库正建在那里,之后按同一路径解析出的是同一把(Codex review 2026-09-23)
+#[cfg(unix)]
+#[test]
+fn index_lock_follows_a_dangling_symlink_to_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real").join("wake.db");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let link = dir.path().join("wake.db");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let before = IndexLock::path_for(&link);
+    assert_eq!(before, IndexLock::path_for(&target));
+    let store = Store::open(&link).unwrap();
+    assert!(target.is_file(), "沿链接建库应建在目标处");
+    assert_eq!(store.db_dir().unwrap(), dir.path(), "镜像目录留在链接旁");
+    assert_eq!(IndexLock::path_for(&link), before, "建库前后锁的位置不能变");
+}
+
+/// 探 `.lock.app` 用共享锁:多个探测者同时探(几个 CLI、或 CLI 撞上正在启动的 GUI)
+/// 不能互相当成 GUI。主锁由一个不持 `.lock.app` 的持有者拿着,四个线程各探几十次,
+/// 谁都不该看到 "GUI 在"(Codex review 2026-09-23)
+#[test]
+fn concurrent_probes_never_mistake_each_other_for_the_gui() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let raw = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(IndexLock::path_for(&db))
+        .unwrap();
+    raw.try_lock().unwrap();
+    let probers: Vec<_> = (0..4)
+        .map(|_| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                for _ in 0..40 {
+                    match IndexLock::try_acquire(&db, "wake-cli refresh").unwrap() {
+                        Ownership::Held(who) => {
+                            assert!(!who.app, "a probe was taken for the GUI: {who}")
+                        }
+                        Ownership::Ours(_) => panic!("the raw holder should block"),
+                    }
+                }
+            })
+        })
+        .collect();
+    for p in probers {
+        p.join().unwrap();
+    }
+    drop(raw);
+}
+
+/// 主锁被占是已经确认的事实,探 `.lock.app` 出错(这里让它是个目录,open 必败)不能把
+/// "被占"翻成 I/O 错——GUI 对拿锁出错的对策是无锁启动。保守按"被占、不是 GUI"报
+/// (Codex review 2026-09-23)
+#[test]
+fn a_failing_app_probe_still_reports_the_index_as_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let lock_path = IndexLock::path_for(&db);
+    std::fs::create_dir_all(format!("{}.app", lock_path.display())).unwrap();
+    let raw = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    raw.try_lock().unwrap();
+    match IndexLock::try_acquire(&db, "wake-cli refresh").unwrap() {
+        Ownership::Held(who) => assert!(!who.app, "{who}"),
+        Ownership::Ours(_) => panic!("the raw holder should block"),
+    }
+    drop(raw);
+    // 主锁到手、`.lock.app` 拿不到:GUI 照样算拿到,别人只是认不出它是 GUI
+    match IndexLock::try_acquire(&db, db::LOCK_KIND_APP).unwrap() {
+        Ownership::Ours(_) => {}
+        Ownership::Held(who) => panic!("free lock reported held by {who}"),
+    }
+}
+
+/// 自述文件写不进去(这里让它是个目录)不能把刚到手的主锁放掉:锁照拿,别人只是点不出名
+/// (Codex review 2026-09-23)
+#[test]
+fn an_unwritable_holder_note_does_not_forfeit_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let lock_path = IndexLock::path_for(&db);
+    std::fs::create_dir_all(format!("{}.holder", lock_path.display())).unwrap();
+    let _held = match IndexLock::try_acquire(&db, db::LOCK_KIND_APP).unwrap() {
+        Ownership::Ours(lock) => lock,
+        Ownership::Held(who) => panic!("free lock reported held by {who}"),
+    };
+    match IndexLock::try_acquire(&db, "wake-cli refresh").unwrap() {
+        Ownership::Held(who) => {
+            assert!(who.app, "GUI 的第二把锁照拿:{who}");
+            assert_eq!(
+                who.to_string(),
+                "another process",
+                "点不出名就说 another process"
+            );
+        }
+        Ownership::Ours(_) => panic!("the lock must still be held"),
+    }
 }

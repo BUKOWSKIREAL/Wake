@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use wake_core::adapters::create_adapters_for;
-use wake_core::db::Store;
+use wake_core::db::{IndexLock, Ownership, Store};
 use wake_core::models::SessionFilter;
 use wake_core::scanner::{run_scan, NullEvents, ScanEvents, ScanProgress};
 
@@ -26,6 +26,14 @@ fn main() -> Result<()> {
         wake_core::db::default_db_path()
     };
     eprintln!("DB: {}", db_path.display());
+    // 写真实索引的进程都得持 IndexLock(`Store::open` 的约定):GUI 在跑就别扫
+    let _lock = match IndexLock::try_acquire(&db_path, "scan")? {
+        Ownership::Ours(lock) => lock,
+        Ownership::Held(holder) => anyhow::bail!(
+            "index at {} is held by {holder}; quit Wake first, or use --tmp",
+            db_path.display()
+        ),
+    };
 
     let store = Arc::new(Store::open(&db_path)?);
     // 必须带上库里的 location 配置:默认 roster 会把自定义根会话当已删清掉

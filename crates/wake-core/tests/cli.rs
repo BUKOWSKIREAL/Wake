@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 use wake_core::adapters::{create_adapter_roster_for, create_adapters_for, AgentAdapter};
 use wake_core::cli;
-use wake_core::db::Store;
+use wake_core::db::{self, Store};
 use wake_core::mcp::tools::{self, TranscriptCache};
 use wake_core::models::SessionFilter;
 use wake_core::scanner::{run_scan, NullEvents};
@@ -564,4 +564,192 @@ fn index_builds_one_from_scratch_then_defers() {
     let (stdout, _, code) = cli_raw(&["--db", db.to_str().unwrap(), "index"]);
     assert_eq!(code, Some(0));
     assert!(stdout.starts_with("An index already exists"), "{stdout}");
+}
+
+/// refresh 用的库副本:主库是全文件共用的只读参照,别的用例正拿它做字节比对,
+/// 刷新只能冲着自己那份拷贝跑(扫的仍是共用的 fixture home,只读)
+fn db_copy(dir: &Path) -> PathBuf {
+    let db = dir.join("copy.db");
+    std::fs::copy(&env().db, &db).unwrap();
+    db
+}
+
+/// 这个功能的主张:app 不开,`refresh` 也把索引追到磁盘的现状。抠掉一行(不留
+/// 墓碑,scanner 删磁盘已删的会话用的正是这一手),文件还在,刷新该把它收回来——
+/// 不往共用的 fixture home 里加文件,那会让并行的 index 用例数出别的数
+#[test]
+fn refresh_brings_an_existing_index_up_to_date() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = db_copy(tmp.path());
+    let path = db.to_str().unwrap();
+    Store::open(&db)
+        .unwrap()
+        .remove_session(CLAUDE_KEY, false)
+        .unwrap();
+    let (_, _, code) = cli_raw(&["--db", path, "show", CLAUDE_KEY, "--messages", "1"]);
+    assert_eq!(code, Some(1), "抠掉的会话按 key 该是读不出来的");
+
+    let (stdout, stderr, code) = cli_raw(&["--db", path, "refresh"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "", "管道里跑,stderr 保持安静");
+    assert!(stdout.starts_with("Refreshed the index at "), "{stdout}");
+    assert!(stdout.contains(" sessions from "), "{stdout}");
+
+    let (_, stderr, code) = cli_raw(&["--db", path, "show", CLAUDE_KEY, "--messages", "1"]);
+    assert_eq!(code, Some(0), "刷新后该收回来:{stderr}");
+}
+
+/// 只在 Wake 没运行时干活:GUI 持锁就直说它在跑,另一个 wake-cli 持锁就点名,
+/// 两种退让都退 0 且库一个字节不动;锁一放就能刷
+#[test]
+fn refresh_defers_while_the_index_is_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = db_copy(tmp.path());
+    let path = db.to_str().unwrap();
+    let before = std::fs::read(&db).unwrap();
+    let refresh = || cli_raw(&["--db", path, "refresh"]);
+    for (kind, expect) in [
+        (db::LOCK_KIND_APP, "Wake is running"),
+        (
+            "wake-cli refresh",
+            "Another process is writing the index right now (wake-cli refresh ",
+        ),
+    ] {
+        let _lock = common::lock_as(&db, kind);
+        let (stdout, stderr, code) = refresh();
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.starts_with(expect), "{stdout}");
+        assert_eq!(before, std::fs::read(&db).unwrap(), "退让时一个字节不许动");
+    }
+    let (stdout, stderr, code) = refresh();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.starts_with("Refreshed the index at "), "{stdout}");
+}
+
+/// 没索引不是 refresh 的事(`index` 或启动 Wake 才建),与查询命令缺库同退 2,
+/// 而且什么都不该建——连锁文件都不留
+#[test]
+fn refresh_without_an_index_exits_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("none.db");
+    let (stdout, stderr, code) = cli_raw(&["--db", db.to_str().unwrap(), "refresh"]);
+    assert_eq!(code, Some(2));
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("wake-cli: no Wake index at "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("wake-cli index"),
+        "该指向建库的那条命令:{stderr}"
+    );
+    let left: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "没索引就什么都不该建,连锁文件与持有者旁路都不该留:{left:?}"
+    );
+}
+
+/// `index` 也认这把锁:GUI 正在启动(下一步就是自己建库)时退让,不建、退 0
+#[test]
+fn index_defers_while_wake_holds_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("fresh.db");
+    let _lock = common::lock_as(&db, db::LOCK_KIND_APP);
+    let (stdout, stderr, code) = cli_raw(&["--db", db.to_str().unwrap(), "index"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.starts_with("Wake is running"), "{stdout}");
+    assert!(!db.exists(), "退让就不该建库");
+}
+
+/// `--db` 指错到别家 SQLite(Cursor 的 state.vscdb 一类):一个字节不许动——别家数据只读是
+/// 铁律——退 2 说清楚,连锁文件都不留(Codex review 2026-09-23)
+#[test]
+fn refresh_refuses_a_database_that_is_not_a_wake_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let foreign = tmp.path().join("state.vscdb");
+    rusqlite::Connection::open(&foreign)
+        .unwrap()
+        .execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);")
+        .unwrap();
+    let before = std::fs::read(&foreign).unwrap();
+    let (stdout, stderr, code) = cli_raw(&["--db", foreign.to_str().unwrap(), "refresh"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("is not a Wake index"), "{stderr}");
+    assert_eq!(
+        before,
+        std::fs::read(&foreign).unwrap(),
+        "别家库一个字节不许动"
+    );
+    let names: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.iter().any(|n| n.contains(".lock")), "{names:?}");
+}
+
+/// 有远程会话入库、镜像目录却不在这条路径旁 = 给的不是 GUI 开它的那条路径(真库的别名,
+/// 或被链接到别处的真库本身):照扫会把远程会话整批当"磁盘已删"清掉,拒掉、退 2、行还在
+/// (Codex review 2026-09-23)
+#[test]
+fn refresh_refuses_a_path_whose_remote_mirrors_are_elsewhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = db_copy(tmp.path());
+    Store::open(&db).unwrap().add_remote_host("box").unwrap();
+    // 直接塞一行远程会话:这条路径旁没有 remotes/box
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(key, agent_id, native_id, host, file_path) \
+             VALUES ('codex:box:abc', 'codex', 'abc', 'box', '/elsewhere/remotes/box/x.jsonl')",
+            [],
+        )
+        .unwrap();
+    let (stdout, stderr, code) = cli_raw(&["--db", db.to_str().unwrap(), "refresh"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("mirrors are not next to it"), "{stderr}");
+    let left: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE host = 'box'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 1, "远程会话不许被清掉");
+}
+
+/// 同上,但这台 host 只剩远程记忆、没有会话行(转录清掉了、Codex 记忆还在):镜像不在照样
+/// 拒,否则 `sync_memories` 会把它的记忆当消失的来源整组删掉(Codex review 2026-09-23)
+#[test]
+fn refresh_refuses_when_only_remote_memories_would_be_lost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = db_copy(tmp.path());
+    Store::open(&db).unwrap().add_remote_host("box").unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO memories(key, agent_id, host, scope, path, title, body) \
+             VALUES ('codex:box:/elsewhere/m.md', 'codex', 'box', 'user', '/elsewhere/m.md', 'm', 'x')",
+            [],
+        )
+        .unwrap();
+    let (stdout, stderr, code) = cli_raw(&["--db", db.to_str().unwrap(), "refresh"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("mirrors are not next to it"), "{stderr}");
+    let left: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE host = 'box'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 1, "远程记忆不许被清掉");
 }

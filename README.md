@@ -105,7 +105,7 @@ command = "/Applications/Wake.app/Contents/MacOS/wake-mcp"
 A few things worth knowing:
 
 - Everything is read-only: the server opens Wake's index without write access and never scans or rebuilds it; there are no delete or star tools (the one thing it can write is Wake's own data directory, which resolving the default index path creates)
-- Search and lists come from Wake's index, so keep Wake running for fresh results — every reply says how recent the index is. Reading a transcript parses the agent's files rather than the index, so it does not depend on the last scan (remote-host sessions are read from their local mirror)
+- Search and lists come from Wake's index, so keep Wake running for fresh results, or schedule `wake-cli refresh` for the times it is closed — every reply says how recent the index is. Reading a transcript parses the agent's files rather than the index, so it does not depend on the last scan (remote-host sessions are read from their local mirror)
 - Agents see the same session files Wake indexes, on this machine only (remote-host mirrors included); nothing leaves the machine
 - `wake-mcp call wake_search '{"query":"useEffect("}'` runs a single tool from the terminal, handy for checking what an agent would see
 
@@ -120,6 +120,7 @@ wake-cli sessions --project "$PWD" --limit 5      # what happened in this repo
 wake-cli search "rate limiter" --project "$PWD"   # where was this discussed
 wake-cli show 'claude-code:1b2c3d4e-…'            # read that transcript
 wake-cli setup                                    # path, PATH setup, and a block to paste into CLAUDE.md
+wake-cli refresh                                  # update the index while Wake is closed — schedule it
 ```
 
 It prints what the MCP tools return, asserted byte for byte in the test suite apart from a trailing newline the CLI adds, so an agent driving it through a shell sees what a connected one does. Full reference in [docs/cli.md](docs/cli.md).

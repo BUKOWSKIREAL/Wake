@@ -166,8 +166,11 @@ fn spawn_scan(
     store: Arc<Store>,
     events: Arc<dyn ScanEvents>,
     full: bool,
+    lock: Option<Arc<wake_core::db::IndexLock>>,
 ) {
     std::thread::spawn(move || {
+        // 写库的线程持一份锁的克隆:Workbench 先没了(关窗)扫描还在跑,锁得跟到扫完
+        let _lock = lock;
         let _ = run_scan(&adapters, &store, events.as_ref(), full);
     });
 }
@@ -179,12 +182,15 @@ fn spawn_remote_sync_thread(
     store: &Arc<Store>,
     bg_tx: futures::channel::mpsc::UnboundedSender<BgEvent>,
     names: Vec<String>,
+    lock: Option<Arc<wake_core::db::IndexLock>>,
 ) {
     if names.is_empty() {
         return;
     }
     let store = store.clone();
     std::thread::spawn(move || {
+        // sync_hosts 往 remote_hosts 表写同步结果,也算写者
+        let _lock = lock;
         wake_core::remote::sync_hosts(&store, &names);
         // 同步期间被 Remove 的 host:rsync 取消不了,收工后按配置表把孤儿
         // 缓存目录清掉(含它刚写回的),Remove 的"缓存已删"承诺自此闭合
@@ -2193,6 +2199,9 @@ pub struct Workbench {
     /// 可用列表内则用它——让"一直用 Ghostty"的人不用每家 agent 都选一遍
     last_terminal: Option<terminal::TerminalApp>,
     _subs: Vec<Subscription>,
+    /// 索引写锁(见 index_lock.rs):**必须是最后一个字段**——drop 按声明序,watcher 先
+    /// join(它的线程还在写库)再放锁;派出去的写线程各持一份克隆,锁随最后一份走
+    index_lock: Option<Arc<wake_core::db::IndexLock>>,
 }
 
 /// Insights 分布图的维度(‹ › 循环切换)。数据三份都在 InsightsData 里,
@@ -2464,6 +2473,8 @@ struct PathFormSpec {
 impl Workbench {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let db_path = wake_core::db::default_db_path();
+        // 开库之前先拿索引写锁(拿不到就等 / 弹窗退出,见 index_lock.rs)
+        let index_lock = crate::index_lock::take(&db_path);
         // 库损坏时降级重建而不是崩掉:GUI 秒退什么都不告诉用户,他们也无从知道
         // 删掉那个文件就能自愈。重建也失败说明是目录权限/磁盘问题,那才没救——
         // 但至少要用系统弹窗把话说清楚再退。
@@ -2510,9 +2521,20 @@ impl Workbench {
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<BgEvent>();
         let bg_tx = tx.clone();
         let events: Arc<dyn ScanEvents> = Arc::new(ChannelEvents(tx));
-        spawn_scan(adapters.clone(), store.clone(), events.clone(), false);
+        spawn_scan(
+            adapters.clone(),
+            store.clone(),
+            events.clone(),
+            false,
+            index_lock.clone(),
+        );
         let syncing_hosts = store.enabled_remote_host_names();
-        spawn_remote_sync_thread(&store, bg_tx.clone(), syncing_hosts.clone());
+        spawn_remote_sync_thread(
+            &store,
+            bg_tx.clone(),
+            syncing_hosts.clone(),
+            index_lock.clone(),
+        );
         {
             let (store, bg_tx) = (store.clone(), bg_tx.clone());
             std::thread::spawn(move || report_remote_cache_size(&store, &bg_tx));
@@ -2604,6 +2626,7 @@ impl Workbench {
             preferred_terminal: HashMap::new(),
             last_terminal: None,
             _subs: subs,
+            index_lock,
         };
         this.load_open_in_prefs();
         this.load_cleanup_prefs();
@@ -2837,6 +2860,7 @@ impl Workbench {
             self.store.clone(),
             self.scan_events.clone(),
             true,
+            self.index_lock.clone(),
         );
         self.sync_all_remote_hosts(cx);
     }
@@ -4320,7 +4344,12 @@ impl Workbench {
             }
             return;
         }
-        spawn_remote_sync_thread(&self.store, self.bg_tx.clone(), names.clone());
+        spawn_remote_sync_thread(
+            &self.store,
+            self.bg_tx.clone(),
+            names.clone(),
+            self.index_lock.clone(),
+        );
         self.syncing_hosts = names;
         cx.notify();
     }
@@ -4347,6 +4376,7 @@ impl Workbench {
             self.store.clone(),
             self.scan_events.clone(),
             false,
+            self.index_lock.clone(),
         );
     }
 
@@ -5241,7 +5271,9 @@ impl Workbench {
         let store = self.store.clone();
         let trash_keys = keys.clone();
         let count = keys.len();
+        let lock = self.index_lock.clone();
         let task = cx.background_spawn(async move {
+            let _lock = lock;
             terminal::trash_paths(&targets)?;
             store.remove_sessions(&trash_keys, true)
         });

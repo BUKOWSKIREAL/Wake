@@ -9,6 +9,7 @@
 mod assets;
 mod format;
 mod i18n;
+mod index_lock;
 mod main_window;
 mod markdown_links;
 mod prefs;

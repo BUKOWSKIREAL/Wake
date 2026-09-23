@@ -856,8 +856,10 @@ impl Workbench {
         let cancel = self.cleanup.cancel.clone();
         let store = self.store.clone();
         let adapters = self.adapters.clone();
+        let lock = self.index_lock.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
+            let _lock = lock;
             let mut batch = CleanupBatch::new(items, chrono::Utc::now().timestamp_millis());
             let result = cleanup::execute(&store, &adapters, &mut batch, &cancel, |n| {
                 let _ = tx.unbounded_send(Ok(n));
@@ -943,7 +945,9 @@ impl Workbench {
         self.cleanup.error = None;
         let store = self.store.clone();
         let adapters = self.adapters.clone();
+        let lock = self.index_lock.clone();
         let task = cx.background_spawn(async move {
+            let _lock = lock;
             let result = if verify_restored_files {
                 cleanup::restore(&store, &adapters, &mut batch)
             } else {

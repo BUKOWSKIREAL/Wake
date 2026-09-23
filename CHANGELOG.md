@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: `wake-cli refresh` updates an existing index from the terminal, so a scheduled task (launchd, systemd timer) keeps search and session lists fresh while Wake is closed; it does nothing while Wake is running, and Wake waits for a running refresh before opening the index (#43, thanks @aka-kika)
+
 ## [0.8.0] — 2026-09-22
 
 - New: Memory page — the notes coding agents keep for themselves (Claude Code's auto-memory, Codex's memories and per-session summaries, ZCode's project memory) and the instruction files you write for them (CLAUDE.md, AGENTS.md, GEMINI.md, `.cursor/rules`, `.kiro/steering`, `copilot-instructions.md`, global and per project) in one read-only place, searchable, filtered by agent, project or user memory

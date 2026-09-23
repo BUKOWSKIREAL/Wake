@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use wake_core::db::{IndexLock, Ownership};
+
 pub fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -896,4 +898,21 @@ pub fn build_zcode_tasks_db(path: &Path) {
         "#,
     )
     .expect("populate zcode tasks fixture db");
+}
+
+/// 以某种身份持住索引锁,拿不到就 panic 点名——各测试文件里"扮演 GUI / 另一个
+/// wake-cli"的同一句
+pub fn lock_as(db: &Path, kind: &str) -> IndexLock {
+    // 并行的别条测试正在 fork 子进程的那几微秒里,本进程所有 fd(含刚放掉的锁)会被复制一份
+    // 直到 exec 关掉——锁因此晚放一瞬。真实使用没有这形态(GUI 持锁到退出),测试里等一下
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match IndexLock::try_acquire(db, kind).unwrap() {
+            Ownership::Ours(lock) => return lock,
+            Ownership::Held(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ownership::Held(who) => panic!("a fresh lock should not be held by {who}"),
+        }
+    }
 }

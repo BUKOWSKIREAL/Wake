@@ -115,7 +115,7 @@ Everything above happens locally; Wake itself does not change and the other agen
 
 ## Keeping results fresh
 
-Search and lists come from Wake's index. Wake keeps the index current while it is running (file watching for JSONL-based agents; SQLite-based agents such as Copilot and OpenCode refresh on launch and on manual refresh). Every reply ends with a line like
+Search and lists come from Wake's index. Wake keeps the index current while it is running (file watching for JSONL-based agents; SQLite-based agents such as Copilot and OpenCode refresh on launch and on manual refresh); while the app is closed, a scheduled `wake-cli refresh` does the same pass (see [docs/cli.md](cli.md#refresh)). Every reply ends with a line like
 
 ```
 Index covers activity up to 2026-09-08 09:41:37 (local time); Wake keeps it fresh while it is running.
@@ -277,6 +277,6 @@ wake-mcp --version
 ## Troubleshooting
 
 - **The client reports the server failed to start.** Run the binary in a terminal: `no Wake index at … — launch Wake once to build it` means Wake has never run on this machine (or `--db` points to the wrong place). `… is empty or from an older version` means the index predates this Wake version; launching Wake once upgrades it.
-- **Results look stale.** Keep Wake running; the freshness line at the end of every reply tells you what the index covers. Copilot / OpenCode / Antigravity / Hermes / OpenClaw databases refresh when Wake launches or when you click Refresh.
+- **Results look stale.** Keep Wake running, or schedule `wake-cli refresh` for the times it is closed ([docs/cli.md](cli.md#refresh)); the freshness line at the end of every reply tells you what the index covers. Copilot / OpenCode / Antigravity / Hermes / OpenClaw databases refresh when Wake launches or when you click Refresh.
 - **A project path is not matched.** Pass the absolute path of the repository, or its name. `wake_list_projects` shows the paths Wake knows.
 - **macOS refuses to run it ("cannot be opened because the developer cannot be verified").** Wake is signed but not notarized, and a client launching `wake-mcp` hits the same first-run gate as opening Wake itself. Clear the quarantine flag for the whole bundle once: `xattr -dr com.apple.quarantine /Applications/Wake.app`, then restart the client.
