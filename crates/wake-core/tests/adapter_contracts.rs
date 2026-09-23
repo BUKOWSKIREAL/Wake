@@ -55,6 +55,13 @@ struct TestEnv {
 
 static ENV: OnceLock<TestEnv> = OnceLock::new();
 
+/// 把文件 mtime 往前拨 `secs` 秒:按 mtime 戳判脏的缓存在同一毫秒内的两次写之间分不出新旧
+fn touch_forward(path: &Path, secs: u64) {
+    let file = fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
 /// 所有测试的第一步:建假 HOME(含 SQLite fixture 库与 gemini 的
 /// projects.json)并把 HOME 指过去。必须先于任何 Adapter::new()。
 /// 读一个 adapter 的全部默认来源(项目模式除外——那要项目根);契约测试里的
@@ -4176,11 +4183,15 @@ fn codex_lists_user_and_thread_memories() {
     let db_path = home.path().join("memories_1.sqlite");
     let good = fs::read(&db_path).unwrap();
     fs::write(&db_path, b"not a sqlite database").unwrap();
+    // 缓存戳是毫秒级 mtime:上一次读到覆写之间不到一毫秒时戳没变、拿到的是缓存的好结果,
+    // CI 与本机都红过。把 mtime 明确往前拨,不赌时钟
+    touch_forward(&db_path, 2);
     assert!(
         all_memories(&adapter).is_err(),
         "memories_1.sqlite 读不出必须报 Err 而不是当成空"
     );
     fs::write(&db_path, good).unwrap();
+    touch_forward(&db_path, 4);
     assert_eq!(all_memories(&adapter).unwrap().len(), 3);
     assert!(
         thread.path.ends_with("memories_1.sqlite#t-0001"),
