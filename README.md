@@ -23,7 +23,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 - **Insights** — a stats page for your whole library: GitHub-style activity heatmap with streaks, hour / weekday / month breakdowns, and Agents / Projects / Models leaderboards switchable between sessions, tokens, and prompts
 - **Remote hosts** — mirror the sessions on your other machines over SSH (Settings → Remote hosts); they show up next to local ones with an `@host` badge, searchable like everything else, and resume through a copied `ssh -t` command
 - **Connect your agents (MCP)** — a bundled read-only MCP server, `wake-mcp`, lets Claude Code, Codex, Cursor or any MCP client search your whole history, list recent sessions per project and read transcripts page by page, so a new agent can pick up where another one left off; Settings → Connect has copy-paste setup snippets
-- **Command line** — `wake-cli` gives the same four answers to anything that can run a shell command: `wake-cli sessions --project "$PWD"`, `wake-cli search "…"`, `wake-cli show <key>`; it prints the same text an MCP client sees; `npx skills add iAmCorey/Wake` installs a skill so agents reach for it on their own
+- **Command line** — `wake-cli` gives the same answers to anything that can run a shell command: `wake-cli sessions --project "$PWD"`, `wake-cli search "…"`, `wake-cli show <key>`; it prints the same text an MCP client sees; `npx skills add iAmCorey/Wake` installs a skill so agents reach for it on their own; `wake-cli refresh` keeps the index fresh from a scheduled task while the app is closed
 
 ![Full-text search across every agent's sessions](imgs/screenshot-2.webp)
 
@@ -54,7 +54,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 
 **Model** = whether Wake shows which LLM a session used (the model the session last used). **Via** = whether Wake shows where the session was started from (CLI, IDE extension, desktop app) — Codex records this in its local data; Hermes and OpenClaw record the channel a session came in through (Telegram, Discord, …). A "—" means the agent's local data simply doesn't record that field, not a missing feature.
 
-Codex writes its background threads — the guardian auto-review, `/review`, compaction, memory consolidation and spawned sub-agents — into the same `sessions` directory as your conversations. Wake recognises them from the metadata on their first line and skips them; a file it cannot identify stays visible rather than risk hiding a real conversation.
+Codex writes its background threads — the guardian auto-review, `/review`, compaction and memory consolidation — into the same `sessions` directory as your conversations. Wake recognises them from the metadata on their first line and skips them; sub-agents you start with `spawn_agent` are kept and listed under the session that spawned them; a file it cannot identify stays visible rather than risk hiding a real conversation.
 
 Cursor keeps two stores. A chat that has a full transcript under `~/.cursor/projects` is read from there; local workspace metadata and filesystem matching restore its project path, including spaces. Project metadata is refreshed on each scan even if the transcript is unchanged. Chats that only live in Cursor's own database — older ones, or Cursor versions that leave nothing but a `turn_ended` marker in the transcript — are read from `state.vscdb`. Older IDE chats that Cursor stored without a workspace show up under *Unknown project*.
 
@@ -105,7 +105,7 @@ command = "/Applications/Wake.app/Contents/MacOS/wake-mcp"
 A few things worth knowing:
 
 - Everything is read-only: the server opens Wake's index without write access and never scans or rebuilds it; there are no delete or star tools (the one thing it can write is Wake's own data directory, which resolving the default index path creates)
-- Search and lists come from Wake's index, so keep Wake running for fresh results, or schedule `wake-cli refresh` for the times it is closed — every reply says how recent the index is. Reading a transcript parses the agent's files rather than the index, so it does not depend on the last scan (remote-host sessions are read from their local mirror)
+- Search and lists come from Wake's index, so keep Wake running for fresh results, or schedule `wake-cli refresh` for the times it is closed — every listing says how recent the index is. Reading a transcript parses the agent's files rather than the index, so it does not depend on the last scan (remote-host sessions are read from their local mirror)
 - Agents see the same session files Wake indexes, on this machine only (remote-host mirrors included); nothing leaves the machine
 - `wake-mcp call wake_search '{"query":"useEffect("}'` runs a single tool from the terminal, handy for checking what an agent would see
 
@@ -196,7 +196,7 @@ cargo run -p wake                      # run in dev mode
 scripts/test.sh                        # one-command test entry: data-layer tests + UI compile gate
 scripts/test.sh --smoke                # adds a real-data scan baseline (reads your local agent dirs, read-only)
 cargo test -p wake-core                # data-layer tests only (adapter contracts, FTS, scanner)
-cargo run -p wake-core --bin scan      # data-layer smoke test: scan and print stats
+cargo run -p wake-core --bin scan      # data-layer smoke test: scan and print stats (quit Wake first, or add --tmp: it will not write an index Wake holds)
 cargo run -p wake-core --bin scan -- --search "useEffect("   # search smoke test
 cargo run -p wake-core --bin wake-mcp -- setup                # print MCP setup snippets for the dev build
 cargo run -p wake-core --bin wake-mcp -- call wake_search '{"query":"useEffect("}'   # run one MCP tool against your index

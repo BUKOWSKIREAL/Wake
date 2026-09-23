@@ -33,6 +33,7 @@ wake-cli search QUERY [OPTIONS]
 wake-cli sessions [OPTIONS]
 wake-cli show KEY [OPTIONS]
 wake-cli projects [OPTIONS]
+wake-cli memories [OPTIONS]
 wake-cli setup
 wake-cli index
 wake-cli refresh
@@ -204,18 +205,24 @@ you use it through the MCP server or this CLI and only open the app to browse:
 wake-cli refresh
 ```
 
-It does the pass the app does on launch and on Refresh — an incremental scan that picks up
-new and changed sessions, drops the deleted ones and re-reads the memory files — and then
-says what the index holds. It does not sync remote hosts; those mirrors update when the app
+It does the incremental pass the app does on launch — picks up new and changed sessions,
+drops the deleted ones and re-reads the memory files — and then says what the index holds.
+(The app's Refresh button re-reads every session; `refresh` only reads what changed.) It does not sync remote hosts; those mirrors update when the app
 runs. Like `index`, it shows progress in a terminal and stays quiet when piped. Point it at
 Wake's own database — the path `wake-cli setup` prints — rather than a copy or an alias: it
 refuses a file that is not a Wake index, and a path whose remote-host mirrors are not next to it.
 
-It runs only while Wake is closed. If the app is running it says so and exits `0` without
+It steps aside while Wake has its window open or is still scanning: closing the window
+releases the index once any scan in flight finishes, so Wake left in the Dock without a window
+does not block it. If Wake or another writer holds the index it says so and exits `0` without
 touching anything: the app is already keeping the index current, and two writers with
 possibly different environments would undo each other's work. The app and the CLI share one
-lock on the index for this — Wake holds it while it runs, `refresh` and `index` hold it
-while they work, and Wake waits for a running `refresh` to finish before it opens the index.
+lock on the index for this — Wake holds it while its window is open, `refresh` and `index`
+hold it while they work, and Wake waits up to a minute for a running `refresh` to finish
+before it opens the index (if the index is still busy after that, or another Wake holds it,
+Wake explains and exits).
+The lock is three small files next to the index (`wake.db.lock`, `wake.db.lock.app`,
+`wake.db.lock.holder`); they are safe to leave alone.
 
 #### Keeping the index fresh without the app
 
@@ -296,7 +303,7 @@ Numeric options outside their range are clamped, not rejected: `--limit 999` on 
 
 ## Agent ids
 
-`claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`. Display names (`"Claude Code"`) and a few aliases (`claude`, `deepseek`) work too.
+`claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`, `zcode`. Display names (`"Claude Code"`) and a few aliases (`claude`, `deepseek`) work too.
 
 ## Session keys and references
 
@@ -322,7 +329,7 @@ Exactly one trailing newline is added when the text does not already end with on
 | `1` | it ran and failed — unknown or ambiguous key, a transcript that would not parse, a query that errored, or a failed write to stdout |
 | `2` | the command line was wrong, or the index is missing / unreadable / too old |
 
-Empty results are never an error, so `wake-cli search x || fallback` does not fire just because nothing was ever discussed about `x`. Diagnostics go to stderr, prefixed `wake-cli: `, so `wake-cli show <key> > out.md` cannot capture one. Two commands treat a missing index as normal rather than as the `2` above. `setup` always exits `0`, even with no index, and reports a missing one as a `Note:` line on stdout — "not set up yet" is the normal state for someone running it. `index` exits `0` both when it builds one and when it declines because one already exists or Wake is running; a build that starts and then fails exits `1`. `refresh` exits `0` when it updates the index and when it declines because Wake is running; it exits `2` when there is no index, when `--db` is not a Wake index, or when the path is not the one Wake opens the index at (its remote-host mirrors would not be found there); a scan that starts and then fails exits `1`.
+Empty results are never an error, so `wake-cli search x || fallback` does not fire just because nothing was ever discussed about `x`. Diagnostics go to stderr, prefixed `wake-cli: `, so `wake-cli show <key> > out.md` cannot capture one. Two commands treat a missing index as normal rather than as the `2` above. `setup` always exits `0`, even with no index, and reports a missing one as a `Note:` line on stdout — "not set up yet" is the normal state for someone running it. `index` exits `0` both when it builds one and when it declines because one already exists or because Wake or another writer holds the index; a build that starts and then fails exits `1`. `refresh` exits `0` when it updates the index and when it declines because Wake or another writer holds the index; it exits `2` when there is no index, when `--db` is not a Wake index, or when the index holds remote-host sessions or memories whose mirrors are not next to that path (a copy or an alias in another directory); a scan that starts and then fails exits `1`.
 
 Both a mistyped option (`--sinse 7d`) and a value the tools reject (`--since 7dd`) exit `2` — from a user's seat they are the same mistake, and the layer that caught it is not visible. This is a deliberate difference from `wake-mcp call`, which exits `1` for anything the tool layer rejects — its JSON-RPC envelope already carries the classification, so the exit code never had to. (`wake-mcp` still uses `2` for its own argv problems: a missing tool name, unparsable JSON, or an index it cannot open.)
 
@@ -335,7 +342,7 @@ Both a mistyped option (`--sinse 7d`) and a value the tools reject (`--since 7dd
 
 ## Troubleshooting
 
-- **`no Wake index at … — launch Wake once to build it`.** Wake has never run on this machine, or `--db` points at the wrong file. If Wake is installed but has never been launched, `wake-cli index` builds the index from a terminal instead. `… is empty or from an older version` means the index predates this Wake version; launching Wake once upgrades it.
+- **`no Wake index at … — launch Wake once to build it`.** Wake has never run on this machine, or `--db` points at the wrong file. If Wake is installed but has never been launched, `wake-cli index` builds the index from a terminal instead. `… is empty or from an older version` means the index predates this Wake version; launching Wake once upgrades it, and so does `wake-cli refresh`.
 - **`No indexed project matches …`.** Pass the absolute path of the repository, or its name. `wake-cli projects` shows the paths Wake knows.
 - **Results look stale.** Keep Wake running, or schedule [`wake-cli refresh`](#refresh) for the times it is closed; the freshness line at the end of every reply says what the index covers. Copilot / OpenCode / Antigravity / Hermes / OpenClaw databases refresh when Wake launches, when you click Refresh, or on `wake-cli refresh`.
 - **macOS refuses to run it ("cannot be opened because the developer cannot be verified").** Wake is signed but not notarized. Clear the quarantine flag for the whole bundle once: `xattr -dr com.apple.quarantine /Applications/Wake.app`.

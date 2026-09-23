@@ -33,8 +33,8 @@ Two things can be missing, and they need different answers:
   few seconds without opening the app, then retry your query.
 
 If the freshness line at the end of a listing is well behind and Wake is not running,
-`wake-cli refresh` updates the index in a few seconds; it does nothing while the app is
-open. Retry the query afterwards.
+`wake-cli refresh` updates the index in a few seconds; it does nothing while Wake has its
+window open or is still scanning. Retry the query afterwards.
 
 ## Commands
 
@@ -112,7 +112,8 @@ with `--from <that number>` to continue.
 - Listings usually end with the index freshness (`Index covers activity up to …`) — the
   newest activity Wake has indexed, not the current time. A stale-looking value usually means
   Wake is not running, but some agents (Copilot, OpenCode, Antigravity, Hermes, OpenClaw) are
-  stored in SQLite and only refresh when Wake launches, so say what the line shows rather than
+  stored in SQLite and only refresh when Wake launches, on its Refresh button or on
+  `wake-cli refresh`, so say what the line shows rather than
   concluding the user did nothing. `show` does not depend on that line — it reads
   the agent's own file rather than the index. The exception is a session from a remote
   host (`<agent>:<host>:<id>`): that file is a local mirror, current as of Wake's last

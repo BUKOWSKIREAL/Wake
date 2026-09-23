@@ -132,7 +132,7 @@ All five tools are read-only and return Markdown text (`content[0].text`). Param
 | Parameter | Type | Meaning |
 |---|---|---|
 | `project` | string | Scope to one project. Pass an absolute path — the agent's working directory is ideal — or a project name. Path matching is three-tier: an exact match of an indexed project path; otherwise the longest indexed project that contains the path (you are in a subdirectory); otherwise every indexed project below the path (a monorepo root or a parent folder). A bare name matches the project name case-insensitively. When nothing matches, the reply lists the known projects instead of erroring. |
-| `agents` | string[] | Only these agents. Ids: `claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`. Display names (`"Claude Code"`, `"Gemini CLI"`) and a few aliases (`claude`, `deepseek`, `opencode2`) are accepted too. |
+| `agents` | string[] | Only these agents. Ids: `claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`, `zcode`. Display names (`"Claude Code"`, `"Gemini CLI"`) and a few aliases (`claude`, `deepseek`, `opencode2`) are accepted too. |
 | `since` | string | Only sessions updated at or after this time. Relative: `30m`, `24h`, `7d`, `2w`. Absolute: `2026-09-01`, `2026-09-01 09:30`, `2026-09-01T09:30:00Z`. Naive date-times are read in local time. |
 | `limit` | integer | Maximum items to return; values outside the allowed range are clamped. |
 
@@ -276,7 +276,7 @@ wake-mcp --version
 
 ## Troubleshooting
 
-- **The client reports the server failed to start.** Run the binary in a terminal: `no Wake index at … — launch Wake once to build it` means Wake has never run on this machine (or `--db` points to the wrong place). `… is empty or from an older version` means the index predates this Wake version; launching Wake once upgrades it.
+- **The client reports the server failed to start.** Run the binary in a terminal: `no Wake index at … — launch Wake once to build it` means Wake has never run on this machine (or `--db` points to the wrong place). `… is empty or from an older version` means the index predates this Wake version; launching Wake once upgrades it, and so does `wake-cli refresh`.
 - **Results look stale.** Keep Wake running, or schedule `wake-cli refresh` for the times it is closed ([docs/cli.md](cli.md#refresh)); the freshness line at the end of every reply tells you what the index covers. Copilot / OpenCode / Antigravity / Hermes / OpenClaw databases refresh when Wake launches or when you click Refresh.
 - **A project path is not matched.** Pass the absolute path of the repository, or its name. `wake_list_projects` shows the paths Wake knows.
 - **macOS refuses to run it ("cannot be opened because the developer cannot be verified").** Wake is signed but not notarized, and a client launching `wake-mcp` hits the same first-run gate as opening Wake itself. Clear the quarantine flag for the whole bundle once: `xattr -dr com.apple.quarantine /Applications/Wake.app`, then restart the client.
